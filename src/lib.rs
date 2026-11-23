@@ -18,7 +18,7 @@ macro_rules! define_ops {
         impl<Id: Copy> Op<Id> {
             pub fn children(self) -> ([Id; 3], usize) where Id: Default {
                 let (mut out, mut n) = ([Id::default(); 3], 0usize);
-                let _ = self.map_ids(|id| { out[n] = id; n += 1; }); (out, n)
+                let _ = self.map_ids(|id| { if let Some(slot) = out.get_mut(n) { *slot = id; n += 1; } }); (out, n)
             }
             pub fn map_ids<Out>(self, mut $f: impl FnMut(Id) -> Out) -> Op<Out> { match self { $( $pat => $me, )* } }
         }

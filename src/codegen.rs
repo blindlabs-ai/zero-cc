@@ -16,7 +16,7 @@ pub struct ScheduleReport {
 fn is_inline(op: Op<NodeId>) -> bool { matches!(op, Op::MemInit | Op::Const(_)) }
 
 fn calc_su(uniq: &[usize], su: &[usize]) -> usize {
-    let mut w: Vec<usize> = uniq.iter().map(|&k| su[k]).collect();
+    let mut w: Vec<usize> = uniq.iter().map(|&k| su.get(k).copied().unwrap_or(0)).collect();
     w.sort_unstable_by(|a, b| b.cmp(a));
     w.iter().enumerate().fold(1usize, |acc, (j, &s)| acc.max(s + j))
 }
