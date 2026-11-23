@@ -128,7 +128,7 @@ fn emit_op_rhs(kernel: &Kernel, doms: &[Domain], id: NodeId) -> String {
         Op::LoadLut { buf, idx } => {
             let (b, ix) = (&kernel.bufs[buf as usize], ref_expr(kernel, idx));
             if let BufAccess::LookupTable(len) = b.access {
-                if len.is_power_of_two() && doms[idx].lo >= 0 && doms[idx].hi < len as i64 {
+                if len.is_power_of_two() && !doms[idx].is_empty() && doms[idx].lo >= 0 && doms[idx].hi < len as i64 {
                     return format!("{}[({ix} as usize) & {}]", b.name, len - 1);
                 }
             }

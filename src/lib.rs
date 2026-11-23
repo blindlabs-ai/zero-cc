@@ -3,12 +3,16 @@
 pub mod codegen;
 pub mod egraph;
 pub mod ir;
+pub mod ntf1;
 
 pub use codegen::{emit_rust, schedule_and_verify, RegBudget, ScheduleReport};
 pub use egraph::optimize_kernel;
 pub use ir::{
     barrett_params, BufAccess, BufDecl, CompileError, Domain, IrOp, Kernel, KernelCost, NodeId,
     Op, OutputWrite, LANES,
+};
+pub use ntf1::{
+    emit_ntf1, export_kernel_ntf1, parse_ntf1, verify_ntf1_airlock, Ntf1Error, Ntf1Spec, Ntf1Stmt,
 };
 
 #[derive(Clone, Debug)]

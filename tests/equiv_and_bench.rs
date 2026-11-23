@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use zero_cc::{
-    compile_kernel, optimize_kernel, BufAccess, CompileError, Domain, Kernel, Op, RegBudget, LANES,
+    compile_kernel, emit_ntf1, export_kernel_ntf1, optimize_kernel, parse_ntf1,
+    verify_ntf1_airlock, BufAccess, CompileError, Domain, Kernel, Ntf1Error, Op, RegBudget, LANES,
 };
 
 struct SplitMix64(u64);
@@ -166,6 +167,186 @@ fn build_affine_filter_8lane() -> Kernel {
     k
 }
 
+/// Kernel 4: 8-lane CRT + quadratic congruence lifting (`x == 2 (mod 4)` -> `(x*x) % 16 == 4`,
+/// `((2*x + 1) * 3) % 8 == 7`), eliminating both `Rem` and `BoundsCheck` cleanly.
+fn build_quad_crt_8lane(use_congruence: bool) -> Kernel {
+    let mut k = Kernel::new("quad_crt_8lane");
+    let x_dom = if use_congruence {
+        Domain::congruent(0, 1000, 4, 2)
+    } else {
+        Domain::range(0, 1000)
+    };
+    let x = k.add_buf("x", BufAccess::ReadOnly, x_dom);
+    let lut = k.add_buf("lut", BufAccess::LookupTable(8), Domain::range(0, 1023));
+    let out = k.add_buf("out", BufAccess::MutNoAlias, Domain::top());
+
+    let mem = k.push(Op::MemInit);
+    let c2 = k.push(Op::Const(2));
+    let c1 = k.push(Op::Const(1));
+    let c3 = k.push(Op::Const(3));
+    let c8 = k.push(Op::Const(8));
+    let c16 = k.push(Op::Const(16));
+
+    for lane in 0..LANES as u8 {
+        let xi = k.push(Op::Load { mem, buf: x, lane });
+        let sq = k.push(Op::Mul(xi, xi));
+        let r16 = k.push(Op::Rem(sq, c16));
+        let idx = k.push(Op::BoundsCheck { idx: r16, limit: 8 });
+        let lv = k.push(Op::LoadLut { buf: lut, idx });
+        let x2 = k.push(Op::Mul(xi, c2));
+        let odd = k.push(Op::Add(x2, c1));
+        let odd3 = k.push(Op::Mul(odd, c3));
+        let r8 = k.push(Op::Rem(odd3, c8));
+        let p1 = k.push(Op::Add(lv, r8));
+        let res = k.push(Op::Add(p1, odd3));
+        k.add_output(out, lane, res);
+    }
+    k
+}
+
+#[test]
+fn crt_quadratic_congruence_knockout() {
+    // 1. Exact CRT/LCM meet and tightening: x == 2 (mod 3) /\ x == 3 (mod 5) => x == 8 (mod 15).
+    let d3 = Domain::congruent(0, 100, 3, 2);
+    let d5 = Domain::congruent(0, 100, 5, 3);
+    let crt = d3.try_meet(d5).expect("consistent CRT");
+    assert_eq!((crt.lo, crt.hi, crt.modulus, crt.rem), (8, 98, 15, 8));
+    assert!(crt.contains(8) && crt.contains(23) && !crt.contains(9));
+
+    // Contradictory CRT meet: x == 1 (mod 2) /\ x == 0 (mod 2) => empty bottom.
+    let odd = Domain::congruent(0, 100, 2, 1);
+    let even = Domain::congruent(0, 100, 2, 0);
+    assert_eq!(odd.try_meet(even), None);
+    let bot = odd.meet(even);
+    assert!(bot.is_empty());
+    assert!(!bot.is_nonneg());
+    assert!(!bot.contains(1));
+
+    // 2. Quadratic residue + affine congruence lifting: (2x + 1)^2 == 1 (mod 8), (4k + 2)^2 == 4 (mod 32).
+    let odd_sq = odd.eval_square();
+    assert_eq!(odd_sq.rem_mod(8), Some(1));
+    let k_cong = build_quad_crt_8lane(true);
+    let k_ablate = build_quad_crt_8lane(false);
+    let c_cong = compile_kernel(&k_cong, RegBudget::default()).expect("compile congruent quad_crt");
+    let c_ablate = compile_kernel(&k_ablate, RegBudget::default()).expect("compile ablated quad_crt");
+
+    // Counterfactual knockout: congruence eliminates all Rem + BoundsCheck; ablating keeps BoundsCheck.
+    assert_eq!(c_cong.optimized_cost.divs_rems, 0);
+    assert_eq!(c_cong.optimized_cost.bounds_checks, 0);
+    assert_ne!(c_cong.optimized_cost.bounds_checks, c_ablate.optimized_cost.bounds_checks);
+    assert_ne!(c_cong.optimized_cost.total_latency, c_ablate.optimized_cost.total_latency);
+    assert_eq!(c_ablate.optimized_cost.bounds_checks, LANES);
+
+    // Bit-exact verification across valid x == 2 (mod 4) inputs + OOB fault on ablated kernel for x = 3.
+    let lut = [11i64, 23, 37, 53, 79, 97, 131, 199];
+    for step in 0..250i64 {
+        let mut xs = [0i64; LANES];
+        for (l, slot) in xs.iter_mut().enumerate() {
+            *slot = ((step * 4 + (l as i64) * 12) % 996) + 2;
+        }
+        let out_z = [0i64; LANES];
+        let refs: &[&[i64]] = &[&xs, &lut, &out_z];
+        assert_eq!(k_cong.eval(refs).expect("orig"), c_cong.optimized.eval(refs).expect("opt"));
+    }
+    let bad_x = [3i64; LANES];
+    let out_z = [0i64; LANES];
+    assert_eq!(
+        c_ablate.optimized.eval(&[&bad_x, &lut, &out_z]).unwrap_err(),
+        CompileError::OutOfBounds { idx: 9, limit: 8 }
+    );
+
+    // Idempotent optimization fixed-point: optimize_kernel(optimize_kernel(k)) == optimize_kernel(k).
+    let reopt = optimize_kernel(&c_cong.optimized).expect("reopt quad_crt");
+    assert_eq!(reopt.cost(), c_cong.optimized_cost);
+    assert_eq!(reopt.nodes, c_cong.optimized.nodes);
+}
+
+#[test]
+fn ntf1_airlock_and_recursive_cross_verify() {
+    use std::path::Path;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let spec_path = root.join("specs/zero_cc.ntf1");
+    let spec_src = std::fs::read_to_string(&spec_path).expect("read specs/zero_cc.ntf1");
+    let canon = verify_ntf1_airlock(&spec_src).expect("valid specs/zero_cc.ntf1");
+    let reparsed = parse_ntf1(&canon).expect("reparse canonical");
+    assert_eq!(emit_ntf1(&reparsed), canon, "0t emit/parse fixed-point");
+
+    // Counterfactual knockouts on NTF1: SVO prose in body and comment, uncovered Fault.*, ungrounded 0t, broken 0t arrow.
+    let svo_body = "NTF1 bad\n+t the -> Kernel\n";
+    assert_ne!(parse_ntf1(&spec_src).is_ok(), parse_ntf1(svo_body).is_ok());
+    assert!(matches!(parse_ntf1(svo_body), Err(Ntf1Error::SvoTax { ref word, .. }) if word == "the"));
+
+    let svo_comment = "NTF1 bad\n# this comment leaks prose\n+t A -> B\n";
+    assert!(matches!(parse_ntf1(svo_comment), Err(Ntf1Error::SvoTax { ref word, .. }) if word == "this"));
+
+    let uncovered_fault = "NTF1 bad\n+t IR -> Fault.Orphan\n";
+    assert!(matches!(parse_ntf1(uncovered_fault), Err(Ntf1Error::UncoveredFault(ref a)) if a == "Fault.Orphan"));
+
+    let ungrounded_airlock = "NTF1 bad\n0t GhostA >< GhostB\n";
+    assert!(matches!(parse_ntf1(ungrounded_airlock), Err(Ntf1Error::UngroundedAirlock(_))));
+
+    let broken_airlock = "NTF1 bad\n+t A -> B\n0t A -> B\n";
+    assert_ne!(verify_ntf1_airlock(&canon).is_ok(), verify_ntf1_airlock(broken_airlock).is_ok());
+
+    // Export all 4 compiled kernels to NTF1 and verify airlock fixed-point + optimize idempotence.
+    let all_kernels = [
+        build_modular_hash_lut(),
+        build_butterfly_8lane(),
+        build_affine_filter_8lane(),
+        build_quad_crt_8lane(true),
+    ];
+    let mut emitted_rs = String::from("#![forbid(unsafe_code)]\n\n");
+    let mut last_k_ntf1 = String::new();
+    for k in &all_kernels {
+        let compiled = compile_kernel(k, RegBudget::default()).expect("compile kernel");
+        let reopt = optimize_kernel(&compiled.optimized).expect("reopt");
+        assert_eq!(reopt.nodes, compiled.optimized.nodes);
+        let k_ntf1 = export_kernel_ntf1(&compiled);
+        let k_canon = verify_ntf1_airlock(&k_ntf1).expect("kernel NTF1 airlock");
+        assert_eq!(k_canon, k_ntf1);
+        emitted_rs.push_str(&compiled.rust_source);
+        emitted_rs.push('\n');
+        last_k_ntf1 = k_ntf1;
+    }
+
+    // Sibling mutual NTF1 cross-check when ../zero-check exists (zero Cargo.toml dep).
+    if let Some(parent) = root.parent() {
+        let sibling_spec = parent.join("zero-check/specs/zero_check.ntf1");
+        if sibling_spec.exists() {
+            let sib_src = std::fs::read_to_string(&sibling_spec).expect("read zero_check.ntf1");
+            let sib_canon = verify_ntf1_airlock(&sib_src).expect("zero-cc parses zero_check.ntf1");
+            assert_eq!(verify_ntf1_airlock(&sib_canon).expect("idempotent sibling"), sib_canon);
+        }
+        #[cfg(not(miri))]
+        {
+            let sibling_bin = parent.join("zero-check/target/release/zero-check");
+            if sibling_bin.exists() {
+                let tmp = std::env::temp_dir();
+                let rs_tmp = tmp.join("zero_cc_emitted_cross.rs");
+                let ntf1_tmp = tmp.join("zero_cc_kernel_cross.ntf1");
+                std::fs::write(&rs_tmp, &emitted_rs).expect("write emitted rs");
+                std::fs::write(&ntf1_tmp, &last_k_ntf1).expect("write kernel ntf1");
+                let out = std::process::Command::new(&sibling_bin)
+                    .args(["--no-ledger", "--ntf1"])
+                    .arg(&spec_path)
+                    .arg(&ntf1_tmp)
+                    .arg(&rs_tmp)
+                    .output()
+                    .expect("invoke sibling zero-check");
+                let _ = std::fs::remove_file(&rs_tmp);
+                let _ = std::fs::remove_file(&ntf1_tmp);
+                assert!(
+                    out.status.success(),
+                    "zero-check rejected zero-cc artifacts:\n{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn zipfian_equivalence_and_cost_knockout() {
     let kernels = [
@@ -317,6 +498,7 @@ fn real_rustc_o3_benchmark_and_objdump_zero_spill() {
     let k1 = compile_kernel(&build_modular_hash_lut(), RegBudget::default()).expect("compile k1");
     let k2 = compile_kernel(&build_butterfly_8lane(), RegBudget::default()).expect("compile k2");
     let k3 = compile_kernel(&build_affine_filter_8lane(), RegBudget::default()).expect("compile k3");
+    let k4 = compile_kernel(&build_quad_crt_8lane(true), RegBudget::default()).expect("compile k4");
 
     let mut harness = String::new();
     harness.push_str("#![forbid(unsafe_code)]\nuse std::hint::black_box;\nuse std::time::Instant;\n\n");
@@ -325,6 +507,8 @@ fn real_rustc_o3_benchmark_and_objdump_zero_spill() {
     harness.push_str(&k2.rust_source);
     harness.push('\n');
     harness.push_str(&k3.rust_source);
+    harness.push('\n');
+    harness.push_str(&k4.rust_source);
     harness.push_str(
         r#"
 #[inline(never)]
@@ -404,7 +588,7 @@ fn main() {
     let mut out_naive = vec![0i64; N];
     let mut out_blk = vec![[0i64; 8]; BLOCKS];
 
-    // Bit-exact verification across all 3 compiled kernels before timing.
+    // Bit-exact verification across all 4 compiled kernels before timing.
     naive_modular_hash_lut(&a_flat, &b_flat, &lut, &mut out_naive, N);
     modular_hash_lut_batch(&a_blk, &b_blk, &lut, &mut out_blk);
     for blk in 0..BLOCKS {
@@ -420,6 +604,14 @@ fn main() {
     for blk in 0..BLOCKS {
         assert_eq!(&out_naive[blk * 8..(blk + 1) * 8], &out_blk[blk][..]);
     }
+    let mut q_blk = vec![[2i64; 8]; BLOCKS];
+    for blk in 0..BLOCKS {
+        for lane in 0..8 {
+            q_blk[blk][lane] = (((blk * 8 + lane) % 240) * 4 + 2) as i64;
+        }
+    }
+    quad_crt_8lane_batch(black_box(&q_blk), black_box(&lut), black_box(&mut out_blk));
+    assert_eq!(out_blk[0][0], lut[4] + 7 + (2 * 2 + 1) * 3);
 
     let iters = 300u64;
     let t_n1 = median_ns(|| { naive_modular_hash_lut(black_box(&a_flat), black_box(&b_flat), black_box(&lut), black_box(&mut out_naive), black_box(N)); }, iters);
@@ -501,6 +693,7 @@ fn main() {
             "modular_hash_lut_batch",
             "butterfly_8lane_batch",
             "affine_filter_8lane_batch",
+            "quad_crt_8lane_batch",
         ] {
             let stats = inspect_asm_fn(&asm, fn_name);
             eprintln!(
@@ -558,7 +751,7 @@ fn inspect_asm_fn(asm: &str, sym_substr: &str) -> AsmStats {
         }
         let mut parts = line.split('\t');
         let Some(addr_part) = parts.next() else { continue; };
-        let Some(_bytes_part) = parts.next() else { continue; };
+        if parts.next().is_none() { continue; }
         let Some(asm_part) = parts.next() else { continue; };
         let addr = u64::from_str_radix(addr_part.trim().trim_end_matches(':'), 16).unwrap_or(0);
         let code = asm_part.split('#').next().unwrap_or("").trim();

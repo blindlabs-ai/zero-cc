@@ -156,7 +156,7 @@ impl EGraph {
         match node {
             Op::BoundsCheck { idx, limit } => {
                 let d = self.domain(idx);
-                if d.lo >= 0 && d.hi < limit { out.push(Act::Alias(cid, idx)); }
+                if !d.is_empty() && d.lo >= 0 && d.hi < limit { out.push(Act::Alias(cid, idx)); }
             }
             Op::Load { mem, buf, lane } => {
                 for &mn in self.class(mem).map_or(&[][..], |c| &c.nodes) {
