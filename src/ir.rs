@@ -14,6 +14,7 @@ pub enum CompileError {
     OutOfBounds { idx: i64, limit: i64 },
     DivByZero,
     RegisterSpill { peak_gprs: usize, max_gprs: usize, peak_vecs: usize, max_vecs: usize },
+    ParseError(String),
 }
 
 impl fmt::Display for CompileError {
@@ -29,6 +30,7 @@ impl fmt::Display for CompileError {
             Self::RegisterSpill { peak_gprs, max_gprs, peak_vecs, max_vecs } => {
                 write!(f, "register spill: gprs {peak_gprs}/{max_gprs}, vecs {peak_vecs}/{max_vecs}")
             }
+            Self::ParseError(msg) => write!(f, "parse error: {msg}"),
         }
     }
 }
@@ -215,6 +217,8 @@ impl Domain {
         if self.is_empty() || rhs.is_empty() { return Self::empty(); }
         if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) { Self::exact(a & b) }
         else if self.is_nonneg() && rhs.is_nonneg() { Self::range(0, self.hi.min(rhs.hi)) }
+        else if rhs.is_nonneg() { Self::range(0, rhs.hi) }
+        else if self.is_nonneg() { Self::range(0, self.hi) }
         else { Self::top() }
     }
 }

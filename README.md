@@ -1,16 +1,17 @@
 # zero-cc
 
-Zero-dependency, zero-spill Rust specialized kernel compiler in **1,250 LOC** across `src/`.
+Zero-dependency, zero-spill Rust specialized kernel compiler in **<= 1,550 LOC** across `src/`.
 
 ## Architecture
 
 `zero-cc` (`zero_cc`) solves the three things general-purpose LLVM IR cannot prove on its own -- typed buffer ownership/noalias, exact value range and CRT/quadratic modular congruence domains, and cycle-free DAG algebraic super-optimization -- then lowers to branchless, fixed-size, zero-spill Rust (`&[i64; 8]` / `&mut [i64; 8]`) so `rustc -C opt-level=3` handles instruction selection, AVX2 SLP vectorization, and register allocation cleanly:
 
-- `src/lib.rs`: `#![forbid(unsafe_code)]` pipeline entrypoint `compile_kernel(kernel, RegBudget)` -> validate -> E-Graph -> zero-spill schedule -> Rust codegen.
+- `src/lib.rs`: `#![forbid(unsafe_code)]` pipeline entrypoints `compile_kernel(kernel, RegBudget)` and `compile_rust_source(src, RegBudget)` -> validate -> E-Graph -> zero-spill schedule -> Rust codegen.
+- `src/rust_fe.rs`: Zero-dependency raw safe-Rust `.rs` kernel frontend (`parse_rust_kernel` + `compile_rust_source`) supporting `/// @domain` doc comments and `#[zero_domain(...)]` attributes, constant `for` loop unrolling (`<= 16` trips), exact Rust operator precedence, fail-closed cast/ownership/bounds checks, and fixed-point round-trip compilation `compile_rust_source(&compiled.rust_source)`.
 - `src/ir.rs`: Typed ownership (`BufAccess::{ReadOnly, MutNoAlias, LookupTable(usize)}`), exact interval + modular congruence lattice `Domain { lo, hi, modulus, rem }` with explicit bottom `Domain::empty()`, `tighten()`, `i128` extended-GCD CRT/LCM `try_meet`/`meet`, constant-preserving `eval_add_sub`/`eval_mul`, exact quadratic residue lifting `eval_square` `(m*k + r)^2 == r^2 (mod m * gcd(m + 2r, 2m))`, unified generic `Op<Id>`, `u128`-checked non-negative `barrett_params(d, max_x)`, DAG validation, cost model, and bit-exact interpreter `eval()`.
 - `src/egraph.rs`: Deterministic Union-Find + `BTreeMap` hash-consed E-Graph with domain intersection, upward domain refinement, `noalias` store-forwarding and load-hoisting, dead bounds-check elimination, distributive/butterfly factoring, shift-add/sub strength reduction, shift fusion, modular congruence zeroing, domain-exact Barrett reduction, cycle-free DAG-cost extraction (`dag_cost`), and preserved `proven_domains` across extraction.
-- `src/codegen.rs`: Sethi-Ullman minimum-live-register DAG scheduler with early output emission, pending-read hazard tracking, and fail-closed zero-spill register cliff guard (`RegBudget { max_gprs: 14, max_vecs: 16 }`), plus warning-free (`-D warnings`) Rust emitter with narrow `u32 * u32 -> u64` multiplies (`vpmuludq`) and logical unsigned right shifts (`vpsrlq`).
-- `src/ntf1.rs` & `specs/zero_cc.ntf1`: Zero-SVO `NTF1` (Native Token-Morphism Format v1) parser, canonical emitter, `0t` airlock fixed-point verifier (`+t ->`, `-t <-`, `0t ><`, `|>`), and `export_kernel_ntf1` causal-graph exporter for recursive `zero-cc >< zero-check` co-verification.
+- `src/codegen.rs`: Sethi-Ullman minimum-live-register DAG scheduler with early output emission, pending-read hazard tracking, and fail-closed zero-spill register cliff guard (`RegBudget { max_gprs: 14, max_vecs: 16 }`), plus warning-free (`-D warnings`) Rust emitter with `/// @domain` doc-comment propagation, narrow `u32 * u32 -> u64` multiplies (`vpmuludq`), and logical unsigned right shifts (`vpsrlq`).
+- `src/ntf1.rs` & `specs/zero_cc.ntf1`: Zero-SVO `NTF1` (Native Token-Morphism Format v1) parser, canonical emitter, `0t` airlock fixed-point verifier (`+t ->`, `-t <-`, `0t ><`, `|>`), `0t RustSrc.Parse >< RustO3.Emit` airlock, and `export_kernel_ntf1` causal-graph exporter for recursive `zero-cc >< zero-check` co-verification.
 
 ## Verified Live Benchmarks (AMD Ryzen 9 3900X, `rustc 1.91.0`, 32,768 lanes)
 
@@ -36,7 +37,7 @@ ripwire --lint --lint-ignore=naming src
 ```
 
 Hygiene invariants:
-- `src/` LOC: `<= 1,250` ceiling
+- `src/` LOC: `<= 1,550` ceiling
 - `Cargo.lock` external dependencies: `0` (`0` `"source ="` lines)
 - `#![forbid(unsafe_code)]`, `0` `.clamp(` / `::clamp(`, `0` `#[allow(` / `#[expect(`, `100%` 7-bit ASCII
 

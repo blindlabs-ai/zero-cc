@@ -4,6 +4,7 @@ pub mod codegen;
 pub mod egraph;
 pub mod ir;
 pub mod ntf1;
+pub mod rust_fe;
 
 pub use codegen::{emit_rust, schedule_and_verify, RegBudget, ScheduleReport};
 pub use egraph::optimize_kernel;
@@ -14,6 +15,7 @@ pub use ir::{
 pub use ntf1::{
     emit_ntf1, export_kernel_ntf1, parse_ntf1, verify_ntf1_airlock, Ntf1Error, Ntf1Spec, Ntf1Stmt,
 };
+pub use rust_fe::{compile_rust_source, parse_rust_kernel};
 
 #[derive(Clone, Debug)]
 pub struct CompiledKernel {

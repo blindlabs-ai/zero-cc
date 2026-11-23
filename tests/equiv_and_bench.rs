@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
 use zero_cc::{
-    compile_kernel, emit_ntf1, export_kernel_ntf1, optimize_kernel, parse_ntf1,
-    verify_ntf1_airlock, BufAccess, CompileError, Domain, Kernel, Ntf1Error, Op, RegBudget, LANES,
+    compile_kernel, compile_rust_source, emit_ntf1, export_kernel_ntf1, optimize_kernel,
+    parse_ntf1, parse_rust_kernel, verify_ntf1_airlock, BufAccess, CompileError, Domain, Kernel,
+    Ntf1Error, Op, RegBudget, LANES,
 };
 
 struct SplitMix64(u64);
@@ -806,6 +807,185 @@ fn inspect_asm_fn(asm: &str, sym_substr: &str) -> AsmStats {
         }
     }
     s
+}
+
+#[test]
+fn rust_source_virtio_ring_roundtrip_and_guards() {
+    let virtio_src = r#"
+/// @domain desc: 0..=65535
+/// @domain pkt: 0..=65535
+/// @domain policy: 0..=1023
+pub fn virtio_ring_filter(desc: &[i64; 8], pkt: &[i64; 8], policy: &[i64; 16], out: &mut [i64; 8]) {
+    for lane in 0..8 {
+        let d = desc[lane];
+        let p = pkt[lane];
+        let ring_mix = (d * 17 + p * 17) / 8;
+        let hash = ring_mix % 251;
+        let slot = hash % 16;
+        assert!(slot >= 0 && slot < 16);
+        let action = policy[slot as usize];
+        out[lane] = hash;
+        let h_reload = out[lane];
+        let d_reload = desc[lane];
+        out[lane] = h_reload.wrapping_add(action).wrapping_add(d_reload % 64);
+    }
+}
+"#;
+    let orig_k = parse_rust_kernel(virtio_src).expect("parse virtio_ring_filter");
+    let compiled = compile_rust_source(virtio_src, RegBudget::default()).expect("compile virtio_ring_filter");
+
+    // 1. Counterfactual knockout: naive .rs has divs/rems + bounds checks; optimized has 0 and 0.
+    assert!(compiled.original_cost.divs_rems > 0);
+    assert!(compiled.original_cost.bounds_checks > 0);
+    assert_ne!(compiled.original_cost, compiled.optimized_cost);
+    assert_eq!(compiled.optimized_cost.divs_rems, 0);
+    assert_eq!(compiled.optimized_cost.bounds_checks, 0);
+    assert!(compiled.optimized_cost.mem_ops < compiled.original_cost.mem_ops);
+    assert!(compiled.rust_source.contains("/// @domain desc: 0..=65535"));
+    assert!(compiled.rust_source.contains("/// @domain pkt: 0..=65535"));
+    assert!(compiled.rust_source.contains("/// @domain policy: 0..=1023"));
+
+    // Bit-exact verification across 4,000 Zipfian 8-lane blocks (128 under Miri).
+    let samples = if cfg!(miri) { 128 } else { 4_000 };
+    let mut zipf = ZipfSampler::new(1024, 1.2, 0x91e1_55aa_2026_7777);
+    let mut policy = [0i64; 16];
+    for (i, slot) in policy.iter_mut().enumerate() {
+        *slot = ((i as i64) * 53 + 17) % 1024;
+    }
+    for iter in 0..samples {
+        let mut desc = [0i64; LANES];
+        let mut pkt = [0i64; LANES];
+        for lane in 0..LANES {
+            desc[lane] = match iter { 0 => 0, 1 => 65535, _ => zipf.sample_range(0, 65535) };
+            pkt[lane] = match iter { 0 => 0, 1 => 65535, _ => zipf.sample_range(0, 65535) };
+        }
+        let out_z = [0i64; LANES];
+        let refs: &[&[i64]] = &[&desc, &pkt, &policy, &out_z];
+        let got_orig = orig_k.eval(refs).expect("orig eval");
+        let got_opt = compiled.optimized.eval(refs).expect("opt eval");
+        assert_eq!(got_orig, got_opt, "virtio_ring_filter mismatch at iter {iter}");
+    }
+
+    // Also verify #[zero_domain(... mod ... == ...)] attribute syntax strips on emit and eliminates checks.
+    let quad_attr_src = r#"
+#[zero_domain(x = 2..=962 mod 4 == 2)]
+#[zero_domain(lut = 0..=1023)]
+pub fn quad_attr_kernel(x: &[i64; 8], lut: &[i64; 8], out: &mut [i64; 8]) {
+    for lane in 0..8 {
+        let xi = x[lane];
+        let r16 = (xi * xi) % 16;
+        assert!(r16 >= 0 && r16 < 8);
+        let lv = lut[r16 as usize];
+        out[lane] = lv + ((xi * 2 + 1) * 3) % 8 + xi;
+    }
+}
+"#;
+    let quad_c = compile_rust_source(quad_attr_src, RegBudget::default()).expect("compile quad_attr");
+    assert_eq!(quad_c.optimized_cost.divs_rems, 0);
+    assert_eq!(quad_c.optimized_cost.bounds_checks, 0);
+    assert!(!quad_c.rust_source.contains("#[zero_domain"));
+    assert!(quad_c.rust_source.contains("/// @domain x: 2..=962 mod 4 == 2"));
+
+    // 2. Fail-closed knockouts: write to &[i64; 8], >14 GPR spill, >16 loop trips, negative unsigned shift, negative LUT index.
+    let bad_ro_write = r#"
+pub fn bad_ro(a: &[i64; 8], out: &[i64; 8]) {
+    for lane in 0..8 { out[lane] = a[lane] + 1; }
+}
+"#;
+    assert_ne!(compile_rust_source(virtio_src, RegBudget::default()).is_ok(), compile_rust_source(bad_ro_write, RegBudget::default()).is_ok());
+    assert_eq!(compile_rust_source(bad_ro_write, RegBudget::default()).unwrap_err(), CompileError::WriteToReadOnlyBuf(1));
+
+    let spill_src = r#"
+/// @domain inp: 0..=1000
+pub fn spill_14(inp: &[i64; 8], out: &mut [i64; 8]) {
+    let m0 = inp[0] * 3 + inp[3]; let m1 = inp[1] * 4 + inp[4]; let m2 = inp[2] * 5 + inp[5];
+    let m3 = inp[3] * 6 + inp[6]; let m4 = inp[4] * 7 + inp[7]; let m5 = inp[5] * 8 + inp[0];
+    let m6 = inp[6] * 9 + inp[1]; let m7 = inp[7] * 10 + inp[2]; let m8 = inp[0] * 11 + inp[3];
+    let m9 = inp[1] * 12 + inp[4];
+    let all = m0 + m1 + m2 + m3 + m4 + m5 + m6 + m7 + m8 + m9;
+    out[0] = all - m0; out[1] = all - m1; out[2] = all - m2; out[3] = all - m3;
+    out[4] = all - m4; out[5] = all - m5; out[6] = all - m6; out[7] = all - m7;
+}
+"#;
+    assert_ne!(compile_rust_source(virtio_src, RegBudget::default()).is_ok(), compile_rust_source(spill_src, RegBudget::default()).is_ok());
+    assert!(matches!(compile_rust_source(spill_src, RegBudget::default()), Err(CompileError::RegisterSpill { .. })));
+
+    let bad_loop = "pub fn bad_loop(a: &[i64; 8], out: &mut [i64; 8]) { for i in 0..32 { out[0] = a[0] + i; } }";
+    assert!(matches!(parse_rust_kernel(bad_loop), Err(CompileError::ParseError(_))));
+
+    let bad_ushr = "/// @domain a: -10..=10\npub fn bad_ushr(a: &[i64; 8], out: &mut [i64; 8]) { out[0] = ((a[0] as u64) >> 2) as i64; }";
+    assert!(matches!(parse_rust_kernel(bad_ushr), Err(CompileError::ParseError(_))));
+
+    let neg_lut_src = "/// @domain a: -10..=10\npub fn neg_lut(a: &[i64; 8], lut: &[i64; 16], out: &mut [i64; 8]) { out[0] = lut[a[0] as usize]; }";
+    let neg_k = parse_rust_kernel(neg_lut_src).expect("parse neg_lut");
+    assert_eq!(neg_k.eval(&[&[-1, 0, 0, 0, 0, 0, 0, 0], &[0; 16], &[0; 8]]).unwrap_err(), CompileError::OutOfBounds { idx: -1, limit: 16 });
+
+    // Precedence check: `a + b * 3` must bind `*` tighter than `+`, and `+` tighter than `&`.
+    let prec_src = "pub fn prec(a: &[i64; 8], b: &[i64; 8], out: &mut [i64; 8]) { out[0] = a[0] + b[0] * 3; out[1] = a[0] + b[0] & 7; }";
+    let prec_k = parse_rust_kernel(prec_src).expect("parse prec");
+    let prec_res = prec_k.eval(&[&[2, 0, 0, 0, 0, 0, 0, 0], &[5, 0, 0, 0, 0, 0, 0, 0], &[0; 8]]).expect("eval prec");
+    assert_eq!(prec_res[2][0], 17);
+    assert_eq!(prec_res[2][1], 7);
+
+    // 3. Round-trip fixed-point: compile_rust_source(&compiled.rust_source) matches optimized_cost.
+    let rt = compile_rust_source(&compiled.rust_source, RegBudget::default()).expect("roundtrip compile_rust_source");
+    assert_eq!(rt.optimized_cost, compiled.optimized_cost);
+    assert_eq!(rt.optimized.nodes, compiled.optimized.nodes);
+
+    #[cfg(not(miri))]
+    {
+        use std::path::Path;
+        use std::process::Command;
+
+        let tmp = std::env::temp_dir();
+        let rs_tmp = tmp.join("zero_cc_virtio_rt.rs");
+        let rlib_tmp = tmp.join("libzero_cc_virtio_rt.rlib");
+        let full_rs = format!("#![forbid(unsafe_code)]\n\n{}\n{}\n", compiled.rust_source, quad_c.rust_source);
+        std::fs::write(&rs_tmp, &full_rs).expect("write virtio emitted rs");
+
+        let rc = Command::new("rustc")
+            .env_remove("RUSTFLAGS")
+            .args(["--crate-type", "lib", "-D", "warnings", "-C", "opt-level=3", "-C", "target-cpu=native", "-o"])
+            .arg(&rlib_tmp)
+            .arg(&rs_tmp)
+            .output()
+            .expect("invoke rustc on emitted virtio");
+        assert!(rc.status.success(), "rustc -D warnings failed:\n{}", String::from_utf8_lossy(&rc.stderr));
+
+        let dis = Command::new("objdump").args(["-d", "--demangle"]).arg(&rlib_tmp).output().expect("objdump virtio");
+        assert!(dis.status.success());
+        let asm = String::from_utf8_lossy(&dis.stdout);
+        let stats = inspect_asm_fn(&asm, "virtio_ring_filter_batch");
+        assert!(stats.insns > 0, "missing virtio_ring_filter_batch in objdump");
+        assert_eq!(stats.frame_allocs, 0);
+        assert_eq!(stats.stack_spills, 0);
+        assert_eq!(stats.loop_rsp_ops, 0);
+        assert_eq!(stats.idivs, 0);
+        assert_eq!(stats.calls, 0);
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if let Some(parent) = root.parent() {
+            let sibling_bin = parent.join("zero-check/target/release/zero-check");
+            if sibling_bin.exists() {
+                let out = Command::new(&sibling_bin)
+                    .args(["--no-ledger", "--prove-fns", "--kernel-strict"])
+                    .arg(&rs_tmp)
+                    .output()
+                    .expect("invoke sibling zero-check --prove-fns --kernel-strict");
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !stderr.contains("unknown") {
+                    assert!(
+                        out.status.success(),
+                        "zero-check --prove-fns --kernel-strict rejected emitted virtio:\n{}\n{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        stderr
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&rs_tmp);
+        let _ = std::fs::remove_file(&rlib_tmp);
+    }
 }
 
 #[cfg(kani)]

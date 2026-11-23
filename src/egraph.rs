@@ -224,6 +224,12 @@ impl EGraph {
                 if a == b { out.push(Act::Alias(cid, a)); }
                 else if self.domain(a).is_const() == Some(0) || self.domain(b).is_const() == Some(0) {
                     out.push(Act::Node(cid, Op::Const(0)));
+                } else if let Some(m) = self.domain(b).is_const().filter(|&m| m >= 0 && ((m as u64) + 1).is_power_of_two()) {
+                    let da = self.domain(a);
+                    if da.is_nonneg() && da.hi <= m { out.push(Act::Alias(cid, a)); }
+                } else if let Some(m) = self.domain(a).is_const().filter(|&m| m >= 0 && ((m as u64) + 1).is_power_of_two()) {
+                    let db = self.domain(b);
+                    if db.is_nonneg() && db.hi <= m { out.push(Act::Alias(cid, b)); }
                 }
             }
             Op::MemInit | Op::Const(_) | Op::Store { .. } | Op::LoadLut { .. } => {}
