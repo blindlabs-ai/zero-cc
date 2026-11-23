@@ -1,14 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::codegen::RegBudget;
-use crate::ir::{BufAccess, CompileError, Domain, Kernel, NodeId, Op, LANES};
+use crate::ir::{BufAccess, CmpKind, CompileError, Domain, Kernel, NodeId, Op, LANES};
 use crate::{compile_kernel, CompiledKernel};
 
 const MAX_UNROLL: i64 = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Tok { Ident(String), Int(i64), DocDomain(String), Sym(String) }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ValTy { I64, U32, U64, Usize }
 
@@ -35,7 +34,7 @@ fn lex_rust(src: &str) -> Result<Vec<Tok>, CompileError> {
             let d: String = src[s..i].chars().filter(|&c| c != '_').collect();
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') { i += 1; }
             out.push(Tok::Int(d.parse::<i64>().map_err(|_| perr(format!("bad int '{d}'")))?));
-        } else if let Some(s) = ["..=", "..", "==", ">=", "<=", "&&", "<<", ">>", "->", "#!"].into_iter().find(|s| b[i..].starts_with(s.as_bytes())) {
+        } else if let Some(s) = ["..=", "..", "==", "!=", ">=", "<=", "&&", "<<", ">>", "->", "#!"].into_iter().find(|s| b[i..].starts_with(s.as_bytes())) {
             out.push(Tok::Sym(s.into())); i += s.len();
         } else { out.push(Tok::Sym((b[i] as char).to_string())); i += 1; }
     }
@@ -72,8 +71,9 @@ fn parse_domain_list(toks: &[Tok], out: &mut BTreeMap<String, Domain>) -> Result
 fn binop_prec(tok: Option<&Tok>) -> Option<(u8, &'static str)> {
     let Tok::Sym(s) = tok? else { return None };
     Some(match s.as_str() {
-        "|" => (1, "|"), "^" => (2, "^"), "&" => (3, "&"), "<<" => (4, "<<"), ">>" => (4, ">>"),
-        "+" => (5, "+"), "-" => (5, "-"), "*" => (6, "*"), "/" => (6, "/"), "%" => (6, "%"), _ => return None,
+        "==" => (1, "=="), "!=" => (1, "!="), "<" => (1, "<"), "<=" => (1, "<="), ">" => (1, ">"), ">=" => (1, ">="),
+        "|" => (2, "|"), "^" => (3, "^"), "&" => (4, "&"), "<<" => (5, "<<"), ">>" => (5, ">>"),
+        "+" => (6, "+"), "-" => (6, "-"), "*" => (7, "*"), "/" => (7, "/"), "%" => (7, "%"), _ => return None,
     })
 }
 
@@ -96,6 +96,10 @@ impl Lowerer {
     fn push(&mut self, op: Op<NodeId>) -> NodeId {
         let d = op.eval_domain(|i| self.doms[i], |b| self.k.bufs[b as usize].domain, |i| matches!(self.k.nodes[i], Op::MemInit));
         let id = self.k.push(op); self.doms.push(d); id
+    }
+    fn record_store(&mut self, buf: u8, lane: u8, val: NodeId) {
+        self.mem = self.push(Op::Store { mem: self.mem, buf, lane, val });
+        if let Some(slot) = self.final_out.iter_mut().find(|o| o.0 == buf && o.1 == lane) { slot.2 = val; } else { self.final_out.push((buf, lane, val)); }
     }
     fn push_shift(&mut self, base: NodeId, ty: ValTy, amt: NodeId, is_shr: bool, check_ushr: bool) -> Result<NodeId, CompileError> {
         let s = self.doms[amt].is_const().ok_or_else(|| perr("shift amount must be constant"))?;
@@ -125,12 +129,36 @@ impl Lowerer {
     fn parse_assert(&mut self) -> Result<(Option<String>, NodeId), CompileError> {
         self.req_sym("!")?; self.req_sym("(")?;
         let vname = match (self.peek(), self.toks.get(self.pos + 1)) { (Some(Tok::Ident(s)), Some(Tok::Sym(t))) if t == ">=" => Some(s.clone()), _ => None };
-        let (idx, _) = self.parse_prec(1)?; self.req_sym(">=")?;
+        let (idx, _) = self.parse_prec(2)?; self.req_sym(">=")?;
         if parse_signed(&self.toks, &mut self.pos)? != 0 { return Err(perr("assert! lower bound must be 0")); }
-        self.req_sym("&&")?; let _ = self.parse_prec(1)?; self.req_sym("<")?;
+        self.req_sym("&&")?; let _ = self.parse_prec(2)?; self.req_sym("<")?;
         let limit = parse_signed(&self.toks, &mut self.pos)?;
         if limit <= 0 { return Err(perr("assert! limit must be > 0")); }
         self.req_sym(")")?; Ok((vname, self.push(Op::BoundsCheck { idx, limit })))
+    }
+    fn merge_select(&mut self, cond: NodeId, t_id: NodeId, f_id: NodeId) -> NodeId {
+        if t_id == f_id { t_id } else { self.push(Op::Select { cond, t_val: t_id, f_val: f_id }) }
+    }
+    fn parse_if_stmt(&mut self) -> Result<(), CompileError> {
+        let ((cond, _), sv, sm, so) = (self.parse_prec(1)?, self.vars.clone(), self.mem, self.final_out.clone());
+        self.parse_block()?; let (tv, to) = (self.vars.clone(), self.final_out.clone());
+        self.vars = sv.clone(); self.mem = sm; self.final_out = so.clone();
+        if !self.eat_id("else") { return Err(perr("if statement requires else")); }
+        if self.eat_id("if") { self.parse_if_stmt()?; } else { self.parse_block()?; }
+        let (fv, fo) = (self.vars.clone(), self.final_out.clone());
+        self.vars = sv; self.mem = sm; self.final_out = so;
+        for (name, &(t_id, ty)) in &tv {
+            if let Some(&(f_id, _)) = fv.get(name) { if self.vars.contains_key(name) { let v = self.merge_select(cond, t_id, f_id); self.vars.insert(name.clone(), (v, ty)); } }
+        }
+        let mut keys: Vec<(u8, u8)> = to.iter().chain(&fo).map(|&(b, l, _)| (b, l)).collect();
+        keys.sort_unstable(); keys.dedup();
+        for (buf, lane) in keys {
+            let t_id = to.iter().find(|o| o.0 == buf && o.1 == lane).map(|o| o.2).unwrap_or_else(|| self.push(Op::Load { mem: sm, buf, lane }));
+            let f_id = fo.iter().find(|o| o.0 == buf && o.1 == lane).map(|o| o.2).unwrap_or_else(|| self.push(Op::Load { mem: sm, buf, lane }));
+            let old = self.final_out.iter().find(|o| o.0 == buf && o.1 == lane).map(|o| o.2);
+            if Some(t_id) != old || Some(f_id) != old { let m = self.merge_select(cond, t_id, f_id); self.record_store(buf, lane, m); }
+        }
+        Ok(())
     }
     fn parse_block(&mut self) -> Result<(), CompileError> {
         self.req_sym("{")?;
@@ -150,8 +178,9 @@ impl Lowerer {
                     self.consts.insert(var.clone(), v); self.pos = bpos; self.parse_block()?; epos = self.pos; self.vars = sv; self.consts = sc;
                 }
                 self.pos = epos;
-            } else if self.eat_id("let") {
-                let name = self.req_id()?; if self.eat_sym(":") { let _ = self.req_id()?; }
+            } else if self.eat_id("if") { self.parse_if_stmt()?; }
+            else if self.eat_id("let") {
+                let _ = self.eat_id("mut"); let name = self.req_id()?; if self.eat_sym(":") { let _ = self.req_id()?; }
                 self.req_sym("=")?; let val = self.parse_prec(1)?; self.req_sym(";")?; self.vars.insert(name, val);
             } else if self.eat_id("assert") {
                 let (vname, chk) = self.parse_assert()?; self.req_sym(";")?;
@@ -161,9 +190,7 @@ impl Lowerer {
                 self.pos += 1; let lstart = self.skip_balanced("[", "]")?;
                 let lv = self.try_const(lstart, self.pos - 1).ok_or_else(|| perr("store index must be constant lane"))?;
                 if lv < 0 || lv >= LANES as i64 { return Err(CompileError::InvalidLane(lane_u8(lv))); }
-                let lane = lv as u8; self.req_sym("=")?; let (val, _) = self.parse_prec(1)?; self.req_sym(";")?;
-                self.mem = self.push(Op::Store { mem: self.mem, buf, lane, val });
-                if let Some(slot) = self.final_out.iter_mut().find(|o| o.0 == buf && o.1 == lane) { slot.2 = val; } else { self.final_out.push((buf, lane, val)); }
+                self.req_sym("=")?; let (val, _) = self.parse_prec(1)?; self.req_sym(";")?; self.record_store(buf, lv as u8, val);
             } else { return Err(perr("unexpected token in kernel body")); }
         }
         Ok(())
@@ -174,15 +201,16 @@ impl Lowerer {
             if p < min_p { break; }
             self.pos += 1; let rhs = self.parse_prec(p + 1)?;
             lhs.0 = match op {
+                "==" => self.push(Op::Cmp(CmpKind::Eq, lhs.0, rhs.0)), "!=" => self.push(Op::Cmp(CmpKind::Ne, lhs.0, rhs.0)),
+                "<" => self.push(Op::Cmp(CmpKind::Lt, lhs.0, rhs.0)), "<=" => self.push(Op::Cmp(CmpKind::Le, lhs.0, rhs.0)),
+                ">" => self.push(Op::Cmp(CmpKind::Gt, lhs.0, rhs.0)), ">=" => self.push(Op::Cmp(CmpKind::Ge, lhs.0, rhs.0)),
                 "|" | "^" => match (self.doms[lhs.0].is_const(), self.doms[rhs.0].is_const()) {
                     (Some(a), Some(b)) => self.push(Op::Const(if op == "|" { a | b } else { a ^ b })),
                     _ => return Err(perr(format!("non-constant '{op}' unsupported in kernel IR"))),
                 },
-                "&" => self.push(Op::BitAnd(lhs.0, rhs.0)),
-                "<<" | ">>" => self.push_shift(lhs.0, lhs.1, rhs.0, op == ">>", true)?,
+                "&" => self.push(Op::BitAnd(lhs.0, rhs.0)), "<<" | ">>" => self.push_shift(lhs.0, lhs.1, rhs.0, op == ">>", true)?,
                 "+" => self.push(Op::Add(lhs.0, rhs.0)), "-" => self.push(Op::Sub(lhs.0, rhs.0)),
-                "*" => self.push(Op::Mul(lhs.0, rhs.0)), "/" => self.push(Op::Div(lhs.0, rhs.0)),
-                _ => self.push(Op::Rem(lhs.0, rhs.0)),
+                "*" => self.push(Op::Mul(lhs.0, rhs.0)), "/" => self.push(Op::Div(lhs.0, rhs.0)), _ => self.push(Op::Rem(lhs.0, rhs.0)),
             };
         }
         Ok(lhs)
@@ -192,8 +220,7 @@ impl Lowerer {
         while self.eat_sym(".") {
             let m = self.req_id()?; self.req_sym("(")?; let arg = self.parse_prec(1)?; self.req_sym(")")?;
             val.0 = match m.as_str() {
-                "wrapping_add" => self.push(Op::Add(val.0, arg.0)), "wrapping_sub" => self.push(Op::Sub(val.0, arg.0)),
-                "wrapping_mul" => self.push(Op::Mul(val.0, arg.0)),
+                "wrapping_add" => self.push(Op::Add(val.0, arg.0)), "wrapping_sub" => self.push(Op::Sub(val.0, arg.0)), "wrapping_mul" => self.push(Op::Mul(val.0, arg.0)),
                 "wrapping_shl" | "wrapping_shr" => self.push_shift(val.0, val.1, arg.0, m == "wrapping_shr", false)?,
                 _ => return Err(perr(format!("unsupported method '.{m}'"))),
             };
@@ -214,11 +241,19 @@ impl Lowerer {
         }
         if let Some(&Tok::Int(v)) = self.peek() { self.pos += 1; return Ok((self.push(Op::Const(v)), ValTy::I64)); }
         if self.eat_sym("(") { let v = self.parse_prec(1)?; self.req_sym(")")?; return Ok(v); }
+        if self.eat_id("if") {
+            let (cond, _) = self.parse_prec(1)?;
+            self.req_sym("{")?; let (t_val, ty) = self.parse_prec(1)?; self.req_sym("}")?;
+            if !self.eat_id("else") { return Err(perr("if expr requires else")); }
+            let (f_val, _) = if self.peek() == Some(&Tok::Ident("if".into())) { self.parse_primary()? } else { self.req_sym("{")?; let v = self.parse_prec(1)?; self.req_sym("}")?; v };
+            return Ok((self.push(Op::Select { cond, t_val, f_val }), ty));
+        }
         if self.eat_sym("{") {
             if !self.eat_id("assert") { return Err(perr("block expr must start with assert!")); }
             let (_, chk) = self.parse_assert()?; self.req_sym(";")?; let _ = self.parse_prec(1)?; self.req_sym("}")?; return Ok((chk, ValTy::I64));
         }
         let name = self.req_id()?;
+        if name == "true" || name == "false" { return Ok((self.push(Op::Const(i64::from(name == "true"))), ValTy::I64)); }
         if let Some(&buf) = self.buf_ids.get(&name) {
             let (saved, istart) = (self.pos, self.skip_balanced("[", "]")?);
             if !matches!(self.k.bufs[buf as usize].access, BufAccess::LookupTable(_)) {
@@ -263,11 +298,9 @@ pub fn parse_rust_kernel(src: &str) -> Result<Kernel, CompileError> {
         low.req_sym(";")?;
         let len = match low.peek() { Some(&Tok::Int(v)) if v > 0 => { low.pos += 1; v as usize } _ => return Err(perr("expected array len")) };
         low.req_sym("]")?;
-        let access = if is_mut { if len != LANES { return Err(perr("&mut buffer must have 8 lanes")); } BufAccess::MutNoAlias }
-            else if len == LANES { BufAccess::ReadOnly } else { BufAccess::LookupTable(len) };
+        let access = if is_mut { if len != LANES { return Err(perr("&mut buffer must have 8 lanes")); } BufAccess::MutNoAlias } else if len == LANES { BufAccess::ReadOnly } else { BufAccess::LookupTable(len) };
         let id = low.k.add_buf(pname.clone(), access, domains.get(&pname).copied().unwrap_or_else(Domain::top));
-        low.buf_ids.insert(pname, id);
-        if !low.eat_sym(",") { low.req_sym(")")?; break; }
+        low.buf_ids.insert(pname, id); if !low.eat_sym(",") { low.req_sym(")")?; break; }
     }
     low.init_mem = low.push(Op::MemInit); low.mem = low.init_mem; low.parse_block()?;
     for (buf, lane, val) in low.final_out { low.k.add_output(buf, lane, val); }

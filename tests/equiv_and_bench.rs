@@ -988,6 +988,110 @@ pub fn spill_14(inp: &[i64; 8], out: &mut [i64; 8]) {
     }
 }
 
+#[test]
+fn branchless_select_mux_roundtrip_and_zero_spill() {
+    let raw_src = r#"
+/// @domain sig: 0..=4095
+/// @domain thresh: 0..=4095
+pub fn branchless_clamp_and_mux(sig: &[i64; 8], thresh: &[i64; 8], out: &mut [i64; 8]) {
+    for lane in 0..8 {
+        let s = sig[lane];
+        let t = thresh[lane];
+        let safe_s = if s < 65536 { s } else { 65535 };
+        if safe_s > t {
+            out[lane] = safe_s - t;
+        } else {
+            out[lane] = t - safe_s;
+        }
+    }
+}
+"#;
+    let ablated_src = raw_src.replace("sig: 0..=4095", "sig: 0..=100000");
+
+    let orig_k = parse_rust_kernel(raw_src).expect("parse branchless_clamp_and_mux");
+    let compiled = compile_rust_source(raw_src, RegBudget::default()).expect("compile branchless_clamp_and_mux");
+    let ablated = compile_rust_source(&ablated_src, RegBudget::default()).expect("compile ablated mux");
+
+    // 1. Counterfactual knockout: domain-proven dead branch `if s < 65536` folds away when sig in 0..=4095.
+    assert_ne!(compiled.optimized_cost, ablated.optimized_cost);
+    assert_ne!(compiled.optimized.nodes.len(), ablated.optimized.nodes.len());
+    assert!(compiled.optimized.nodes.len() < ablated.optimized.nodes.len());
+    assert!(compiled.optimized.nodes.iter().any(|op| matches!(op, Op::Select { .. })));
+
+    // Bit-exact verification across 4,000 Zipfian 8-lane blocks (128 under Miri).
+    let samples = if cfg!(miri) { 128 } else { 4_000 };
+    let mut zipf = ZipfSampler::new(1024, 1.2, 0xcafe_babe_2026_1234);
+    for iter in 0..samples {
+        let (mut sig, mut thresh, mut expected) = ([0i64; LANES], [0i64; LANES], [0i64; LANES]);
+        for lane in 0..LANES {
+            sig[lane] = match iter { 0 => 0, 1 => 4095, _ => zipf.sample_range(0, 4095) };
+            thresh[lane] = match iter { 0 => 4095, 1 => 0, _ => zipf.sample_range(0, 4095) };
+            expected[lane] = (sig[lane] - thresh[lane]).abs();
+        }
+        let out_z = [0i64; LANES];
+        let refs: &[&[i64]] = &[&sig, &thresh, &out_z];
+        assert_eq!(orig_k.eval(refs).expect("orig mux")[2], expected);
+        assert_eq!(compiled.optimized.eval(refs).expect("opt mux")[2], expected);
+    }
+
+    // 2. Exact fixed-point round-trip: recompiled.optimized.nodes == compiled.optimized.nodes!
+    let recompiled = compile_rust_source(&compiled.rust_source, RegBudget::default()).expect("roundtrip mux");
+    assert_eq!(recompiled.optimized.nodes, compiled.optimized.nodes);
+    assert_eq!(recompiled.optimized_cost, compiled.optimized_cost);
+
+    // 3. Real rustc -D warnings -O3 native objdump zero-spill + live zero-check proof.
+    #[cfg(not(miri))]
+    {
+        use std::path::Path;
+        use std::process::Command;
+
+        let tmp = std::env::temp_dir();
+        let raw_tmp = tmp.join("zero_cc_mux_raw.rs");
+        let em_tmp = tmp.join("zero_cc_mux_emitted.rs");
+        let rlib_tmp = tmp.join("libzero_cc_mux_emitted.rlib");
+        std::fs::write(&raw_tmp, format!("#![forbid(unsafe_code)]\n{raw_src}")).expect("write raw mux");
+        std::fs::write(&em_tmp, format!("#![forbid(unsafe_code)]\n\n{}", compiled.rust_source)).expect("write emitted mux");
+
+        let rc = Command::new("rustc")
+            .env_remove("RUSTFLAGS")
+            .args(["--crate-type", "lib", "-D", "warnings", "-C", "opt-level=3", "-C", "target-cpu=native", "-o"])
+            .arg(&rlib_tmp)
+            .arg(&em_tmp)
+            .output()
+            .expect("invoke rustc on emitted mux");
+        assert!(rc.status.success(), "rustc -D warnings failed:\n{}", String::from_utf8_lossy(&rc.stderr));
+
+        let dis = Command::new("objdump").args(["-d", "--demangle"]).arg(&rlib_tmp).output().expect("objdump mux");
+        assert!(dis.status.success());
+        let stats = inspect_asm_fn(&String::from_utf8_lossy(&dis.stdout), "branchless_clamp_and_mux_batch");
+        assert!(stats.insns > 0, "missing branchless_clamp_and_mux_batch in objdump");
+        assert_eq!(stats.frame_allocs, 0);
+        assert_eq!(stats.stack_spills, 0);
+        assert_eq!(stats.loop_rsp_ops, 0);
+        assert_eq!(stats.idivs, 0);
+        assert_eq!(stats.calls, 0);
+
+        if let Some(parent) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
+            let sibling_bin = parent.join("zero-check/target/release/zero-check");
+            if sibling_bin.exists() {
+                for (args, path) in [
+                    (&["--no-ledger", "--prove-fns", "--kernel-strict", "--require-totality"][..], &raw_tmp),
+                    (&["--no-ledger", "--prove-fns", "--kernel-strict"][..], &em_tmp),
+                ] {
+                    let out = Command::new(&sibling_bin).args(args).arg(path).output().expect("invoke zero-check");
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if !stderr.contains("unknown") {
+                        assert!(out.status.success(), "zero-check failed on {}:\n{}\n{}", path.display(), String::from_utf8_lossy(&out.stdout), stderr);
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&raw_tmp);
+        let _ = std::fs::remove_file(&em_tmp);
+        let _ = std::fs::remove_file(&rlib_tmp);
+    }
+}
+
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;

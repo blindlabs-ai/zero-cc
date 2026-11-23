@@ -1,7 +1,7 @@
 NTF1 zero_cc
 # zero-cc >< zero-check recursive compiler-verifier contract
-RustSrc.Parse |> Kernel.IR |> Domain.CRT_Quad |> EGraph.Rewrite |> SethiUllman.Sched |> RustO3.Emit
-+t zero_cc -> RustSrc.Parse |> Kernel.IR |> EGraph.Rewrite |> RustO3.Emit
+RustSrc.Parse |> Kernel.IR |> Domain.CRT_Quad |> EGraph.Rewrite |> Select.Cmov |> SethiUllman.Sched |> RustO3.Emit
++t zero_cc -> RustSrc.Parse |> Kernel.IR |> EGraph.Rewrite |> Select.Cmov |> RustO3.Emit
 +t zero_check -> RustO3.Emit |> Lint.ZeroDep |> Verify.Airlock
 +t Domain.Meet -> Domain.CRT_LCM |> Domain.Tighten
 +t Domain.Mul -> Domain.CongruenceLift |> Domain.QuadResidue
