@@ -23,7 +23,12 @@ All 3 compiled kernels are verified bit-exact against naive slice Rust across al
 | `butterfly_8lane` | `18,000 ns -> 19,548 ns` (`0.92x` scalar; `57` vs `145` insns, `0` vs `12` calls) | `19,490 ns -> 7,095 ns` (**`2.75x`**) | `34` insns, `11` AVX2 vec, `0` spills, `0` `idiv`, `0` calls | `145` insns, `0` vec, `12` panic calls |
 | `affine_filter_8lane` | `72,924 ns -> 44,522 ns` (**`1.64x`**) | `59,187 ns -> 18,652 ns` (**`3.17x`**) | `305` insns, `266` AVX2 vec, `0` spills, `0` `idiv`, `0` calls | `58` insns, `0` vec, `3` panic calls |
 
-Across all 3 kernels under both profiles, `objdump -d` confirms: `0` stack frame allocations (`sub $..., %rsp`), `0` stack spills, `0` hot-loop `(%rsp)` accesses, `0` hardware `idiv`, and `0` panic/bounds-check calls.
+Across all compiled kernels (including raw-`.rs` `quad_crt_8lane`, `virtio_ring_filter`, and `branchless_clamp_and_mux`) under both profiles, `objdump -d` confirms: `0` stack frame allocations (`sub $..., %rsp`), `0` stack spills, `0` hot-loop `(%rsp)` accesses, `0` hardware `idiv`, and `0` panic/bounds-check calls.
+
+## Raw `.rs` Round-Trip Airlock (`zero-cc >< zero-check`) & Compile-Time Recursion
+
+- **Direct `.rs -> E-Graph -> Zero-Spill .rs` Fixed-Point (`0t RustSrc.Parse >< RustO3.Emit`):** `compile_rust_source` ingests raw safe-Rust `.rs` kernels (`virtio_ring_filter`, `branchless_clamp_and_mux`) with `/// @domain` doc comments, lowers `if / else` and comparisons into branchless `Op::Cmp` + `Op::Select` (`cmov`/`vblend`), eliminates divisions/moduli/bounds checks via CRT + quadratic congruence E-Graph rewrites, hits exact node-count idempotence on `compile_rust_source(&compiled.rust_source)`, and passes `zero-check --prove-fns --kernel-strict` in `< 2 ms`.
+- **Compile-Time Recursive Compression (`1,272` LOC across `src/`):** `define_ops!` (`[Id; 3]` arity traversal delegating `children` to `map_ids`), `define_errors!`, and tail-recursive `const fn` number-theory solvers (`gcd_u128`, `ext_gcd_i128`, `barrett_params`) keep the entire compiler, E-Graph, register-cliff scheduler, `NTF1` airlock, and `.rs` frontend under `1,300` LOC with `0` external crates and `0` `ripwire` clones/findings.
 
 ## Verification & Hygiene Gates
 
