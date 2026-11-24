@@ -196,6 +196,8 @@ fn emit_op_rhs(kernel: &Kernel, doms: &[Domain], id: NodeId) -> String {
         Op::BitAnd(a, b) => format!("{} & {}", ref_expr(kernel, a), ref_expr(kernel, b)),
         Op::BitOr(a, b) => format!("{} | {}", ref_expr(kernel, a), ref_expr(kernel, b)),
         Op::BitXor(a, b) => format!("{} ^ {}", ref_expr(kernel, a), ref_expr(kernel, b)),
+        Op::Popcnt(a) => format!("(({} as u64).count_ones()) as i64", ref_expr(kernel, a)),
+        Op::Tzcnt(a) => format!("(({} as u64).trailing_zeros()) as i64", ref_expr(kernel, a)),
         Op::Cmp(k, a, b) => if k.is_unsigned() {
             format!("(({} as u64) {} ({} as u64)) as i64", ref_expr(kernel, a), k.sym(), ref_expr(kernel, b))
         } else {

@@ -53,6 +53,7 @@ enum B8Step {
     Mov { dst: usize, src: usize },
     Add32 { dst: usize, a: usize, b: usize },
     Sub32 { dst: usize, a: usize, b: usize },
+    Mul32 { dst: usize, a: usize, b: usize },
     And32 { dst: usize, a: usize, b: usize },
     Andn32 { dst: usize, mask_inv: usize, val: usize },
     Or32 { dst: usize, a: usize, b: usize },
@@ -67,6 +68,7 @@ enum B8Step {
     ShrVar32 { dst: usize, a: usize, b: usize },
     Blend32 { dst: usize, f_val: usize, t_val: usize, mask: usize },
     MulHiShr { dst: usize, x_lo: usize, x_hi: Option<usize>, c: usize, shift: u8, hi_mode: MulHiMode },
+    Popcnt64 { dst: usize, x_lo: usize, x_hi: Option<usize>, mask_0f: usize, mul_0101: usize },
     Store1 { lo: usize, hi: Option<usize>, buf: u8, ty: ElemTy, unpermute: bool },
     Store2U64 { o0_lo: usize, o0_hi: usize, o1_lo: usize, o1_hi: usize, buf: u8 },
 }
@@ -80,6 +82,7 @@ impl B8Step {
             | Self::Mov { dst, .. }
             | Self::Add32 { dst, .. }
             | Self::Sub32 { dst, .. }
+            | Self::Mul32 { dst, .. }
             | Self::And32 { dst, .. }
             | Self::Andn32 { dst, .. }
             | Self::Or32 { dst, .. }
@@ -93,7 +96,8 @@ impl B8Step {
             | Self::ShlVar32 { dst, .. }
             | Self::ShrVar32 { dst, .. }
             | Self::Blend32 { dst, .. }
-            | Self::MulHiShr { dst, .. } => ([dst, 0], 1),
+            | Self::MulHiShr { dst, .. }
+            | Self::Popcnt64 { dst, .. } => ([dst, 0], 1),
         }
     }
 
@@ -103,6 +107,7 @@ impl B8Step {
             Self::Mov { src, .. } | Self::ShlImm32 { src, .. } | Self::ShrImm32 { src, .. } => f(src),
             Self::Add32 { a, b, .. }
             | Self::Sub32 { a, b, .. }
+            | Self::Mul32 { a, b, .. }
             | Self::And32 { a, b, .. }
             | Self::Or32 { a, b, .. }
             | Self::Xor32 { a, b, .. }
@@ -115,6 +120,12 @@ impl B8Step {
             Self::Andn32 { mask_inv, val, .. } => { f(mask_inv); f(val); }
             Self::Blend32 { f_val, t_val, mask, .. } => { f(f_val); f(t_val); f(mask); }
             Self::MulHiShr { x_lo, x_hi, c, .. } => { f(x_lo); if let Some(h) = x_hi { f(h); } f(c); }
+            Self::Popcnt64 { x_lo, x_hi, mask_0f, mul_0101, .. } => {
+                f(x_lo);
+                if let Some(h) = x_hi { f(h); }
+                f(mask_0f);
+                f(mul_0101);
+            }
             Self::Store1 { lo, hi, .. } => { f(lo); if let Some(h) = hi { f(h); } }
             Self::Store2U64 { o0_lo, o0_hi, o1_lo, o1_hi, .. } => { f(o0_lo); f(o0_hi); f(o1_lo); f(o1_hi); }
         }
@@ -227,7 +238,8 @@ fn analyze_demanded_lo32(k: &Kernel, sched: &ScheduleReport) -> Vec<bool> {
                 needs_hi[cond] = true;
                 if hi { needs_hi[t_val] = true; needs_hi[f_val] = true; }
             }
-            Op::Mul(a, b) => { needs_hi[a] = true; needs_hi[b] = true; }
+            Op::Mul(a, b) => { if hi { needs_hi[a] = true; needs_hi[b] = true; } }
+            Op::Popcnt(a) | Op::Tzcnt(a) => { needs_hi[a] = true; }
             Op::Add(a, b) | Op::Sub(a, b) | Op::BitOr(a, b) | Op::BitXor(a, b) => {
                 if hi { needs_hi[a] = true; needs_hi[b] = true; }
             }
@@ -264,6 +276,26 @@ impl<'a> B8Builder<'a> {
     }
 
     fn emit(&mut self, s: B8Step) { self.steps.push(s); }
+
+    fn ensure_reg(&mut self, v: usize) -> usize {
+        if self.consts.iter().any(|&(cv, _)| cv == v) {
+            let d = self.alloc_v();
+            self.emit(B8Step::Mov { dst: d, src: v });
+            d
+        } else {
+            v
+        }
+    }
+
+    fn emit_popcnt_words(&mut self, x_lo: usize, x_hi: Option<usize>) -> usize {
+        let rlo = self.ensure_reg(x_lo);
+        let rhi = x_hi.map(|h| self.ensure_reg(h));
+        let mask_0f = self.const32(0x0F0F_0F0F);
+        let mul_0101 = self.const32(0x0101_0101);
+        let d = self.alloc_v();
+        self.emit(B8Step::Popcnt64 { dst: d, x_lo: rlo, x_hi: rhi, mask_0f, mul_0101 });
+        d
+    }
 
     fn val_lo32(&mut self, v: B8Val) -> usize {
         match v {
@@ -469,7 +501,7 @@ impl<'a> B8Builder<'a> {
     }
 
     fn lower_add(&mut self, id: NodeId, a: NodeId, b: NodeId) -> Option<B8Val> {
-        let (va, vb) = (self.vals[a]?, self.vals[b]?);
+        let (va, vb) = (self.vals.get(a).copied().flatten()?, self.vals.get(b).copied().flatten()?);
         if (self.doms[id].fits_u32() || self.demanded_lo32[id]) && self.is_zero_hi(va) && self.is_zero_hi(vb) {
             let (la, lb) = (self.val_lo32(va), self.val_lo32(vb));
             let d = self.alloc_v();
@@ -536,7 +568,7 @@ impl<'a> B8Builder<'a> {
     }
 
     fn lower_sub(&mut self, id: NodeId, a: NodeId, b: NodeId) -> Option<B8Val> {
-        let (va, vb) = (self.vals[a]?, self.vals[b]?);
+        let (va, vb) = (self.vals.get(a).copied().flatten()?, self.vals.get(b).copied().flatten()?);
         if (self.doms[id].fits_u32() || self.demanded_lo32[id]) && self.is_zero_hi(va) && self.is_zero_hi(vb) {
             let (la, lb) = (self.val_lo32(va), self.val_lo32(vb));
             let d = self.alloc_v();
@@ -663,7 +695,7 @@ impl<'a> B8Builder<'a> {
     }
 
     fn lower_cmp(&mut self, id: NodeId, kind: CmpKind, a: NodeId, b: NodeId) -> Option<B8Val> {
-        let (va, vb) = (self.vals[a]?, self.vals[b]?);
+        let (va, vb) = (self.vals.get(a).copied().flatten()?, self.vals.get(b).copied().flatten()?);
         let mask = if self.is_zero_hi(va) && self.is_zero_hi(vb) {
             let eff_kind = if self.doms[a].is_nonneg() && self.doms[b].is_nonneg() {
                 match kind {
@@ -797,9 +829,82 @@ impl<'a> B8Builder<'a> {
             }
             Op::Add(a, b) => self.lower_add(id, a, b)?,
             Op::Sub(a, b) => self.lower_sub(id, a, b)?,
+            Op::Mul(a, b) => {
+                let (va, vb) = (self.vals.get(a).copied().flatten()?, self.vals.get(b).copied().flatten()?);
+                if self.demanded_lo32[id]
+                    || (self.doms[id].fits_u32() && self.doms[a].fits_u32() && self.doms[b].fits_u32())
+                {
+                    let (la, lb) = (self.val_lo32(va), self.val_lo32(vb));
+                    let d = self.alloc_v();
+                    self.emit(B8Step::Mul32 { dst: d, a: la, b: lb });
+                    B8Val::Lo32(d)
+                } else if let Some((x_id, c_val)) = match (self.k.nodes.get(a), self.k.nodes.get(b)) {
+                    (_, Some(&Op::Const(c))) if c >= 0 && c <= u32::MAX as i64 => Some((a, c as u32)),
+                    (Some(&Op::Const(c)), _) if c >= 0 && c <= u32::MAX as i64 => Some((b, c as u32)),
+                    _ => None,
+                } {
+                    let vx = self.vals.get(x_id).copied().flatten()?;
+                    let x_lo = self.val_lo32(vx);
+                    let x_hi = if self.is_zero_hi(vx) { None } else { Some(self.val_hi32(vx)) };
+                    let c_v = self.const32(c_val);
+                    let lo = self.alloc_v();
+                    self.emit(B8Step::Mul32 { dst: lo, a: x_lo, b: c_v });
+                    let hi = self.alloc_v();
+                    self.emit(B8Step::MulHiShr { dst: hi, x_lo, x_hi, c: c_v, shift: 0, hi_mode: MulHiMode::General });
+                    B8Val::Split64(lo, hi)
+                } else {
+                    return None;
+                }
+            }
+            Op::Popcnt(a) => {
+                let va = self.vals[a]?;
+                if let B8Val::Const(c) = va {
+                    B8Val::Const(u64::from(c.count_ones()))
+                } else if self.is_zero_lo(va) && !self.is_zero_hi(va) {
+                    let ha = self.val_hi32(va);
+                    B8Val::Lo32(self.emit_popcnt_words(ha, None))
+                } else {
+                    let la = self.val_lo32(va);
+                    let ha = if self.is_zero_hi(va) { None } else { Some(self.val_hi32(va)) };
+                    B8Val::Lo32(self.emit_popcnt_words(la, ha))
+                }
+            }
+            Op::Tzcnt(a) => {
+                let va = self.vals[a]?;
+                if let B8Val::Const(c) = va {
+                    B8Val::Const(u64::from(c.trailing_zeros()))
+                } else if self.is_zero_hi(va) {
+                    let lo = self.val_lo32(va);
+                    let one = self.const32(1);
+                    let zero = self.const32(0);
+                    let xm1_lo = self.alloc_v();
+                    self.emit(B8Step::Sub32 { dst: xm1_lo, a: lo, b: one });
+                    let t_lo = self.alloc_v();
+                    self.emit(B8Step::Andn32 { dst: t_lo, mask_inv: lo, val: xm1_lo });
+                    let t_hi = self.alloc_v();
+                    self.emit(B8Step::CmpEq32 { dst: t_hi, a: lo, b: zero });
+                    B8Val::Lo32(self.emit_popcnt_words(t_lo, Some(t_hi)))
+                } else {
+                    let lo = self.val_lo32(va);
+                    let hi = self.val_hi32(va);
+                    let one = self.const32(1);
+                    let zero = self.const32(0);
+                    let xm1_lo = self.alloc_v();
+                    self.emit(B8Step::Sub32 { dst: xm1_lo, a: lo, b: one });
+                    let borrow = self.alloc_v();
+                    self.emit(B8Step::CmpEq32 { dst: borrow, a: lo, b: zero });
+                    let xm1_hi = self.alloc_v();
+                    self.emit(B8Step::Add32 { dst: xm1_hi, a: hi, b: borrow });
+                    let t_lo = self.alloc_v();
+                    self.emit(B8Step::Andn32 { dst: t_lo, mask_inv: lo, val: xm1_lo });
+                    let t_hi = self.alloc_v();
+                    self.emit(B8Step::Andn32 { dst: t_hi, mask_inv: hi, val: xm1_hi });
+                    B8Val::Lo32(self.emit_popcnt_words(t_lo, Some(t_hi)))
+                }
+            }
             Op::BitAnd(a, b) | Op::BitOr(a, b) | Op::BitXor(a, b) => self.lower_bitwise(id, op, a, b)?,
             Op::Shl(a, s) => {
-                let va = self.vals[a]?;
+                let va = self.vals.get(a).copied().flatten()?;
                 if s == 0 { va }
                 else if s >= 32 {
                     let la = self.val_lo32(va);
@@ -852,7 +957,21 @@ impl<'a> B8Builder<'a> {
                         self.emit(B8Step::ShrImm32 { dst: d, src: la, s });
                         B8Val::Lo32(d)
                     } else {
-                        return None;
+                        let la = self.val_lo32(va);
+                        let ha = self.val_hi32(va);
+                        let l_part = self.alloc_v();
+                        let h_part = self.alloc_v();
+                        let lo = self.alloc_v();
+                        self.emit(B8Step::ShrImm32 { dst: l_part, src: la, s });
+                        self.emit(B8Step::ShlImm32 { dst: h_part, src: ha, s: 32 - s });
+                        self.emit(B8Step::Or32 { dst: lo, a: l_part, b: h_part });
+                        if self.demanded_lo32[id] || self.doms[id].fits_u32() {
+                            B8Val::Lo32(lo)
+                        } else {
+                            let hi = self.alloc_v();
+                            self.emit(B8Step::ShrImm32 { dst: hi, src: ha, s });
+                            B8Val::Split64(lo, hi)
+                        }
                     }
                 }
             }
@@ -1782,6 +1901,7 @@ pub(crate) fn emit_x86_batch8_body(e: &mut X86Emit, k: &Kernel, ra: &RegAlloc, p
             }
             B8Step::Add32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(1, 0xFE, d, ra_, rb_); }
             B8Step::Sub32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(1, 0xFA, d, ra_, rb_); }
+            B8Step::Mul32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(2, 0x40, d, ra_, rb_); }
             B8Step::And32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(1, 0xDB, d, ra_, rb_); }
             B8Step::Andn32 { dst, mask_inv, val } => { let (d, rm, rv) = (b8_dst(plan, dst)?, b8_reg(e, plan, mask_inv, 14)?, b8_reg(e, plan, val, 15)?); e.vex_ymm_op(1, 0xDF, d, rm, rv); }
             B8Step::Or32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(1, 0xEB, d, ra_, rb_); }
@@ -1828,6 +1948,33 @@ pub(crate) fn emit_x86_batch8_body(e: &mut X86Emit, k: &Kernel, ra: &RegAlloc, p
                     e.vex_ymm_op(1, 0xFE, d, d, 14);
                 }
                 if shift > 0 { e.vex_shift_imm(0x72, 2, d, d, shift); }
+            }
+            B8Step::Popcnt64 { dst, x_lo, x_hi, mask_0f, mul_0101 } => {
+                let d = b8_dst(plan, dst)?;
+                let rlo = b8_dst(plan, x_lo)?;
+                let rm0f = b8_reg(e, plan, mask_0f, 13)?;
+                e.vex_broadcast_rip(14, 0x0302_0201_0201_0100_u64 as i64);
+                e.vex_broadcast_rip(15, 0x0403_0302_0302_0201_u64 as i64);
+                e.vex_ymm_op(1, 0x6C, 15, 14, 15);
+                e.vex_shift_imm(0x71, 2, 14, rlo, 4);
+                e.vex_ymm_op(1, 0xDB, 14, 14, rm0f);
+                e.vex_ymm_op(2, 0x00, 14, 15, 14);
+                e.vex_ymm_op(1, 0xDB, d, rlo, rm0f);
+                e.vex_ymm_op(2, 0x00, d, 15, d);
+                e.vex_ymm_op(1, 0xFC, d, d, 14);
+                if let Some(xh) = x_hi {
+                    let rhi = b8_dst(plan, xh)?;
+                    e.vex_shift_imm(0x71, 2, 14, rhi, 4);
+                    e.vex_ymm_op(1, 0xDB, 14, 14, rm0f);
+                    e.vex_ymm_op(2, 0x00, 14, 15, 14);
+                    e.vex_ymm_op(1, 0xFC, d, d, 14);
+                    e.vex_ymm_op(1, 0xDB, 14, rhi, rm0f);
+                    e.vex_ymm_op(2, 0x00, 14, 15, 14);
+                    e.vex_ymm_op(1, 0xFC, d, d, 14);
+                }
+                let rmul = b8_reg(e, plan, mul_0101, 15)?;
+                e.vex_ymm_op(2, 0x40, d, d, rmul);
+                e.vex_shift_imm(0x72, 2, d, d, 24);
             }
             B8Step::Store1 { lo, hi, buf, ty, unpermute } => {
                 let breg = *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;

@@ -768,6 +768,7 @@ impl Lowerer {
         let mut expr = self.parse_primary()?;
         while self.eat_sym(".") {
             let (mut n, ty) = self.realize(expr)?;
+            let mut out_ty = ty;
             let m = self.req_id()?;
             self.req_sym("(")?;
             if self.eat_sym(")") {
@@ -779,6 +780,25 @@ impl Lowerer {
                         let neg = self.push(Op::Sub(z, n));
                         self.push(Op::Select { cond: lt, t_val: neg, f_val: n })
                     }
+                    "count_ones" => {
+                        let v = match ty {
+                            ValTy::I32 => { let mask = self.push(Op::Const(0xFFFF_FFFF)); self.push(Op::BitAnd(n, mask)) }
+                            ValTy::I16 => { let mask = self.push(Op::Const(0xFFFF)); self.push(Op::BitAnd(n, mask)) }
+                            _ => n,
+                        };
+                        out_ty = ValTy::U32;
+                        self.push(Op::Popcnt(v))
+                    }
+                    "trailing_zeros" => {
+                        let v = match ty {
+                            ValTy::U32 | ValTy::I32 => { let hi = self.push(Op::Const(1i64 << 32)); self.push(Op::BitOr(n, hi)) }
+                            ValTy::U16 | ValTy::I16 => { let hi = self.push(Op::Const(1i64 << 16)); self.push(Op::BitOr(n, hi)) }
+                            ValTy::U8 => { let hi = self.push(Op::Const(1i64 << 8)); self.push(Op::BitOr(n, hi)) }
+                            _ => n,
+                        };
+                        out_ty = ValTy::U32;
+                        self.push(Op::Tzcnt(v))
+                    }
                     _ => return Err(perr(format!("unsupported 0-arg method '.{m}'"))),
                 };
             } else {
@@ -788,6 +808,13 @@ impl Lowerer {
                     "wrapping_add" => self.push(Op::Add(n, arg)),
                     "wrapping_sub" => self.push(Op::Sub(n, arg)),
                     "wrapping_mul" => self.push(Op::Mul(n, arg)),
+                    "saturating_sub" => {
+                        if ty.is_signed() { return Err(perr("saturating_sub requires unsigned integer")); }
+                        let ge = self.push(Op::Cmp(CmpKind::Uge, n, arg));
+                        let diff = self.push(Op::Sub(n, arg));
+                        let z = self.push(Op::Const(0));
+                        self.push(Op::Select { cond: ge, t_val: diff, f_val: z })
+                    }
                     "wrapping_shl" | "wrapping_shr" => self.push_shift(n, ty, arg, m == "wrapping_shr", false)?,
                     "min" => { let k = if ty.is_u64_cmp() { CmpKind::Ult } else { CmpKind::Lt }; let c = self.push(Op::Cmp(k, n, arg)); self.push(Op::Select { cond: c, t_val: n, f_val: arg }) }
                     "max" => { let k = if ty.is_u64_cmp() { CmpKind::Ugt } else { CmpKind::Gt }; let c = self.push(Op::Cmp(k, n, arg)); self.push(Op::Select { cond: c, t_val: n, f_val: arg }) }
@@ -801,7 +828,7 @@ impl Lowerer {
                     _ => return Err(perr(format!("unsupported method '.{m}'"))),
                 };
             }
-            expr = ExprVal::Node(n, ty);
+            expr = ExprVal::Node(n, out_ty);
         }
         while self.eat_id("as") {
             let (mut n, _) = self.realize(expr)?;

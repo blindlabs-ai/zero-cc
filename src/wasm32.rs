@@ -399,6 +399,11 @@ fn emit_scalar_body(e: &mut WasmBuf, k: &Kernel, sched: &ScheduleReport, locs: &
                         e.op(opc);
                         e.local_set(dst);
                     }
+                    Op::Popcnt(a) | Op::Tzcnt(a) => {
+                        push_scalar_val(e, k, locs, a)?;
+                        e.op(if matches!(op, Op::Popcnt(_)) { 0x7B } else { 0x7A });
+                        e.local_set(dst);
+                    }
                     Op::Cmp(kind, a, b) => {
                         push_scalar_val(e, k, locs, a)?;
                         push_scalar_val(e, k, locs, b)?;

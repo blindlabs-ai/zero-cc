@@ -335,6 +335,8 @@ define_ops! { f;
     BitAnd(Id, Id) | Self::BitAnd(a, b) => Op::BitAnd(f(a), f(b));
     BitOr(Id, Id) | Self::BitOr(a, b) => Op::BitOr(f(a), f(b));
     BitXor(Id, Id) | Self::BitXor(a, b) => Op::BitXor(f(a), f(b));
+    Popcnt(Id) | Self::Popcnt(a) => Op::Popcnt(f(a));
+    Tzcnt(Id) | Self::Tzcnt(a) => Op::Tzcnt(f(a));
     Cmp(CmpKind, Id, Id) | Self::Cmp(k, a, b) => Op::Cmp(k, f(a), f(b));
     Select { cond: Id, t_val: Id, f_val: Id } | Self::Select { cond, t_val, f_val } => Op::Select { cond: f(cond), t_val: f(t_val), f_val: f(f_val) };
 }
@@ -354,6 +356,20 @@ impl<Id: Copy> Op<Id> {
             Self::Ushr(a, s) => dom(a).eval_ushr(s), Self::ShlVar(a, b) => dom(a).eval_shl_var(dom(b)), Self::ShrVarU(a, b) => dom(a).eval_shr_var_u(dom(b)),
             Self::BitAnd(a, b) => dom(a).eval_and(dom(b)), Self::BitOr(a, b) => dom(a).eval_or(dom(b)),
             Self::BitXor(a, b) => if a == b { Domain::exact(0) } else { dom(a).eval_xor(dom(b)) },
+            Self::Popcnt(a) => {
+                let da = dom(a);
+                if da.is_empty() { Domain::empty() }
+                else if let Some(c) = da.is_const() { Domain::exact(i64::from((c as u64).count_ones())) }
+                else if da.fits_u32() { Domain::range(0, 32) }
+                else { Domain::range(0, 64) }
+            }
+            Self::Tzcnt(a) => {
+                let da = dom(a);
+                if da.is_empty() { Domain::empty() }
+                else if let Some(c) = da.is_const() { Domain::exact(i64::from((c as u64).trailing_zeros())) }
+                else if !da.contains(0) { Domain::range(0, 63) }
+                else { Domain::range(0, 64) }
+            }
             Self::Cmp(k, a, b) => if a == b { Domain::exact(i64::from(matches!(k, CmpKind::Eq | CmpKind::Le | CmpKind::Ge | CmpKind::Ule | CmpKind::Uge))) } else { dom(a).eval_cmp(k, dom(b)) },
             Self::Select { cond, t_val, f_val } => {
                 let cd = dom(cond);
@@ -366,7 +382,7 @@ impl<Id: Copy> Op<Id> {
             Self::MemInit | Self::Const(_) => (0, 0), Self::Load { mem, .. } => if is_init(mem) { (4, 1) } else { (12, 2) },
             Self::Store { .. } => (10, 2), Self::LoadLut { .. } => (5, 1), Self::BoundsCheck { .. } => (12, 2), Self::Select { .. } => (2, 1),
             Self::Add(_, _) | Self::Sub(_, _) | Self::Shl(_, _) | Self::Shr(_, _) | Self::Ushr(_, _) | Self::BitAnd(_, _) | Self::BitOr(_, _) | Self::BitXor(_, _) | Self::Cmp(_, _, _) => (1, 1),
-            Self::ShlVar(_, _) | Self::ShrVarU(_, _) => (2, 1),
+            Self::ShlVar(_, _) | Self::ShrVarU(_, _) | Self::Popcnt(_) | Self::Tzcnt(_) => (2, 1),
             Self::Mul(a, b) => if dom(a).fits_u32() && dom(b).fits_u32() { (4, 1) } else { (10, 2) }, Self::Div(_, _) | Self::Rem(_, _) => (36, 3),
         }
     }
@@ -480,6 +496,8 @@ impl Kernel {
                 Op::ShlVar(a, b) => ((vals[a] as u64).wrapping_shl((vals[b] as u32) & 63)) as i64,
                 Op::ShrVarU(a, b) => ((vals[a] as u64).wrapping_shr((vals[b] as u32) & 63)) as i64,
                 Op::BitAnd(a, b) => vals[a] & vals[b], Op::BitOr(a, b) => vals[a] | vals[b], Op::BitXor(a, b) => vals[a] ^ vals[b],
+                Op::Popcnt(a) => i64::from((vals[a] as u64).count_ones()),
+                Op::Tzcnt(a) => i64::from((vals[a] as u64).trailing_zeros()),
                 Op::Cmp(k, a, b) => i64::from(k.eval(vals[a], vals[b])), Op::Select { cond, t_val, f_val } => if vals[cond] != 0 { vals[t_val] } else { vals[f_val] },
             };
         }

@@ -152,6 +152,16 @@ impl EGraph {
                 else if self.domain(b).is_const() == Some(0) { out.push(Act::Alias(cid, a)); }
                 else if self.domain(a).is_const() == Some(0) { out.push(Act::Alias(cid, b)); }
             }
+            Op::Popcnt(a) => {
+                if let Some(c) = self.domain(a).is_const() {
+                    out.push(Act::Node(cid, Op::Const(i64::from((c as u64).count_ones()))));
+                }
+            }
+            Op::Tzcnt(a) => {
+                if let Some(c) = self.domain(a).is_const() {
+                    out.push(Act::Node(cid, Op::Const(i64::from((c as u64).trailing_zeros()))));
+                }
+            }
             Op::Cmp(k, a, b) => for (val, c_id) in [(a, b), (b, a)] {
                 if let Some(c) = self.domain(c_id).is_const() { if self.is_bool(val) && ((k == CmpKind::Ne && c == 0) || (k == CmpKind::Eq && c == 1)) { out.push(Act::Alias(cid, val)); } }
             },

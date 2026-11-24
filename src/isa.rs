@@ -1418,6 +1418,16 @@ fn emit_x86_body(e: &mut X86Emit, kernel: &Kernel, sched: &ScheduleReport, ra: &
                 let (va, vb) = (x86_val_into(e, kernel, ra, a, 0)?, x86_val_into(e, kernel, ra, b, 11)?);
                 e.bmi2_shift(if matches!(op, Op::ShlVar(_, _)) { 1 } else { 3 }, dst, va, vb);
             }
+            Op::Popcnt(a) => {
+                let va = x86_val_into(e, kernel, ra, a, 0)?;
+                e.code.extend_from_slice(&[0xF3, x86_rex_w(dst, va), 0x0F, 0xB8, x86_modrm(3, dst, va)]);
+                e.insns += 1;
+            }
+            Op::Tzcnt(a) => {
+                let va = x86_val_into(e, kernel, ra, a, 0)?;
+                e.code.extend_from_slice(&[0xF3, x86_rex_w(dst, va), 0x0F, 0xBC, x86_modrm(3, dst, va)]);
+                e.insns += 1;
+            }
             Op::Cmp(k, a, b) => { let (va, vb) = (x86_val_into(e, kernel, ra, a, 0)?, x86_val_into(e, kernel, ra, b, 11)?); emit_x86_cmp(e, k, dst, va, vb); }
             Op::Select { cond, t_val, f_val } => {
                 let vc = x86_val_into(e, kernel, ra, cond, 0)?;
@@ -1770,6 +1780,18 @@ fn emit_arm_body(e: &mut ArmEmit, kernel: &Kernel, sched: &ScheduleReport, ra: &
             Op::ShlVar(a, b) => { let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?); e.put(arm64_rrr(0x9AC0_0000, vb, 0x2000, va, dst)); }
             Op::ShrVarU(a, b) => { let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?); e.put(arm64_rrr(0x9AC0_0000, vb, 0x2400, va, dst)); }
             Op::Mul(a, b) => { let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?); e.put(arm64_rrr(0x9B00_0000, vb, 0x7C00, va, dst)); }
+            Op::Popcnt(a) => {
+                let va = arm_val(e, kernel, ra, a, 16)?;
+                e.put(0x9E67_0000 | ((va as u32 & 31) << 5));
+                e.put(0x0E20_5800);
+                e.put(0x0E31_B800);
+                e.put(0x0E01_3C00 | (dst as u32 & 31));
+            }
+            Op::Tzcnt(a) => {
+                let va = arm_val(e, kernel, ra, a, 16)?;
+                e.put(0xDAC0_0000 | ((va as u32 & 31) << 5) | (dst as u32 & 31));
+                e.put(0xDAC0_1000 | ((dst as u32 & 31) << 5) | (dst as u32 & 31));
+            }
             Op::Div(a, b) | Op::Rem(a, b) => {
                 let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?);
                 let (da, db) = (doms.get(a).copied().unwrap_or_else(Domain::top), doms.get(b).copied().unwrap_or_else(Domain::top));
