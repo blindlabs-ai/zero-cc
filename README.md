@@ -1,6 +1,6 @@
 # zero-cc
 
-Zero-dependency, zero-spill Rust specialized kernel compiler & sovereign **100.0% Direct `ELF64`** (`ET_EXEC` + `ET_REL`, `x86_64` AVX2 + `AArch64`) machine-code backend in **4,736 LOC** across `src/`.
+Zero-dependency, zero-spill Rust specialized kernel compiler & sovereign **100.0% Direct `ELF64`** (`ET_EXEC` + `ET_REL`, `x86_64` AVX2 + `AArch64`) and **Direct `WASM32` (+`SIMD128`)** machine-code backend in **6,524 LOC** across `src/`.
 
 ![zero-cc vs rustc -O3 on zero-rans](assets/zero_rans_speedup.svg)
 
@@ -8,19 +8,21 @@ Zero-dependency, zero-spill Rust specialized kernel compiler & sovereign **100.0
 
 `zero-cc` (`zero_cc`) extracts pure numeric kernels directly from unmodified `.rs` files or crate trees, solves typed buffer ownership/noalias, narrow element widths (`i64`/`i32`/`i16`/`u32`/`u16`/`u8`) and variable lane widths (`1..=8`), exact value-range + CRT/quadratic modular congruence domains, and cycle-free DAG algebraic super-optimization (including signed Barrett division `((x * m) >> s) - (x >> 63)`), then lowers directly to:
 1. **Standalone `100.0%` Direct Linux `ELF64` `ET_EXEC` binaries** (zero `rustc`, zero `cc`, zero `ld`, zero LLVM, strict W^X page-congruent `RX`/`RW` `PT_LOAD` + non-executable `PT_GNU_STACK`, self-verified by `verify_elf64_executable`);
-2. **Relocatable `ELF64` `ET_REL` `.o` object files** with typed `extern "C"` Rust FFI shims (`0` LLVM `undef`/`poison` drift, `0` stack spills); or
-3. **Branchless safe Rust** (`&[T; N]` / `&mut [T; N]`).
+2. **Relocatable `ELF64` `ET_REL` `.o` object files** with typed `extern "C"` Rust FFI shims (`0` LLVM `undef`/`poison` drift, `0` stack spills);
+3. **Standalone `0`-import WebAssembly 2.0 (`WASM32` + `SIMD128`) `.wasm` modules** (zero `rustc`, zero `wasm-ld`, zero LLVM, horizontal `i32x4` + vertical 2-block `i64x2` SIMD128 + scalar `i64` fallback, self-verified by `verify_wasm_module`); or
+4. **Branchless safe Rust** (`&[T; N]` / `&mut [T; N]`).
 
-Module breakdown (`4,736` total LOC across `9` files, `0` external crates):
+Module breakdown (`6,524` total LOC across `10` files, `0` external crates):
 
-- `src/lib.rs` (64 LOC): `#![forbid(unsafe_code)]` compile-time declarative macros (`define_errors!`, `define_ops!` with unified `children`/`map_ids` arity-3 traversal) and pipeline entrypoints (`compile_kernel`, `compile_rust_source`, `compile_kernel_direct`, `compile_rust_to_elf`, `compile_standalone_elf_exec`, `compile_rust_to_elf_exec`).
+- `src/lib.rs` (70 LOC): `#![forbid(unsafe_code)]` compile-time declarative macros (`define_errors!`, `define_ops!` with unified `children`/`map_ids` arity-3 traversal) and pipeline entrypoints (`compile_kernel`, `compile_rust_source`, `compile_kernel_direct`, `compile_rust_to_elf`, `compile_standalone_elf_exec`, `compile_rust_to_elf_exec`, `compile_kernel_wasm`, `compile_rust_to_wasm`, `compile_kernels_wasm`).
 - `src/rust_fe.rs` (1,352 LOC): Zero-dependency multi-file Rust crate & kernel frontend (`parse_rust_kernel`, `parse_rust_file_kernels`, `extract_crate_kernels`, `extract_and_compile_crate`, `parse_domain_spec`, `kernel_reg_budget`) supporting narrow `ElemTy` buffers, scalar/tuple auto-batching, bounded helper inlining (`<= 6` depth), constant `for` loop unrolling (`<= 16` trips), `/// @domain` doc comments, `#[zero_domain(...)]` attributes, CLI `--domain` provenance overrides, value/statement `if`/`else` -> branchless `Op::Select`, and exact signed Barrett lowering (`((x * m) >> s) - (x >> 63)`).
 - `src/ir.rs` (417 LOC): Typed ownership (`BufAccess::{ReadOnly, MutNoAlias, LookupTable(usize)}`), `ElemTy::{I64, I32, I16, U32, U16, U8}` (`natural_domain`, `cast_i64`, `push_le_elem`, `scale_shift`), variable `lanes` (`BufDecl::{elem_ty, lanes, block_bytes}`), exact interval + modular congruence lattice `Domain { lo, hi, modulus, rem }` (`fits_i32`, `is_nonneg`) with `i128` tail-recursive `const fn` `gcd_u128`/`ext_gcd_i128` CRT/LCM `try_meet`/`meet`, quadratic residue lifting `eval_square`, `const fn` `u128`-checked `barrett_params(d, max_x)`, DAG validation, cost model, and bit-exact interpreter `eval()`.
 - `src/egraph.rs` (266 LOC): Deterministic Union-Find + `BTreeMap` hash-consed E-Graph with domain intersection, upward domain refinement, `noalias` store-forwarding and load-hoisting, dead bounds-check and dead saturation-clamp elimination, domain-proven dead-branch `Select` and boolean identity (`Select(cond, 1, 0) -> cond`) folding, distributive/butterfly factoring, shift-add/sub strength reduction, modular congruence zeroing, domain-exact Barrett reduction, and cycle-free DAG-cost extraction (`dag_cost`).
 - `src/codegen.rs` (187 LOC): Generalized arity-3 Sethi-Ullman (`calc_su`) minimum-live-register DAG scheduler with memory-chain anti-dependency ordering, early output emission, pending-read hazard tracking, and fail-closed zero-spill register cliff guard (`RegBudget { max_gprs: 14, max_vecs: 16 }`), plus warning-free (`-D warnings`) Rust emitter.
 - `src/isa.rs` (1,724 LOC) & `src/elf64.rs` (374 LOC): Linear-scan physical GPR and `ymm0..ymm15` allocators (`allocate_registers`, `try_plan_avx2_w32`, `try_plan_avx2_batch4`) proving `spills == 0`, System V AMD64 `x86_64` scalar (exact width-matched loads/stores across all 6 `ElemTy` widths with mandatory REX prefix on `u8` stores) + 256-bit AVX2 backends (horizontal `i32x8`/`u32x8` with `0x80000000`-biased unsigned `vpcmpgtd` & `vpblendvb`, vertical 4-block `i64x4` with loop-hoisted constants, 4x4 `vpunpck*`/`vperm2i128` output transpose, and `blocks % 4` scalar tail, plus `i64x8` lane vectorization and `vzeroupper`) and AAPCS64 `AArch64` encoders, 16-byte-aligned counted `<name>_batch` loops, two-pass fixed-width `_start` synthesis invoking Linux `sys_write`/`sys_exit`, standalone `ET_EXEC` (`emit_elf64_executable` + `verify_elf64_executable`) and `ET_REL` (`emit_elf64_object` + `verify_elf64_object`) emitters with strict W^X airlock.
+- `src/wasm32.rs` (1,676 LOC): Standalone `0`-import WebAssembly 2.0 + `SIMD128` binary emitter (`compile_kernel_wasm`, `compile_rust_to_wasm`, `compile_kernels_wasm`) and structural airlock validator (`verify_wasm_module`). Emits strictly ascending sections (`Type < Function < Memory < Export < Code`), linear `"memory"` (min 4 pages = 256 KiB, growable) plus `zero_cc_<name>` / `zero_cc_<name>_batch` exports across three lowering paths: horizontal 8-lane `i32x4` SIMD128 (`v128.load`/`v128.load16x4_{u,s}`, native unsigned `i32x4.lt_u..ge_u`, `v128.bitselect`, `i64x2.extend_{low,high}_i32x4_{s,u}`), vertical 2-block `i64x2` SIMD128 with odd-block scalar tail call across all `6` `ElemTy` widths, and scalar `i64` fallback (`LoadLut`, `BoundsCheck`, `Store`).
 - `src/ntf1.rs` (158 LOC) & `specs/zero_cc.ntf1`: Zero-SVO `NTF1` (Native Token-Morphism Format v1) parser, canonical emitter, and `0t` airlock fixed-point verifier.
-- `src/bin/zero-cc.rs` (194 LOC): Sovereign CLI (`zero-cc <file_or_dir> [--kernel <name>] [--domain <spec>] [--emit-elf <out.o>] [--emit-exec <out_bin>] [--isa x86_64|aarch64] [--bench]`).
+- `src/bin/zero-cc.rs` (300 LOC): Sovereign CLI (`zero-cc <file_or_dir> [--kernel <name>] [--domain <spec>] [--emit-elf <out.o>] [--emit-exec <out_bin>] [--emit-wasm <out.wasm|dir>] [--target x86_64|aarch64|wasm32] [--bench]`).
 
 ## Live Benchmarks: Real `zero-rans` Kernels (`rustc -O3` vs `zero-cc` Direct `ELF64`)
 
@@ -35,7 +37,20 @@ Measured live on **AMD Ryzen 9 3900X** (`rustc 1.91.0 -C opt-level=3`, `512` blo
 | `dct8_1d_even` | `69 -> 31` | `0` / `0` | `100.0%` (`241` insns, `34` `ymm`) | `4.21` | `2.75` | **`1.53x`** | Vertical 4-block `i64x4` AVX2; domain proves all clamps dead |
 | `rans_renorm_branchless` | `137 -> 58` | `0` / `0` | `100.0%` (`83` insns, `40` `ymm`) | `3.03` | `2.70` | **`1.12x`** | Horizontal 8-lane `u32x8` AVX2 (`0x80000000`-biased `vpcmpgtd` + `vpblendvb`) |
 
-Full-crate scan (`./target/release/zero-cc ../zero-rans/src --domain "raw: -262144..=262144, x: -32768..=32767, even: -1000000000..=1000000000, odd: -1000000000..=1000000000, next: 0..=4294967295"`): `7` files, `152` functions, `26` kernels extracted, **`25/26` compiled to `100.0%` direct `ET_EXEC` + `ET_REL` with `0` spills in `23.22 ms`**.
+Full-crate scan (`./target/release/zero-cc ../zero-rans/src --domain "raw: -262144..=262144, x: -32768..=32767, even: -1000000000..=1000000000, odd: -1000000000..=1000000000, next: 0..=4294967295"`): `7` files, `152` functions, `26` kernels extracted, **`25/26` compiled to `100.0%` direct `ET_EXEC` + `ET_REL` with `0` spills in `23.22 ms`**, and **`26/26` compiled to standalone `0`-import `WASM32` (+`SIMD128`) in `21.36 ms`**.
+
+## Live Benchmarks: Direct `WASM32` + `SIMD128` (`zero-rans` in Node v22)
+
+Verified live in **Node v22** (`WebAssembly.validate` + `WebAssembly.instantiate`, `0` imports, `4,096` blocks + `0`/`1`/`3`/`7` tails bit-exact against `Kernel::eval`, `0` WASM `div`/`rem` opcodes across all `6/6` kernels):
+
+| Kernel (`zero-rans`) | WASM Mode | `.wasm` Size | Total / `SIMD128` Insns | WASM `div`/`rem` | Node v22 (`ns/call`) |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| `idct8_1d_combine` | `VerticalI64x2` | `736 B` | `268` / `40` | `0` | `4.39` |
+| `dct8_1d_even` | `VerticalI64x2` | `832 B` | `339` / `46` | `0` | `4.54` |
+| `rans_renorm_branchless` | `HorizontalI32x4` | `687 B` | `203` / `58` | `0` | `4.78` |
+| `dct8_1d_odd` | `VerticalI64x2` | `1,182 B` | `515` / `68` | `0` | `5.46` |
+| `idct8_1d_even` | `VerticalI64x2` | `904 B` | `359` / `48` | `0` | `6.54` |
+| `idct8_1d_odd` | `VerticalI64x2` | `1,460 B` | `631` / `82` | `0` | `9.56` |
 
 ## Live Benchmarks: `i64x8` AVX2 Kernels (32,768 lanes, AMD Ryzen 9 3900X)
 
@@ -62,7 +77,12 @@ env -u RUSTFLAGS cargo build --release --offline
   --kernel idct8_1d_odd --domain "raw: -262144..=262144" \
   --emit-elf /tmp/idct8_1d_odd.o --emit-exec /tmp/idct8_1d_odd --bench
 
-# Full test suite (13/13: direct ELF64 + equiv/bench + live zero-rans 6-kernel bench)
+# Emit standalone 0-import WASM32 (+SIMD128) modules for a whole crate (dir = per-kernel .wasm; .wasm = multi-kernel bundle)
+./target/release/zero-cc ../zero-rans/src \
+  --domain "raw: -262144..=262144, x: -32768..=32767, even: -1000000000..=1000000000, odd: -1000000000..=1000000000, next: 0..=4294967295" \
+  --emit-wasm /tmp/zero_rans_wasm
+
+# Full test suite (17/17: direct ELF64 + equiv/bench + direct WASM32/SIMD128 in Node v22 + live zero-rans 6-kernel bench)
 env -u RUSTFLAGS cargo test --release --offline -- --nocapture
 
 # Clippy, Ripwire clone/lint audit, and zero-check proof gauntlet
@@ -73,7 +93,7 @@ ripwire --lint --lint-ignore=naming src
 ```
 
 Hygiene invariants:
-- `src/` LOC: `4,736` (`9` files)
+- `src/` LOC: `6,524` (`10` files)
 - `Cargo.lock` external dependencies: `0` (`0` `"source ="` lines)
 - `#![forbid(unsafe_code)]`, `0` `.clamp(` / `::clamp(`, `0` `#[allow(` / `#[expect(`, `100%` 7-bit ASCII
 

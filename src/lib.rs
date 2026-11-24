@@ -32,6 +32,7 @@ pub mod ir;
 pub mod isa;
 pub mod ntf1;
 pub mod rust_fe;
+pub mod wasm32;
 
 pub use codegen::{emit_rust, schedule_and_verify, RegBudget, ScheduleReport};
 pub use egraph::optimize_kernel;
@@ -50,6 +51,11 @@ pub use isa::{
 };
 pub use ntf1::{emit_ntf1, export_kernel_ntf1, parse_ntf1, verify_ntf1_airlock, Ntf1Error, Ntf1Spec, Ntf1Stmt};
 pub use rust_fe::{compile_rust_source, parse_rust_kernel};
+pub use wasm32::{
+    compile_kernel_wasm, compile_kernel_wasm_opts, compile_kernels_wasm, compile_rust_to_wasm,
+    verify_wasm_module, CompiledWasm, TargetArch, WasmExport, WasmSummary, WasmVectorMode,
+    WASM_DEFAULT_MEM_PAGES, WASM_MAGIC_VERSION,
+};
 
 #[derive(Clone, Debug)]
 pub struct CompiledKernel { pub optimized: Kernel, pub original_cost: KernelCost, pub optimized_cost: KernelCost, pub schedule: ScheduleReport, pub rust_source: String }
