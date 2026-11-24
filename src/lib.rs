@@ -25,6 +25,7 @@ macro_rules! define_ops {
     };
 }
 
+pub(crate) mod batch8;
 pub mod codegen;
 pub mod egraph;
 pub mod elf64;

@@ -184,6 +184,19 @@ impl EGraph {
         for &xn in self.class(x).map_or(&[][..], |c| &c.nodes) {
             match (is_shr, xn) {
                 (false, Op::Shl(base, s0)) if u16::from(s0) + u16::from(s) < 64 => out.push(Act::Node(cid, Op::Shl(base, s0 + s))),
+                (false, Op::BitAnd(u, v)) if s > 0 && s < 64 => {
+                    for (val_id, mask_id) in [(u, v), (v, u)] {
+                        if let Some(m) = self.domain(mask_id).is_const() {
+                            for &vn in self.class(val_id).map_or(&[][..], |c| &c.nodes) {
+                                if let Op::Shr(base, s0) | Op::Ushr(base, s0) = vn {
+                                    if s0 == s {
+                                        out.push(Act::MaskRem { l: cid, x: base, mask: ((m as u64) << s) as i64 });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 (true, Op::Shr(base, s0)) if u16::from(s0) + u16::from(s) < 64 && self.domain(base).is_nonneg() => out.push(Act::Node(cid, Op::Shr(base, s0 + s))),
                 (true, Op::Shl(base, s0)) => {
                     let db = self.domain(base);

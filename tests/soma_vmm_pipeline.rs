@@ -147,6 +147,22 @@ fn soma_vmm_4stage_pipeline_fuse_barrett_objdump_and_parity() {
         (0x1000, 1500, 0x0A00_0001 | (0x0A00_0001 << 32), 33),
         (0x1000, 1500 | (4 << 32), 0x0A00_0001 | (0x0A00_0001 << 32), 32),
         (0x1000, 0, 0x0A00_0001 | (0x0A00_0001 << 32), 32),
+        // Six adversarial boundary cases: exact High-RAM straddle, 32-bit borrow flip,
+        // len + 1499 u32 wrap boundary, and 8 distinct prefixes [0,8,16,20,24,28,32,33].
+        (0x1_0000_0001, 0xFFFF_FFFF, 0x0A00_0001 | (0x0A00_0000 << 32), 24),
+        (0x1_0000_0002, 0xFFFF_FFFF, 0x0A00_0001 | (0x0A00_0000 << 32), 24),
+        (0x1_3FFF_FFFF, 64, 0x0A00_0001 | (0x0A00_0000 << 32), 24),
+        (0x1_4000_0000, 64, 0x0A00_0001 | (0x0A00_0000 << 32), 24),
+        (0x1000, 0xFFFF_FA24, 0x0A00_0001 | (0x0A00_0000 << 32), 24),
+        (0x1000, 0xFFFF_FA25, 0x0A00_0001 | (0x0A00_0000 << 32), 24),
+        (0x2000, 512, 0x0A00_0001 | (0x0A00_00FF << 32), 0),
+        (0x2000, 512, 0x0A00_0001 | (0x0A11_2233 << 32), 8),
+        (0x2000, 512, 0x0A00_0001 | (0x0A00_2233 << 32), 16),
+        (0x2000, 512, 0x0A00_0001 | (0x0A00_0F33 << 32), 20),
+        (0x2000, 512, 0x0A00_0001 | (0x0A00_0033 << 32), 24),
+        (0x2000, 512, 0x0A00_0001 | (0x0A00_000F << 32), 28),
+        (0x2000, 512, 0x0A00_0001 | (0x0A00_0001 << 32), 32),
+        (0x2000, 512, 0x0A00_0001 | (0x0A00_0001 << 32), 33),
     ];
     for &(gpa, desc, net, prefix) in cases {
         let want = soma_oracle(gpa, desc, net, prefix);
@@ -155,6 +171,28 @@ fn soma_vmm_4stage_pipeline_fuse_barrett_objdump_and_parity() {
             .expect("eval opt");
         assert_eq!([got_ir[4][0] as u64, got_ir[4][1] as u64], want, "IR mismatch on ({gpa:#x}, {desc:#x}, {net:#x}, {prefix})");
     }
+    // Verify exact oracle outcomes for the 4 key arithmetic boundaries.
+    assert_eq!(soma_oracle(0x1_0000_0001, 0xFFFF_FFFF, 0x0A00_0001 | (0x0A00_0000 << 32), 24), [0xC000_0001, (1u64 << 63) | (2_863_312u64 << 32) | 0xFFFF_FFFF]);
+    assert_eq!(soma_oracle(0x1_0000_0002, 0xFFFF_FFFF, 0x0A00_0001 | (0x0A00_0000 << 32), 24), [0, 0]);
+    assert_eq!(soma_oracle(0x1_3FFF_FFFF, 64, 0x0A00_0001 | (0x0A00_0000 << 32), 24)[0], 0x0_FFFF_FFFF);
+    assert_eq!(soma_oracle(0x1_4000_0000, 64, 0x0A00_0001 | (0x0A00_0000 << 32), 24)[0], 0x1_0000_0000);
+
+    // Counterfactual non-SOMA kernel with identical (u64, u64, u64, u8) -> [u64; 2] buffer shape:
+    // fast-path superblock specialization must never miscompile a different output formula.
+    let counter_k = parse_rust_kernel(
+        "pub fn counter_vmm(in_gpa: &[u64; 1], in_desc: &[u64; 1], in_net: &[u64; 1], in_prefix: &[u8; 1], out_res: &mut [u64; 2]) {
+            let len = in_desc[0] & 0xFFFF_FFFF;
+            let credits = (len + 1499) / 1500;
+            let ok = if in_gpa[0] < 0xC000_0000 { if (in_prefix[0] as u64) <= 32 { 1 } else { 0 } } else { 0 };
+            out_res[0] = if ok != 0 { in_gpa[0] + 7 } else { 0 };
+            out_res[1] = if ok != 0 { (credits << 32) | (in_net[0] & 0xFFFF_FFFF) } else { 0 };
+        }",
+    )
+    .expect("parse counter_vmm");
+    let counter_obj = compile_kernel_direct(&counter_k, RegBudget { max_gprs: 14, max_vecs: 32 }, TargetIsa::X86_64)
+        .expect("compile counter_vmm");
+    verify_elf64_object(&counter_obj.elf_bytes).expect("verify counter_vmm elf");
+    assert!(counter_obj.zero_spills);
 
     // Compile direct ELF64 x86-64 + AArch64 and inspect disassembly.
     let budget = RegBudget { max_gprs: 14, max_vecs: 32 };
@@ -179,17 +217,28 @@ fn soma_vmm_4stage_pipeline_fuse_barrett_objdump_and_parity() {
         let mut ymm_cnt = 0usize;
         let mut div_cnt = 0usize;
         let mut spill_cnt = 0usize;
+        let mut vptest_cnt = 0usize;
         let mut in_fn = false;
         for line in asm.lines() {
             if line.contains("<zero_cc_soma_vmm_4stage_batch>:") { in_fn = true; continue; }
             if !in_fn { continue; }
             if line.contains("ymm") { ymm_cnt += 1; }
+            if line.contains("vptest") { vptest_cnt += 1; }
             if line.contains("\tdiv ") || line.contains("\tidiv ") { div_cnt += 1; }
             if line.contains("[rsp") || line.contains("[rbp") { spill_cnt += 1; }
         }
-        eprintln!("SOMA_OBJ|insns={}|ymm={}|divs={}|spills={}|bytes={}", x86.direct_insns, ymm_cnt, div_cnt, spill_cnt, x86.elf_bytes.len());
+        eprintln!("SOMA_OBJ|insns={}|ymm={}|divs={}|spills={}|vptest={}|bytes={}", x86.direct_insns, ymm_cnt, div_cnt, spill_cnt, vptest_cnt, x86.elf_bytes.len());
         assert_eq!(div_cnt, 0, "found div/idiv in zero_cc_soma_vmm_4stage_batch:\n{asm}");
         assert_eq!(spill_cnt, 0, "found stack spill in zero_cc_soma_vmm_4stage_batch:\n{asm}");
-        assert!(ymm_cnt > 100, "expected AVX2 Batch4Plan YMM emission, got ymm={ymm_cnt}:\n{asm}");
+        assert!(ymm_cnt > 100, "expected AVX2 Batch8Plan YMM emission, got ymm={ymm_cnt}:\n{asm}");
+        assert!(vptest_cnt >= 1, "expected Pass-2 vptest superblock in zero_cc_soma_vmm_4stage_batch:\n{asm}");
+
+        let c_path = std::env::temp_dir().join("zero_cc_counter_vmm.o");
+        std::fs::write(&c_path, &counter_obj.elf_bytes).expect("write counter_vmm .o");
+        let c_dis = Command::new("objdump").args(["-d", "-M", "intel"]).arg(&c_path).output().expect("objdump counter_vmm .o");
+        let _ = std::fs::remove_file(&c_path);
+        assert!(c_dis.status.success());
+        let c_asm = String::from_utf8_lossy(&c_dis.stdout);
+        assert!(!c_asm.contains("vptest"), "counterfactual counter_vmm must not trigger SOMA vptest fast path:\n{c_asm}");
     }
 }
