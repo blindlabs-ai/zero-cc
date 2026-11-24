@@ -40,6 +40,8 @@ const SIMD_I32X4_LE_U: u32 = 0x3E;
 const SIMD_I32X4_GE_S: u32 = 0x3F;
 const SIMD_I32X4_GE_U: u32 = 0x40;
 const SIMD_V128_AND: u32 = 0x4E;
+const SIMD_V128_OR: u32 = 0x50;
+const SIMD_V128_XOR: u32 = 0x51;
 const SIMD_V128_BITSELECT: u32 = 0x52;
 const SIMD_V128_LOAD64_LANE: u32 = 0x57;
 const SIMD_V128_STORE64_LANE: u32 = 0x5B;
@@ -55,6 +57,7 @@ const SIMD_I64X2_EXTEND_LOW_I32X4_U: u32 = 0xC9;
 const SIMD_I64X2_EXTEND_HIGH_I32X4_U: u32 = 0xCA;
 const SIMD_I64X2_SHL: u32 = 0xCB;
 const SIMD_I64X2_SHR_S: u32 = 0xCC;
+const SIMD_I64X2_SHR_U: u32 = 0xCD;
 const SIMD_I64X2_ADD: u32 = 0xCE;
 const SIMD_I64X2_SUB: u32 = 0xD1;
 const SIMD_I64X2_MUL: u32 = 0xD5;
@@ -209,7 +212,7 @@ impl WasmBuf {
     }
     fn load_elem_i64(&mut self, ty: ElemTy, offset: u32) {
         let opcode = match ty {
-            ElemTy::I64 => 0x29,
+            ElemTy::I64 | ElemTy::U64 => 0x29,
             ElemTy::I32 => 0x34,
             ElemTy::I16 => 0x32,
             ElemTy::U32 => 0x35,
@@ -221,7 +224,7 @@ impl WasmBuf {
     }
     fn store_elem_i64(&mut self, ty: ElemTy, offset: u32) {
         let opcode = match ty {
-            ElemTy::I64 => 0x37,
+            ElemTy::I64 | ElemTy::U64 => 0x37,
             ElemTy::I32 | ElemTy::U32 => 0x3E,
             ElemTy::I16 | ElemTy::U16 => 0x3D,
             ElemTy::U8 => 0x3C,
@@ -366,7 +369,8 @@ fn emit_scalar_body(e: &mut WasmBuf, k: &Kernel, sched: &ScheduleReport, locs: &
                         e.op(0x00);
                         e.op(0x0B);
                     }
-                    Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::Rem(a, b) | Op::BitAnd(a, b) => {
+                    Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::Rem(a, b)
+                    | Op::BitAnd(a, b) | Op::BitOr(a, b) | Op::BitXor(a, b) | Op::ShlVar(a, b) | Op::ShrVarU(a, b) => {
                         push_scalar_val(e, k, locs, a)?;
                         push_scalar_val(e, k, locs, b)?;
                         let opc = match op {
@@ -375,15 +379,24 @@ fn emit_scalar_body(e: &mut WasmBuf, k: &Kernel, sched: &ScheduleReport, locs: &
                             Op::Mul(_, _) => 0x7E,
                             Op::Div(_, _) => 0x7F,
                             Op::Rem(_, _) => 0x81,
-                            _ => 0x83,
+                            Op::BitAnd(_, _) => 0x83,
+                            Op::BitOr(_, _) => 0x84,
+                            Op::BitXor(_, _) => 0x85,
+                            Op::ShlVar(_, _) => 0x86,
+                            _ => 0x88,
                         };
                         e.op(opc);
                         e.local_set(dst);
                     }
-                    Op::Shl(a, s) | Op::Shr(a, s) => {
+                    Op::Shl(a, s) | Op::Shr(a, s) | Op::Ushr(a, s) => {
                         push_scalar_val(e, k, locs, a)?;
                         e.i64_const(i64::from(s));
-                        e.op(if matches!(op, Op::Shl(_, _)) { 0x86 } else { 0x87 });
+                        let opc = match op {
+                            Op::Shl(_, _) => 0x86,
+                            Op::Shr(_, _) => 0x87,
+                            _ => 0x88,
+                        };
+                        e.op(opc);
                         e.local_set(dst);
                     }
                     Op::Cmp(kind, a, b) => {
@@ -393,9 +406,13 @@ fn emit_scalar_body(e: &mut WasmBuf, k: &Kernel, sched: &ScheduleReport, locs: &
                             CmpKind::Eq => 0x51,
                             CmpKind::Ne => 0x52,
                             CmpKind::Lt => 0x53,
+                            CmpKind::Ult => 0x54,
                             CmpKind::Gt => 0x55,
+                            CmpKind::Ugt => 0x56,
                             CmpKind::Le => 0x57,
+                            CmpKind::Ule => 0x58,
                             CmpKind::Ge => 0x59,
+                            CmpKind::Uge => 0x5A,
                         };
                         e.op(opc);
                         e.op(0xAD);
@@ -578,6 +595,9 @@ impl<'a> I32x4Ctx<'a> {
                 self.push_step(op, false)
             }
             Op::Cmp(kind, _, _) => {
+                if kind.is_unsigned() && !self.unsigned {
+                    return None;
+                }
                 let (mut la, mut lb) = ([0usize; LANES], [0usize; LANES]);
                 for (i, &id) in ids.iter().enumerate() {
                     let Op::Cmp(k2, a, b) = self.k.nodes.get(id).copied()? else {
@@ -779,13 +799,13 @@ fn emit_i32x4_half(e: &mut WasmBuf, plan: &I32x4Plan, base_v: u32, half_idx: u32
                     (CmpKind::Eq, _) => SIMD_I32X4_EQ,
                     (CmpKind::Ne, _) => SIMD_I32X4_NE,
                     (CmpKind::Lt, false) => SIMD_I32X4_LT_S,
-                    (CmpKind::Lt, true) => SIMD_I32X4_LT_U,
+                    (CmpKind::Lt, true) | (CmpKind::Ult, _) => SIMD_I32X4_LT_U,
                     (CmpKind::Gt, false) => SIMD_I32X4_GT_S,
-                    (CmpKind::Gt, true) => SIMD_I32X4_GT_U,
+                    (CmpKind::Gt, true) | (CmpKind::Ugt, _) => SIMD_I32X4_GT_U,
                     (CmpKind::Le, false) => SIMD_I32X4_LE_S,
-                    (CmpKind::Le, true) => SIMD_I32X4_LE_U,
+                    (CmpKind::Le, true) | (CmpKind::Ule, _) => SIMD_I32X4_LE_U,
                     (CmpKind::Ge, false) => SIMD_I32X4_GE_S,
-                    (CmpKind::Ge, true) => SIMD_I32X4_GE_U,
+                    (CmpKind::Ge, true) | (CmpKind::Uge, _) => SIMD_I32X4_GE_U,
                 };
                 e.simd(sub);
                 e.local_set(dst);
@@ -835,23 +855,26 @@ fn can_plan_i64x2(k: &Kernel, sched: &ScheduleReport) -> bool {
         return false;
     }
     sched.order.iter().all(|&id| {
-        matches!(
-            k.nodes.get(id),
+        match k.nodes.get(id) {
             Some(
                 Op::MemInit
-                    | Op::Const(_)
-                    | Op::Load { .. }
-                    | Op::Store { .. }
-                    | Op::Add(_, _)
-                    | Op::Sub(_, _)
-                    | Op::Mul(_, _)
-                    | Op::Shl(_, _)
-                    | Op::Shr(_, _)
-                    | Op::BitAnd(_, _)
-                    | Op::Cmp(_, _, _)
-                    | Op::Select { .. }
-            )
-        )
+                | Op::Const(_)
+                | Op::Load { .. }
+                | Op::Store { .. }
+                | Op::Add(_, _)
+                | Op::Sub(_, _)
+                | Op::Mul(_, _)
+                | Op::Shl(_, _)
+                | Op::Shr(_, _)
+                | Op::Ushr(_, _)
+                | Op::BitAnd(_, _)
+                | Op::BitOr(_, _)
+                | Op::BitXor(_, _)
+                | Op::Select { .. },
+            ) => true,
+            Some(Op::Cmp(kind, _, _)) => !kind.is_unsigned(),
+            _ => false,
+        }
     })
 }
 
@@ -935,7 +958,7 @@ fn emit_i64x2_store_pair(
     let off1 = (b.block_bytes() as u32).saturating_add(off0);
     push_i64x2_val(e, k, locs, is_mask, hoisted, val)?;
     e.local_set(scratch_v);
-    if b.elem_ty == ElemTy::I64 {
+    if matches!(b.elem_ty, ElemTy::I64 | ElemTy::U64) {
         e.local_get(u32::from(buf));
         e.local_get(scratch_v);
         e.simd_mem(SIMD_V128_STORE64_LANE, 3, off0);
@@ -991,7 +1014,7 @@ fn emit_i64x2_body(
                         let b = k.bufs.get(usize::from(buf)).ok_or(CompileError::InvalidBuffer(buf))?;
                         let off0 = u32::from(lane) * u32::from(b.elem_ty.bytes());
                         let off1 = (b.block_bytes() as u32).saturating_add(off0);
-                        if b.elem_ty == ElemTy::I64 {
+                        if matches!(b.elem_ty, ElemTy::I64 | ElemTy::U64) {
                             e.local_get(u32::from(buf));
                             e.local_get(u32::from(buf));
                             e.simd_mem(SIMD_V128_LOAD64_SPLAT, 3, off0);
@@ -1008,22 +1031,29 @@ fn emit_i64x2_body(
                         }
                         e.local_set(dst);
                     }
-                    Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::BitAnd(a, b) => {
+                    Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::BitAnd(a, b) | Op::BitOr(a, b) | Op::BitXor(a, b) => {
                         push_i64x2_val(e, k, locs, &is_mask, hoisted, a)?;
                         push_i64x2_val(e, k, locs, &is_mask, hoisted, b)?;
                         let sub = match op {
                             Op::Add(_, _) => SIMD_I64X2_ADD,
                             Op::Sub(_, _) => SIMD_I64X2_SUB,
                             Op::Mul(_, _) => SIMD_I64X2_MUL,
-                            _ => SIMD_V128_AND,
+                            Op::BitAnd(_, _) => SIMD_V128_AND,
+                            Op::BitOr(_, _) => SIMD_V128_OR,
+                            _ => SIMD_V128_XOR,
                         };
                         e.simd(sub);
                         e.local_set(dst);
                     }
-                    Op::Shl(a, s) | Op::Shr(a, s) => {
+                    Op::Shl(a, s) | Op::Shr(a, s) | Op::Ushr(a, s) => {
                         push_i64x2_val(e, k, locs, &is_mask, hoisted, a)?;
                         e.i32_const(i32::from(s));
-                        e.simd(if matches!(op, Op::Shl(_, _)) { SIMD_I64X2_SHL } else { SIMD_I64X2_SHR_S });
+                        let sub = match op {
+                            Op::Shl(_, _) => SIMD_I64X2_SHL,
+                            Op::Shr(_, _) => SIMD_I64X2_SHR_S,
+                            _ => SIMD_I64X2_SHR_U,
+                        };
+                        e.simd(sub);
                         e.local_set(dst);
                     }
                     Op::Cmp(kind, a, b) => {
@@ -1036,6 +1066,7 @@ fn emit_i64x2_body(
                             CmpKind::Gt => SIMD_I64X2_GT_S,
                             CmpKind::Le => SIMD_I64X2_LE_S,
                             CmpKind::Ge => SIMD_I64X2_GE_S,
+                            _ => return Err(werr("unsigned i64x2 cmp unsupported")),
                         };
                         e.simd(sub);
                         e.local_set(dst);

@@ -1241,7 +1241,7 @@ fn narrow_elem_ty_all_six_widths_variable_lanes_and_u8_rex_pressure() {
     for &ty in &all_tys {
         let rty = ty.rust_name();
         let (exp_ldr, exp_str, exp_lut) = match ty {
-            ElemTy::I64 => (0xF940_0000u32, 0xF900_0000u32, 0xF860_7800u32),
+            ElemTy::I64 | ElemTy::U64 => (0xF940_0000u32, 0xF900_0000u32, 0xF860_7800u32),
             ElemTy::I32 => (0xB980_0000u32, 0xB900_0000u32, 0xB8A0_7800u32),
             ElemTy::I16 => (0x7980_0000u32, 0x7900_0000u32, 0x78A0_7800u32),
             ElemTy::U32 => (0xB940_0000u32, 0xB900_0000u32, 0xB860_7800u32),

@@ -913,8 +913,13 @@ pub fn spill_14(inp: &[i64; 8], out: &mut [i64; 8]) {
     let bad_loop = "pub fn bad_loop(a: &[i64; 8], out: &mut [i64; 8]) { for i in 0..32 { out[0] = a[0] + i; } }";
     assert!(matches!(parse_rust_kernel(bad_loop), Err(CompileError::ParseError(_))));
 
-    let bad_ushr = "/// @domain a: -10..=10\npub fn bad_ushr(a: &[i64; 8], out: &mut [i64; 8]) { out[0] = ((a[0] as u64) >> 2) as i64; }";
-    assert!(matches!(parse_rust_kernel(bad_ushr), Err(CompileError::ParseError(_))));
+    let ushr_src = "/// @domain a: -10..=10\npub fn ok_ushr(a: &[i64; 8], out: &mut [i64; 8]) { out[0] = ((a[0] as u64) >> 2) as i64; }";
+    let ushr_k = parse_rust_kernel(ushr_src).expect("parse ok_ushr");
+    let ushr_res = ushr_k.eval(&[&[-1, 0, 0, 0, 0, 0, 0, 0], &[0; 8]]).expect("eval ok_ushr");
+    assert_eq!(ushr_res[1][0], 0x3FFF_FFFF_FFFF_FFFF_i64);
+
+    let bad_cast = "/// @domain a: -10..=10\npub fn bad_cast(a: &[i64; 8], out: &mut [i64; 8]) { out[0] = a[0] as f64; }";
+    assert!(matches!(parse_rust_kernel(bad_cast), Err(CompileError::ParseError(_))));
 
     let neg_lut_src = "/// @domain a: -10..=10\npub fn neg_lut(a: &[i64; 8], lut: &[i64; 16], out: &mut [i64; 8]) { out[0] = lut[a[0] as usize]; }";
     let neg_k = parse_rust_kernel(neg_lut_src).expect("parse neg_lut");

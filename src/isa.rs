@@ -11,8 +11,8 @@ use crate::optimize_kernel;
 use crate::rust_fe::parse_rust_kernel;
 
 const X86_ARGS: [u8; 6] = [7, 6, 2, 1, 8, 9];
-const X86_CALLEE: [u8; 5] = [3, 12, 13, 14, 15];
-const X86_POOL: [u8; 12] = [10, 1, 2, 6, 7, 8, 9, 3, 12, 13, 14, 15];
+const X86_CALLEE: [u8; 6] = [3, 5, 12, 13, 14, 15];
+const X86_POOL: [u8; 13] = [10, 1, 2, 6, 7, 8, 9, 3, 5, 12, 13, 14, 15];
 const ARM_POOL: [u8; 14] = [9, 10, 11, 12, 13, 14, 15, 19, 20, 21, 22, 23, 24, 25];
 
 #[derive(Clone, Debug)]
@@ -141,9 +141,9 @@ pub fn allocate_registers(kernel: &Kernel, sched: &ScheduleReport, isa: TargetIs
     Ok(RegAlloc { node_reg, buf_reg, callee_saved: used_callee, spills: 0 })
 }
 
-struct X86Emit { code: Vec<u8>, insns: usize }
+struct X86Emit { code: Vec<u8>, insns: usize, const_pool: Vec<i64>, const_patches: Vec<(usize, usize)> }
 impl X86Emit {
-    fn new() -> Self { Self { code: Vec::with_capacity(512), insns: 0 } }
+    fn new() -> Self { Self { code: Vec::with_capacity(512), insns: 0, const_pool: Vec::new(), const_patches: Vec::new() } }
     fn push_rr(&mut self, op: u8, reg: u8, rm: u8) { self.code.extend_from_slice(&[x86_rex_w(reg, rm), op, x86_modrm(3, reg, rm)]); self.insns += 1; }
     fn mov_rr(&mut self, dst: u8, src: u8) { if dst != src { self.push_rr(0x89, src, dst); } }
     fn movabs_imm64(&mut self, dst: u8, val: u64) {
@@ -182,12 +182,12 @@ impl X86Emit {
         self.insns += 1;
     }
     fn push_load_prefix_opc(&mut self, ty: ElemTy, dst: u8, idx: u8, base: u8) {
-        let need_w = matches!(ty, ElemTy::I64 | ElemTy::I32 | ElemTy::I16);
+        let need_w = matches!(ty, ElemTy::I64 | ElemTy::U64 | ElemTy::I32 | ElemTy::I16);
         if need_w || dst >= 8 || idx >= 8 || base >= 8 {
             self.code.push(x86_rex_byte(need_w, dst, idx, base));
         }
         match ty {
-            ElemTy::I64 | ElemTy::U32 => self.code.push(0x8B),
+            ElemTy::I64 | ElemTy::U64 | ElemTy::U32 => self.code.push(0x8B),
             ElemTy::I32 => self.code.push(0x63),
             ElemTy::I16 => self.code.extend_from_slice(&[0x0F, 0xBF]),
             ElemTy::U16 => self.code.extend_from_slice(&[0x0F, 0xB7]),
@@ -200,7 +200,7 @@ impl X86Emit {
     }
     fn store_lane(&mut self, ty: ElemTy, src: u8, base: u8, lane: u8) {
         match ty {
-            ElemTy::I64 => self.code.extend_from_slice(&[x86_rex_w(src, base), 0x89]),
+            ElemTy::I64 | ElemTy::U64 => self.code.extend_from_slice(&[x86_rex_w(src, base), 0x89]),
             ElemTy::I32 | ElemTy::U32 => {
                 if src >= 8 || base >= 8 { self.code.push(x86_rex_byte(false, src, 0, base)); }
                 self.code.push(0x89);
@@ -243,9 +243,22 @@ impl X86Emit {
         self.code.push((if is_pop { 0x58 } else { 0x50 }) + (r & 7));
         self.insns += 1;
     }
-    fn vex_ymm_op(&mut self, map: u8, opc: u8, dst: u8, vvvv: u8, rm: u8) {
-        let vw = x86_vex3_word((dst >> 3) & 1, (rm >> 3) & 1, map, 0, vvvv, 1, 1).to_le_bytes();
+    fn vex_ymm_op_w(&mut self, map: u8, w: u8, opc: u8, dst: u8, vvvv: u8, rm: u8) {
+        let vw = x86_vex3_word((dst >> 3) & 1, (rm >> 3) & 1, map, w, vvvv, 1, 1).to_le_bytes();
         self.code.extend_from_slice(&[0xC4, vw[0], vw[1], opc, x86_modrm(3, dst, rm)]);
+        self.insns += 1;
+    }
+    fn vex_ymm_op(&mut self, map: u8, opc: u8, dst: u8, vvvv: u8, rm: u8) {
+        self.vex_ymm_op_w(map, 0, opc, dst, vvvv, rm);
+    }
+    fn prefetcht0(&mut self, base: u8, disp: i32) {
+        if base >= 8 { self.code.push(x86_rex_byte(false, 0, 0, base)); }
+        self.code.extend_from_slice(&[0x0F, 0x18]);
+        self.push_mem_disp(1, base, disp);
+    }
+    fn bmi2_shift(&mut self, pp: u8, dst: u8, src: u8, amt: u8) {
+        let vw = x86_vex3_word((dst >> 3) & 1, (src >> 3) & 1, 2, 1, amt, 0, pp).to_le_bytes();
+        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], 0xF7, x86_modrm(3, dst, src)]);
         self.insns += 1;
     }
     fn vex_ymm_imm(&mut self, map: u8, opc: u8, dst: u8, vvvv: u8, rm: u8, imm: u8) {
@@ -279,6 +292,30 @@ impl X86Emit {
         self.code.extend_from_slice(&[0xC4, vw[0], vw[1], 0x6E, x86_modrm(3, dst, 0)]);
         self.insns += 1;
         self.vex_ymm_op(2, if is_64 { 0x59 } else { 0x58 }, dst, 0, dst);
+    }
+    fn vex_broadcast_rip(&mut self, dst: u8, val: i64) {
+        if val == 0 { self.vex_ymm_op(1, 0xEF, dst, dst, dst); return; }
+        let idx = match self.const_pool.iter().position(|&c| c == val) {
+            Some(i) => i,
+            None => { let i = self.const_pool.len(); self.const_pool.push(val); i }
+        };
+        let vw = x86_vex3_word((dst >> 3) & 1, 0, 2, 0, 0, 1, 1).to_le_bytes();
+        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], 0x59, x86_modrm(0, dst, 5)]);
+        let disp_off = self.code.len();
+        self.code.extend_from_slice(&0i32.to_le_bytes());
+        self.const_patches.push((disp_off, idx));
+        self.insns += 1;
+    }
+    fn finalize_const_pool(&mut self) {
+        if self.const_pool.is_empty() { return; }
+        while self.code.len() % 8 != 0 { self.code.push(0x90); }
+        let pool_base = self.code.len();
+        for &c in &self.const_pool { self.code.extend_from_slice(&c.to_le_bytes()); }
+        for &(disp_off, idx) in &self.const_patches {
+            let target = pool_base.saturating_add(idx.saturating_mul(8));
+            let disp = (target as isize) - ((disp_off + 4) as isize);
+            if let Some(s) = self.code.get_mut(disp_off..disp_off + 4) { s.copy_from_slice(&(disp as i32).to_le_bytes()); }
+        }
     }
     fn vzeroupper(&mut self) { self.code.extend_from_slice(&[0xC5, 0xF8, 0x77]); self.insns += 1; }
     fn ret(&mut self) { self.code.push(0xC3); self.insns += 1; }
@@ -543,7 +580,7 @@ impl<'a> W32Ctx<'a> {
                     if self.k.nodes.get(id).copied() != Some(Op::Load { mem, buf, lane: i as u8 }) { return None; }
                 }
                 let ty = self.k.bufs.get(buf as usize)?.elem_ty;
-                if matches!(ty, ElemTy::I64) { return None; }
+                if matches!(ty, ElemTy::I64 | ElemTy::U64) { return None; }
                 let d = self.alloc_v();
                 self.steps.push(W32Step::Load(d, buf, ty));
                 d
@@ -591,9 +628,9 @@ impl<'a> W32Ctx<'a> {
                 }
                 let all_i32 = la.iter().chain(lb.iter()).all(|&x| self.doms.get(x).copied().is_some_and(Domain::fits_i32));
                 let all_u32 = la.iter().chain(lb.iter()).all(|&x| self.doms.get(x).copied().is_some_and(Domain::fits_u32));
-                if !all_i32 && !all_u32 { return None; }
-                let need_bias = !all_i32 && !matches!(kind, CmpKind::Eq | CmpKind::Ne);
-                let need_one = matches!(kind, CmpKind::Ne | CmpKind::Ge | CmpKind::Le);
+                if (!all_i32 || kind.is_unsigned()) && !all_u32 { return None; }
+                let need_bias = (kind.is_unsigned() || !all_i32) && !matches!(kind, CmpKind::Eq | CmpKind::Ne);
+                let need_one = matches!(kind, CmpKind::Ne | CmpKind::Ge | CmpKind::Le | CmpKind::Uge | CmpKind::Ule);
                 let (va, vb) = (self.match_vec8(la)?, self.match_vec8(lb)?);
                 let bias = if need_bias { Some(self.get_const(0x8000_0000)) } else { None };
                 let one = if need_one { Some(self.get_const(1)) } else { None };
@@ -713,31 +750,34 @@ fn emit_x86_w32_consts(e: &mut X86Emit, plan: &W32Plan) {
     for &(reg, val) in &plan.consts { e.vex_broadcast_imm(reg, i64::from(val as i32), false); }
 }
 
-fn emit_x86_w32_body(e: &mut X86Emit, plan: &W32Plan, ra: &RegAlloc) -> Result<(), CompileError> {
+fn emit_x86_w32_body(e: &mut X86Emit, k: &Kernel, plan: &W32Plan, ra: &RegAlloc, base_blk: i32) -> Result<(), CompileError> {
     for st in &plan.steps {
         match *st {
             W32Step::Load(d, buf, ty) => {
                 let breg = *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
+                let off = base_blk * (k.bufs.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?.block_bytes() as i32);
                 match ty {
-                    ElemTy::I32 | ElemTy::U32 => e.vex_mem_op([1, 1, 2, 0, 0, 0x6F], d as u8, breg, 0),
-                    ElemTy::U16 => e.vex_mem_op([2, 1, 1, 0, 0, 0x33], d as u8, breg, 0),
-                    ElemTy::I16 => e.vex_mem_op([2, 1, 1, 0, 0, 0x23], d as u8, breg, 0),
-                    ElemTy::U8 => e.vex_mem_op([2, 1, 1, 0, 0, 0x31], d as u8, breg, 0),
-                    ElemTy::I64 => return Err(berr("unexpected i64 load in w32")),
+                    ElemTy::I32 | ElemTy::U32 => e.vex_mem_op([1, 1, 2, 0, 0, 0x6F], d as u8, breg, off),
+                    ElemTy::U16 => e.vex_mem_op([2, 1, 1, 0, 0, 0x33], d as u8, breg, off),
+                    ElemTy::I16 => e.vex_mem_op([2, 1, 1, 0, 0, 0x23], d as u8, breg, off),
+                    ElemTy::U8 => e.vex_mem_op([2, 1, 1, 0, 0, 0x31], d as u8, breg, off),
+                    ElemTy::I64 | ElemTy::U64 => return Err(berr("unexpected 64-bit load in w32")),
                 }
             }
             W32Step::Store32(s, buf) => {
                 let breg = *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
-                e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], s as u8, breg, 0);
+                let off = base_blk * (k.bufs.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?.block_bytes() as i32);
+                e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], s as u8, breg, off);
             }
             W32Step::StoreI64 { src, buf, signed } => {
                 let breg = *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
+                let off = base_blk * (k.bufs.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?.block_bytes() as i32);
                 let ext_opc = if signed { 0x25 } else { 0x35 };
                 e.vex_ymm_op(2, ext_opc, 15, 0, src as u8);
-                e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, 0);
+                e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, off);
                 e.vex_extracti128(14, src as u8, 1);
                 e.vex_ymm_op(2, ext_opc, 15, 0, 14);
-                e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, 32);
+                e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, off + 32);
             }
             W32Step::Add(d, a, b) => e.vex_ymm_op(1, 0xFE, d as u8, a as u8, b as u8),
             W32Step::Sub(d, a, b) => e.vex_ymm_op(1, 0xFA, d as u8, a as u8, b as u8),
@@ -755,8 +795,8 @@ fn emit_x86_w32_body(e: &mut X86Emit, plan: &W32Plan, ra: &RegAlloc) -> Result<(
                 }
                 match kind {
                     CmpKind::Eq | CmpKind::Ne => e.vex_ymm_op(1, 0x76, d, va, vb),
-                    CmpKind::Gt | CmpKind::Le => e.vex_ymm_op(1, 0x66, d, va, vb),
-                    CmpKind::Lt | CmpKind::Ge => e.vex_ymm_op(1, 0x66, d, vb, va),
+                    CmpKind::Gt | CmpKind::Le | CmpKind::Ugt | CmpKind::Ule => e.vex_ymm_op(1, 0x66, d, va, vb),
+                    CmpKind::Lt | CmpKind::Ge | CmpKind::Ult | CmpKind::Uge => e.vex_ymm_op(1, 0x66, d, vb, va),
                 }
                 e.vex_shift_imm(0x72, 2, d, d, 31);
                 if let Some(or) = one { e.vex_ymm_op(1, 0xEF, d, d, or as u8); }
@@ -770,21 +810,27 @@ fn emit_x86_w32_body(e: &mut X86Emit, plan: &W32Plan, ra: &RegAlloc) -> Result<(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum TransposeOut {
+    Lanes2(u8, [NodeId; 2]),
+    Lanes4(u8, [NodeId; 4]),
+}
+
 struct Batch4Plan {
     node_ymm: Vec<Option<u8>>,
     hoisted: Vec<(u8, i64)>,
-    transpose_out: Option<(u8, [NodeId; 4])>,
+    transpose_out: Option<TransposeOut>,
 }
 
-fn alloc_batch4_ymms(k: &Kernel, sched: &ScheduleReport, pool_limit: usize, hold_outs: Option<[NodeId; 4]>) -> Option<(Vec<Option<u8>>, u16)> {
+fn alloc_batch4_ymms(k: &Kernel, sched: &ScheduleReport, pool_limit: usize, hold_outs: &[NodeId]) -> Option<(Vec<Option<u8>>, u16)> {
     let n = k.nodes.len();
     let mut last_step = vec![0usize; n];
     for (step, &id) in sched.order.iter().enumerate() {
         let (kids, cnt) = k.nodes[id].children();
         for &kid in &kids[..cnt] { if let Some(ls) = last_step.get_mut(kid) { *ls = (*ls).max(step); } }
     }
-    if let Some(outs) = hold_outs {
-        for o in outs { if let Some(ls) = last_step.get_mut(o) { *ls = sched.order.len().saturating_add(1); } }
+    if !hold_outs.is_empty() {
+        for &o in hold_outs { if let Some(ls) = last_step.get_mut(o) { *ls = sched.order.len().saturating_add(1); } }
     } else {
         for &(ostep, oi) in &sched.output_order {
             if let Some(o) = k.outputs.get(oi) {
@@ -807,7 +853,7 @@ fn alloc_batch4_ymms(k: &Kernel, sched: &ScheduleReport, pool_limit: usize, hold
             let (aid, areg) = active[i];
             if last_step[aid] <= step { active.swap_remove(i); free.push(areg); } else { i += 1; }
         }
-        if hold_outs.is_none() {
+        if hold_outs.is_empty() {
             for &(ostep, _) in sched.output_order.iter().filter(|&&(os, _)| os == step + 1) {
                 let mut j = 0usize;
                 while j < active.len() {
@@ -820,68 +866,124 @@ fn alloc_batch4_ymms(k: &Kernel, sched: &ScheduleReport, pool_limit: usize, hold
     Some((node_ymm, used_mask))
 }
 
+fn b4_const_of(k: &Kernel, id: NodeId) -> Option<i64> {
+    match k.nodes.get(id).copied() {
+        Some(Op::Const(c)) => Some(c),
+        Some(Op::MemInit) => Some(0),
+        _ => None,
+    }
+}
+
 fn try_plan_avx2_batch4(k: &Kernel, sched: &ScheduleReport, doms: &[Domain], max_vecs: usize) -> Option<Batch4Plan> {
-    if k.outputs.is_empty() || k.bufs.iter().any(|b| matches!(b.access, BufAccess::LookupTable(_)) || b.lanes == 0 || !matches!(b.elem_ty, ElemTy::I64 | ElemTy::I32 | ElemTy::U32)) {
+    if k.outputs.is_empty() || k.bufs.iter().any(|b| {
+        matches!(b.access, BufAccess::LookupTable(_))
+            || b.lanes == 0
+            || if b.access == BufAccess::ReadOnly && b.lanes == 1 {
+                false
+            } else {
+                !matches!(b.elem_ty, ElemTy::I64 | ElemTy::U64 | ElemTy::I32 | ElemTy::U32)
+            }
+    }) {
         return None;
     }
     for &id in &sched.order {
         match *k.nodes.get(id)? {
-            Op::MemInit | Op::Const(_) | Op::Add(_, _) | Op::Sub(_, _) | Op::BitAnd(_, _) => {}
+            Op::MemInit | Op::Const(_) | Op::Add(_, _) | Op::Sub(_, _) | Op::BitAnd(_, _)
+            | Op::BitOr(_, _) | Op::BitXor(_, _) | Op::ShlVar(_, _) | Op::ShrVarU(_, _)
+            | Op::Cmp(_, _, _) | Op::Select { .. } => {}
             Op::Load { mem, .. } if k.nodes.get(mem).copied() == Some(Op::MemInit) => {}
             Op::Mul(a, b) => {
                 let (da, db) = (doms.get(a).copied()?, doms.get(b).copied()?);
-                if !((da.fits_i32() && db.fits_i32()) || (da.fits_u32() && db.fits_u32())) { return None; }
+                if !((da.fits_i32() && db.fits_i32()) || da.fits_u32() || db.fits_u32()) { return None; }
             }
-            Op::Shl(_, s) | Op::Shr(_, s) if s < 64 => {}
+            Op::Shl(_, s) | Op::Shr(_, s) | Op::Ushr(_, s) if s < 64 => {}
             _ => return None,
         }
     }
-    let mut cand_transpose: Option<(u8, [NodeId; 4])> = None;
-    if k.outputs.len() == 4 {
+    let mut cand_transpose: Option<TransposeOut> = None;
+    if k.outputs.len() == 2 || k.outputs.len() == 4 {
+        let n_lanes = k.outputs.len();
         let ob = k.outputs[0].buf;
         let bdecl = k.bufs.get(ob as usize)?;
         let mut lanes = [usize::MAX; 4];
-        let mut ok = bdecl.elem_ty == ElemTy::I64 && bdecl.lanes == 4 && k.bufs.iter().filter(|b| b.access == BufAccess::MutNoAlias).count() == 1;
+        let mut ok = matches!(bdecl.elem_ty, ElemTy::I64 | ElemTy::U64)
+            && usize::from(bdecl.lanes) == n_lanes
+            && k.bufs.iter().filter(|b| b.access == BufAccess::MutNoAlias).count() == 1;
         for o in &k.outputs {
-            if o.buf != ob || o.lane >= 4 || lanes[usize::from(o.lane)] != usize::MAX || matches!(k.nodes.get(o.val), Some(Op::Const(_) | Op::MemInit)) {
+            if o.buf != ob || usize::from(o.lane) >= n_lanes || lanes[usize::from(o.lane)] != usize::MAX
+                || matches!(k.nodes.get(o.val), Some(Op::Const(_) | Op::MemInit))
+            {
                 ok = false; break;
             }
             lanes[usize::from(o.lane)] = o.val;
         }
-        if ok && !lanes.contains(&usize::MAX) { cand_transpose = Some((ob, lanes)); }
+        if ok && !lanes[..n_lanes].contains(&usize::MAX) {
+            cand_transpose = Some(if n_lanes == 2 {
+                TransposeOut::Lanes2(ob, [lanes[0], lanes[1]])
+            } else {
+                TransposeOut::Lanes4(ob, lanes)
+            });
+        }
     }
-    let (node_ymm, used_mask, pool_limit, transpose_out) = if let Some((ob, lanes)) = cand_transpose {
-        let lim13 = max_vecs.min(13);
-        if let Some((ny, um)) = alloc_batch4_ymms(k, sched, lim13, Some(lanes)) {
-            (ny, um, lim13, Some((ob, lanes)))
+    let (node_ymm, used_mask, pool_limit, transpose_out) = if let Some(tr) = cand_transpose {
+        let tr_lim = max_vecs.min(if matches!(tr, TransposeOut::Lanes2(_, _)) { 14 } else { 13 });
+        let hold: &[NodeId] = match &tr { TransposeOut::Lanes2(_, l) => l, TransposeOut::Lanes4(_, l) => l };
+        if let Some((ny, um)) = alloc_batch4_ymms(k, sched, tr_lim, hold) {
+            (ny, um, tr_lim, Some(tr))
         } else {
             let lim14 = max_vecs.min(14);
-            let (ny, um) = alloc_batch4_ymms(k, sched, lim14, None)?;
+            let (ny, um) = alloc_batch4_ymms(k, sched, lim14, &[])?;
             (ny, um, lim14, None)
         }
     } else {
         let lim14 = max_vecs.min(14);
-        let (ny, um) = alloc_batch4_ymms(k, sched, lim14, None)?;
+        let (ny, um) = alloc_batch4_ymms(k, sched, lim14, &[])?;
         (ny, um, lim14, None)
     };
 
     let mut const_counts: Vec<(i64, usize)> = Vec::new();
-    let mut bump = |c: i64| {
-        if let Some(e) = const_counts.iter_mut().find(|e| e.0 == c) { e.1 += 1; } else { const_counts.push((c, 1)); }
+    let mut bump = |c: i64, w: usize| {
+        if let Some(e) = const_counts.iter_mut().find(|e| e.0 == c) { e.1 += w; } else { const_counts.push((c, w)); }
     };
     for &id in &sched.order {
         let Some(&op) = k.nodes.get(id) else { continue; };
-        let (kids, cnt) = op.children();
-        for &kid in &kids[..cnt] {
-            if let Some(Op::Const(c)) = k.nodes.get(kid).copied() { bump(c); }
-        }
-        if let Op::Shr(a, s) = op {
-            if s > 0 && doms.get(a).is_some_and(|d| !d.is_nonneg()) {
-                if s == 63 { bump(0); } else { bump(i64::MIN); bump(((1u64 << 63) >> s) as i64); }
+        match op {
+            Op::Cmp(kind, a, b) => {
+                let need_bias = kind.is_unsigned() && !(doms[a].is_nonneg() && doms[b].is_nonneg());
+                if need_bias {
+                    if let Some(ca) = b4_const_of(k, a) { bump(ca ^ i64::MIN, 3); } else { bump(i64::MIN, 6); }
+                    if let Some(cb) = b4_const_of(k, b) { bump(cb ^ i64::MIN, 3); } else { bump(i64::MIN, 6); }
+                } else {
+                    if let Some(ca) = b4_const_of(k, a) { bump(ca, 2); }
+                    if let Some(cb) = b4_const_of(k, b) { bump(cb, 2); }
+                }
+                if matches!(kind, CmpKind::Ne | CmpKind::Le | CmpKind::Ge | CmpKind::Ule | CmpKind::Uge) { bump(1, 6); }
+            }
+            Op::Select { cond, t_val, f_val } => {
+                bump(0, 6);
+                for kid in [cond, t_val, f_val] {
+                    if let Some(Op::Const(c)) = k.nodes.get(kid).copied() { bump(c, 2); }
+                }
+            }
+            Op::ShlVar(a, b) | Op::ShrVarU(a, b) => {
+                if let Some(Op::Const(c)) = k.nodes.get(a).copied() { bump(c, 2); }
+                if let Some(Op::Const(c)) = k.nodes.get(b).copied() { bump(c & 63, 2); }
+                else if !(doms[b].is_nonneg() && doms[b].hi < 64) { bump(63, 4); }
+            }
+            _ => {
+                let (kids, cnt) = op.children();
+                for &kid in &kids[..cnt] {
+                    if let Some(Op::Const(c)) = k.nodes.get(kid).copied() { bump(c, 2); }
+                }
+                if let Op::Shr(a, s) = op {
+                    if s > 0 && doms.get(a).is_some_and(|d| !d.is_nonneg()) {
+                        if s == 63 { bump(0, 3); } else { bump(i64::MIN, 3); bump(((1u64 << 63) >> s) as i64, 2); }
+                    }
+                }
             }
         }
     }
-    for o in &k.outputs { if let Op::Const(c) = k.nodes[o.val] { bump(c); } }
+    for o in &k.outputs { if let Op::Const(c) = k.nodes[o.val] { bump(c, 2); } }
     const_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let mut hoisted = Vec::new();
@@ -895,7 +997,7 @@ fn try_plan_avx2_batch4(k: &Kernel, sched: &ScheduleReport, doms: &[Domain], max
 
 fn b4_const_reg(e: &mut X86Emit, plan: &Batch4Plan, c: i64, scratch: u8) -> u8 {
     if let Some(&(r, _)) = plan.hoisted.iter().find(|&&(_, v)| v == c) { return r; }
-    e.vex_broadcast_imm(scratch, c, true);
+    e.vex_broadcast_rip(scratch, c);
     scratch
 }
 
@@ -907,9 +1009,16 @@ fn b4_val_reg(e: &mut X86Emit, k: &Kernel, plan: &Batch4Plan, id: NodeId, scratc
     }
 }
 
-fn emit_b4_store_scatter(e: &mut X86Emit, ty: ElemTy, vreg: u8, breg: u8, stride: i32, lane: u8) {
-    let off = i32::from(lane) * i32::from(ty.bytes());
-    let (mov_opc, w, idx) = if ty == ElemTy::I64 { (0xD6u8, 1u8, 1u8) } else { (0x7Eu8, 0u8, 2u8) };
+fn emit_b4_store_scatter(e: &mut X86Emit, bdecl: &crate::ir::BufDecl, vreg: u8, breg: u8, base_blk: i32, lane: u8) {
+    let ty = bdecl.elem_ty;
+    let stride = bdecl.block_bytes() as i32;
+    let base_off = base_blk * stride;
+    if bdecl.lanes == 1 && matches!(ty, ElemTy::I64 | ElemTy::U64) {
+        e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], vreg, breg, base_off);
+        return;
+    }
+    let off = base_off + i32::from(lane) * i32::from(ty.bytes());
+    let (mov_opc, w, idx) = if matches!(ty, ElemTy::I64 | ElemTy::U64) { (0xD6u8, 1u8, 1u8) } else { (0x7Eu8, 0u8, 2u8) };
     e.vex_mem_op([1, 0, 1, 0, 0, mov_opc], vreg, breg, off);
     e.vex_mem_imm([3, 0, 1, w, 0, 0x16], vreg, breg, stride + off, idx);
     e.vex_extracti128(15, vreg, 1);
@@ -917,15 +1026,15 @@ fn emit_b4_store_scatter(e: &mut X86Emit, ty: ElemTy, vreg: u8, breg: u8, stride
     e.vex_mem_imm([3, 0, 1, w, 0, 0x16], 15, breg, 3 * stride + off, idx);
 }
 
-fn emit_x86_batch4_body(e: &mut X86Emit, k: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms: &[Domain], plan: &Batch4Plan) -> Result<(), CompileError> {
+fn emit_x86_batch4_body(e: &mut X86Emit, k: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms: &[Domain], plan: &Batch4Plan, base_blk: i32) -> Result<(), CompileError> {
     let mut oc = 0usize;
     let scatter_outputs = plan.transpose_out.is_none();
     for (step, &id) in sched.order.iter().enumerate() {
         if scatter_outputs {
-            drain_scheduled_outputs(k, sched, ra, &mut oc, Some(step), |ty, breg, lane, val| {
+            drain_scheduled_outputs(k, sched, ra, &mut oc, Some(step), |_ty, breg, lane, val| {
                 let bdecl = k.bufs.iter().find(|b| ra.buf_reg.get(usize::from(b.id)).copied() == Some(breg)).ok_or(CompileError::InvalidBuffer(0))?;
                 let vreg = b4_val_reg(e, k, plan, val, 14)?;
-                emit_b4_store_scatter(e, ty, vreg, breg, bdecl.block_bytes() as i32, lane);
+                emit_b4_store_scatter(e, bdecl, vreg, breg, base_blk, lane);
                 Ok(())
             })?;
         }
@@ -936,34 +1045,76 @@ fn emit_x86_batch4_body(e: &mut X86Emit, k: &Kernel, sched: &ScheduleReport, ra:
             Op::Load { buf, lane, .. } => {
                 let bdecl = k.bufs.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
                 let breg = *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
-                let (stride, off) = (bdecl.block_bytes() as i32, i32::from(lane) * i32::from(bdecl.elem_ty.bytes()));
-                if bdecl.elem_ty == ElemTy::I64 {
-                    e.vex_mem_op([1, 0, 2, 0, 0, 0x7E], dst, breg, off);
-                    e.vex_mem_imm([3, 0, 1, 1, dst, 0x22], dst, breg, stride + off, 1);
-                    e.vex_mem_op([1, 0, 2, 0, 0, 0x7E], 15, breg, 2 * stride + off);
-                    e.vex_mem_imm([3, 0, 1, 1, 15, 0x22], 15, breg, 3 * stride + off, 1);
-                    e.vex_ymm_imm(3, 0x38, dst, dst, 15, 1);
+                let stride = bdecl.block_bytes() as i32;
+                let base_off = base_blk * stride;
+                if bdecl.lanes == 1 {
+                    let enc = match bdecl.elem_ty {
+                        ElemTy::I64 | ElemTy::U64 => [1, 1, 2, 0, 0, 0x6F],
+                        ElemTy::I32 => [2, 1, 1, 0, 0, 0x25],
+                        ElemTy::U32 => [2, 1, 1, 0, 0, 0x35],
+                        ElemTy::I16 => [2, 1, 1, 0, 0, 0x24],
+                        ElemTy::U16 => [2, 1, 1, 0, 0, 0x34],
+                        ElemTy::U8 => [2, 1, 1, 0, 0, 0x32],
+                    };
+                    e.vex_mem_op(enc, dst, breg, base_off);
                 } else {
-                    e.vex_mem_op([1, 0, 1, 0, 0, 0x6E], dst, breg, off);
-                    e.vex_mem_imm([3, 0, 1, 0, dst, 0x22], dst, breg, stride + off, 1);
-                    e.vex_mem_imm([3, 0, 1, 0, dst, 0x22], dst, breg, 2 * stride + off, 2);
-                    e.vex_mem_imm([3, 0, 1, 0, dst, 0x22], dst, breg, 3 * stride + off, 3);
-                    e.vex_ymm_op(2, if bdecl.elem_ty == ElemTy::I32 { 0x25 } else { 0x35 }, dst, 0, dst);
+                    let off = base_off + i32::from(lane) * i32::from(bdecl.elem_ty.bytes());
+                    if matches!(bdecl.elem_ty, ElemTy::I64 | ElemTy::U64) {
+                        e.vex_mem_op([1, 0, 2, 0, 0, 0x7E], dst, breg, off);
+                        e.vex_mem_imm([3, 0, 1, 1, dst, 0x22], dst, breg, stride + off, 1);
+                        e.vex_mem_op([1, 0, 2, 0, 0, 0x7E], 15, breg, 2 * stride + off);
+                        e.vex_mem_imm([3, 0, 1, 1, 15, 0x22], 15, breg, 3 * stride + off, 1);
+                        e.vex_ymm_imm(3, 0x38, dst, dst, 15, 1);
+                    } else {
+                        e.vex_mem_op([1, 0, 1, 0, 0, 0x6E], dst, breg, off);
+                        e.vex_mem_imm([3, 0, 1, 0, dst, 0x22], dst, breg, stride + off, 1);
+                        e.vex_mem_imm([3, 0, 1, 0, dst, 0x22], dst, breg, 2 * stride + off, 2);
+                        e.vex_mem_imm([3, 0, 1, 0, dst, 0x22], dst, breg, 3 * stride + off, 3);
+                        e.vex_ymm_op(2, if bdecl.elem_ty == ElemTy::I32 { 0x25 } else { 0x35 }, dst, 0, dst);
+                    }
                 }
             }
-            Op::Add(a, b) | Op::Sub(a, b) | Op::BitAnd(a, b) => {
+            Op::Add(a, b) | Op::Sub(a, b) | Op::BitAnd(a, b) | Op::BitOr(a, b) | Op::BitXor(a, b) => {
                 let (va, vb) = (b4_val_reg(e, k, plan, a, 14)?, b4_val_reg(e, k, plan, b, 15)?);
-                let opc = match op { Op::Add(_, _) => 0xD4, Op::Sub(_, _) => 0xFB, _ => 0xDB };
+                let opc = match op {
+                    Op::Add(_, _) => 0xD4,
+                    Op::Sub(_, _) => 0xFB,
+                    Op::BitAnd(_, _) => 0xDB,
+                    Op::BitOr(_, _) => 0xEB,
+                    _ => 0xEF,
+                };
                 e.vex_ymm_op(1, opc, dst, va, vb);
             }
             Op::Mul(a, b) => {
-                let (va, vb) = (b4_val_reg(e, k, plan, a, 14)?, b4_val_reg(e, k, plan, b, 15)?);
-                if doms[a].fits_i32() && doms[b].fits_i32() { e.vex_ymm_op(2, 0x28, dst, va, vb); }
-                else { e.vex_ymm_op(1, 0xF4, dst, va, vb); }
+                if doms[a].fits_i32() && doms[b].fits_i32() {
+                    let (va, vb) = (b4_val_reg(e, k, plan, a, 14)?, b4_val_reg(e, k, plan, b, 15)?);
+                    e.vex_ymm_op(2, 0x28, dst, va, vb);
+                } else if doms[a].fits_u32() && doms[b].fits_u32() {
+                    let (va, vb) = (b4_val_reg(e, k, plan, a, 14)?, b4_val_reg(e, k, plan, b, 15)?);
+                    e.vex_ymm_op(1, 0xF4, dst, va, vb);
+                } else {
+                    let (x, y) = if doms[b].fits_u32() { (a, b) } else { (b, a) };
+                    let (vx, vy) = (b4_val_reg(e, k, plan, x, 14)?, b4_val_reg(e, k, plan, y, 15)?);
+                    let tmp = if dst == vx { 14 } else if dst == vy { 15 } else { dst };
+                    e.vex_shift_imm(0x73, 2, tmp, vx, 32);
+                    e.vex_ymm_op(1, 0xF4, tmp, tmp, vy);
+                    e.vex_shift_imm(0x73, 6, tmp, tmp, 32);
+                    if tmp == dst {
+                        e.vex_ymm_op(1, 0xF4, 14, vx, vy);
+                        e.vex_ymm_op(1, 0xD4, dst, dst, 14);
+                    } else {
+                        e.vex_ymm_op(1, 0xF4, dst, vx, vy);
+                        e.vex_ymm_op(1, 0xD4, dst, dst, tmp);
+                    }
+                }
             }
             Op::Shl(a, s) => {
                 let va = b4_val_reg(e, k, plan, a, dst)?;
                 if s > 0 { e.vex_shift_imm(0x73, 6, dst, va, s); } else if dst != va { e.vex_ymm_op(1, 0xEB, dst, va, va); }
+            }
+            Op::Ushr(a, s) => {
+                let va = b4_val_reg(e, k, plan, a, dst)?;
+                if s > 0 { e.vex_shift_imm(0x73, 2, dst, va, s); } else if dst != va { e.vex_ymm_op(1, 0xEB, dst, va, va); }
             }
             Op::Shr(a, s) => {
                 let va = b4_val_reg(e, k, plan, a, dst)?;
@@ -982,41 +1133,141 @@ fn emit_x86_batch4_body(e: &mut X86Emit, k: &Kernel, sched: &ScheduleReport, ra:
                     e.vex_ymm_op(1, 0xFB, dst, dst, sbs);
                 }
             }
+            Op::ShlVar(a, b) | Op::ShrVarU(a, b) => {
+                let va = b4_val_reg(e, k, plan, a, 14)?;
+                let vb = match b4_const_of(k, b) {
+                    Some(c) => b4_const_reg(e, plan, c & 63, 15),
+                    None => {
+                        let r = b4_val_reg(e, k, plan, b, 15)?;
+                        if doms[b].is_nonneg() && doms[b].hi < 64 {
+                            r
+                        } else {
+                            let m63 = b4_const_reg(e, plan, 63, 15);
+                            e.vex_ymm_op(1, 0xDB, 15, r, m63);
+                            15
+                        }
+                    }
+                };
+                e.vex_ymm_op_w(2, 1, if matches!(op, Op::ShlVar(_, _)) { 0x47 } else { 0x45 }, dst, va, vb);
+            }
+            Op::Cmp(kind, a, b) => {
+                if matches!(kind, CmpKind::Eq | CmpKind::Ne) {
+                    let (va, vb) = (b4_val_reg(e, k, plan, a, 14)?, b4_val_reg(e, k, plan, b, 15)?);
+                    e.vex_ymm_op(2, 0x29, dst, va, vb);
+                } else {
+                    let need_bias = kind.is_unsigned() && !(doms[a].is_nonneg() && doms[b].is_nonneg());
+                    let (va, vb) = if !need_bias {
+                        (b4_val_reg(e, k, plan, a, 14)?, b4_val_reg(e, k, plan, b, 15)?)
+                    } else {
+                        match (b4_const_of(k, a), b4_const_of(k, b)) {
+                            (Some(ca), Some(cb)) => (b4_const_reg(e, plan, ca ^ i64::MIN, 14), b4_const_reg(e, plan, cb ^ i64::MIN, 15)),
+                            (Some(ca), None) => {
+                                let rb = b4_val_reg(e, k, plan, b, 15)?;
+                                let br = b4_const_reg(e, plan, i64::MIN, 15);
+                                e.vex_ymm_op(1, 0xEF, 15, rb, br);
+                                (b4_const_reg(e, plan, ca ^ i64::MIN, 14), 15)
+                            }
+                            (None, Some(cb)) => {
+                                let ra = b4_val_reg(e, k, plan, a, 14)?;
+                                let br = b4_const_reg(e, plan, i64::MIN, 14);
+                                e.vex_ymm_op(1, 0xEF, 14, ra, br);
+                                (14, b4_const_reg(e, plan, cb ^ i64::MIN, 15))
+                            }
+                            (None, None) => {
+                                let (ra, rb) = (b4_val_reg(e, k, plan, a, 14)?, b4_val_reg(e, k, plan, b, 15)?);
+                                let br = b4_const_reg(e, plan, i64::MIN, 14);
+                                e.vex_ymm_op(1, 0xEF, 15, rb, br);
+                                e.vex_ymm_op(1, 0xEF, 14, ra, br);
+                                (14, 15)
+                            }
+                        }
+                    };
+                    if matches!(kind, CmpKind::Gt | CmpKind::Le | CmpKind::Ugt | CmpKind::Ule) {
+                        e.vex_ymm_op(2, 0x37, dst, va, vb);
+                    } else {
+                        e.vex_ymm_op(2, 0x37, dst, vb, va);
+                    }
+                }
+                e.vex_shift_imm(0x73, 2, dst, dst, 63);
+                if matches!(kind, CmpKind::Ne | CmpKind::Le | CmpKind::Ge | CmpKind::Ule | CmpKind::Uge) {
+                    let one = b4_const_reg(e, plan, 1, 15);
+                    e.vex_ymm_op(1, 0xEF, dst, dst, one);
+                }
+            }
+            Op::Select { cond, t_val, f_val } => {
+                let vc = b4_val_reg(e, k, plan, cond, 14)?;
+                let zr = b4_const_reg(e, plan, 0, 15);
+                e.vex_ymm_op(2, 0x29, 15, vc, zr);
+                if b4_const_of(k, f_val) == Some(0) {
+                    let vt = b4_val_reg(e, k, plan, t_val, 14)?;
+                    e.vex_ymm_op(1, 0xDF, dst, 15, vt);
+                } else if b4_const_of(k, t_val) == Some(0) {
+                    let vf = b4_val_reg(e, k, plan, f_val, 14)?;
+                    e.vex_ymm_op(1, 0xDB, dst, 15, vf);
+                } else {
+                    let mut vt = b4_val_reg(e, k, plan, t_val, 14)?;
+                    if vt == dst {
+                        e.vex_ymm_op(1, 0xEB, 14, vt, vt);
+                        vt = 14;
+                    }
+                    let vf = b4_val_reg(e, k, plan, f_val, dst)?;
+                    e.vex_ymm_imm(3, 0x4C, dst, vt, vf, 15 << 4);
+                }
+            }
             _ => return Err(berr("unsupported op in batch4")),
         }
     }
-    if let Some((ob, lanes)) = plan.transpose_out {
-        let breg = *ra.buf_reg.get(ob as usize).ok_or(CompileError::InvalidBuffer(ob))?;
-        let [r0, r1, r2, r3] = [
-            b4_val_reg(e, k, plan, lanes[0], 13)?, b4_val_reg(e, k, plan, lanes[1], 13)?,
-            b4_val_reg(e, k, plan, lanes[2], 13)?, b4_val_reg(e, k, plan, lanes[3], 13)?,
-        ];
-        e.vex_ymm_op(1, 0x6C, 13, r0, r1);
-        e.vex_ymm_op(1, 0x6C, 14, r2, r3);
-        e.vex_ymm_imm(3, 0x46, 15, 13, 14, 0x20);
-        e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, 0);
-        e.vex_ymm_imm(3, 0x46, 15, 13, 14, 0x31);
-        e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, 64);
-        e.vex_ymm_op(1, 0x6D, 13, r0, r1);
-        e.vex_ymm_op(1, 0x6D, 14, r2, r3);
-        e.vex_ymm_imm(3, 0x46, 15, 13, 14, 0x20);
-        e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, 32);
-        e.vex_ymm_imm(3, 0x46, 15, 13, 14, 0x31);
-        e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, 96);
-    } else {
-        drain_scheduled_outputs(k, sched, ra, &mut oc, None, |ty, breg, lane, val| {
-            let bdecl = k.bufs.iter().find(|b| ra.buf_reg.get(usize::from(b.id)).copied() == Some(breg)).ok_or(CompileError::InvalidBuffer(0))?;
-            let vreg = b4_val_reg(e, k, plan, val, 14)?;
-            emit_b4_store_scatter(e, ty, vreg, breg, bdecl.block_bytes() as i32, lane);
-            Ok(())
-        })?;
+    match plan.transpose_out {
+        Some(TransposeOut::Lanes2(ob, lanes)) => {
+            let breg = *ra.buf_reg.get(ob as usize).ok_or(CompileError::InvalidBuffer(ob))?;
+            let base_off = base_blk * 16;
+            let r0 = b4_val_reg(e, k, plan, lanes[0], 14)?;
+            let r1 = b4_val_reg(e, k, plan, lanes[1], 15)?;
+            e.vex_ymm_op(1, 0x6C, 14, r0, r1);
+            e.vex_ymm_op(1, 0x6D, 15, r0, r1);
+            e.vex_ymm_imm(3, 0x46, r0, 14, 15, 0x20);
+            e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], r0, breg, base_off);
+            e.vex_ymm_imm(3, 0x46, 14, 14, 15, 0x31);
+            e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 14, breg, base_off + 32);
+        }
+        Some(TransposeOut::Lanes4(ob, lanes)) => {
+            let breg = *ra.buf_reg.get(ob as usize).ok_or(CompileError::InvalidBuffer(ob))?;
+            let base_off = base_blk * 32;
+            let [r0, r1, r2, r3] = [
+                b4_val_reg(e, k, plan, lanes[0], 13)?, b4_val_reg(e, k, plan, lanes[1], 13)?,
+                b4_val_reg(e, k, plan, lanes[2], 13)?, b4_val_reg(e, k, plan, lanes[3], 13)?,
+            ];
+            e.vex_ymm_op(1, 0x6C, 13, r0, r1);
+            e.vex_ymm_op(1, 0x6C, 14, r2, r3);
+            e.vex_ymm_imm(3, 0x46, 15, 13, 14, 0x20);
+            e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, base_off);
+            e.vex_ymm_imm(3, 0x46, 15, 13, 14, 0x31);
+            e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, base_off + 64);
+            e.vex_ymm_op(1, 0x6D, 13, r0, r1);
+            e.vex_ymm_op(1, 0x6D, 14, r2, r3);
+            e.vex_ymm_imm(3, 0x46, 15, 13, 14, 0x20);
+            e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, base_off + 32);
+            e.vex_ymm_imm(3, 0x46, 15, 13, 14, 0x31);
+            e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, base_off + 96);
+        }
+        None => {
+            drain_scheduled_outputs(k, sched, ra, &mut oc, None, |_ty, breg, lane, val| {
+                let bdecl = k.bufs.iter().find(|b| ra.buf_reg.get(usize::from(b.id)).copied() == Some(breg)).ok_or(CompileError::InvalidBuffer(0))?;
+                let vreg = b4_val_reg(e, k, plan, val, 14)?;
+                emit_b4_store_scatter(e, bdecl, vreg, breg, base_blk, lane);
+                Ok(())
+            })?;
+        }
     }
     Ok(())
 }
 
 fn emit_x86_cmp(e: &mut X86Emit, k: CmpKind, dst: u8, ra: u8, rb: u8) {
     e.push_rr(0x39, rb, ra);
-    let cc = match k { CmpKind::Eq => 0x94, CmpKind::Ne => 0x95, CmpKind::Lt => 0x9C, CmpKind::Ge => 0x9D, CmpKind::Le => 0x9E, CmpKind::Gt => 0x9F };
+    let cc = match k {
+        CmpKind::Eq => 0x94, CmpKind::Ne => 0x95, CmpKind::Lt => 0x9C, CmpKind::Ge => 0x9D, CmpKind::Le => 0x9E, CmpKind::Gt => 0x9F,
+        CmpKind::Ult => 0x92, CmpKind::Uge => 0x93, CmpKind::Ule => 0x96, CmpKind::Ugt => 0x97,
+    };
     e.code.extend_from_slice(&[0x0F, cc, 0xC0]); e.insns += 1;
     e.code.extend_from_slice(&[x86_rex_w(dst, 0), 0x0F, 0xB6, x86_modrm(3, dst, 0)]); e.insns += 1;
 }
@@ -1078,19 +1329,19 @@ fn emit_x86_body(e: &mut X86Emit, kernel: &Kernel, sched: &ScheduleReport, ra: &
                 e.code.extend_from_slice(&[0x72, 0x02]); e.insns += 1; e.ud2();
                 e.mov_rr(dst, ireg);
             }
-            Op::Add(a, b) | Op::Sub(a, b) | Op::BitAnd(a, b) => {
-                let (is_add, is_sub) = (matches!(op, Op::Add(_, _)), matches!(op, Op::Sub(_, _)));
+            Op::Add(a, b) | Op::Sub(a, b) | Op::BitAnd(a, b) | Op::BitOr(a, b) | Op::BitXor(a, b) => {
+                let is_sub = matches!(op, Op::Sub(_, _));
                 let imm_rhs = kernel.nodes.get(b).and_then(|&o| if let Op::Const(c) = o { i32::try_from(c).ok().map(|v| (a, v)) } else { None })
                     .or_else(|| if !is_sub { kernel.nodes.get(a).and_then(|&o| if let Op::Const(c) = o { i32::try_from(c).ok().map(|v| (b, v)) } else { None }) } else { None });
                 if let Some((x, c32)) = imm_rhs {
                     let vx = x86_val_into(e, kernel, ra, x, 0)?;
                     e.mov_rr(dst, vx);
-                    let subop = if is_add { 0 } else if is_sub { 5 } else { 4 };
+                    let subop = match op { Op::Add(_, _) => 0, Op::BitOr(_, _) => 1, Op::BitAnd(_, _) => 4, Op::Sub(_, _) => 5, _ => 6 };
                     if let Ok(c8) = i8::try_from(c32) { e.op_imm8(0x83, subop, dst, c8 as u8, false); }
                     else { e.code.extend_from_slice(&[x86_rex_w(0, dst), 0x81, x86_modrm(3, subop, dst)]); e.code.extend_from_slice(&c32.to_le_bytes()); e.insns += 1; }
                 } else {
-                    let (opc, va) = (if is_add { 0x01 } else if is_sub { 0x29 } else { 0x21 }, x86_val_into(e, kernel, ra, a, 0)?);
-                    let vb = x86_val_into(e, kernel, ra, b, 11)?;
+                    let opc = match op { Op::Add(_, _) => 0x01, Op::BitOr(_, _) => 0x09, Op::BitAnd(_, _) => 0x21, Op::Sub(_, _) => 0x29, _ => 0x31 };
+                    let (va, vb) = (x86_val_into(e, kernel, ra, a, 0)?, x86_val_into(e, kernel, ra, b, 11)?);
                     if dst == vb && dst != va { e.mov_rr(11, vb); e.mov_rr(dst, va); e.push_rr(opc, 11, dst); }
                     else { e.mov_rr(dst, va); e.push_rr(opc, vb, dst); }
                 }
@@ -1114,9 +1365,14 @@ fn emit_x86_body(e: &mut X86Emit, kernel: &Kernel, sched: &ScheduleReport, ra: &
                 emit_x86_div_rem(e, dst, va, vb, matches!(op, Op::Rem(_, _)));
             }
             Op::Shl(a, s) => { let va = x86_val_into(e, kernel, ra, a, 0)?; e.mov_rr(dst, va); e.op_imm8(0xC1, 4, dst, s, true); }
+            Op::Ushr(a, s) => { let va = x86_val_into(e, kernel, ra, a, 0)?; e.mov_rr(dst, va); e.op_imm8(0xC1, 5, dst, s, true); }
             Op::Shr(a, s) => {
                 let va = x86_val_into(e, kernel, ra, a, 0)?; e.mov_rr(dst, va);
                 e.op_imm8(0xC1, if doms.get(a).copied().is_some_and(Domain::is_nonneg) { 5 } else { 7 }, dst, s, true);
+            }
+            Op::ShlVar(a, b) | Op::ShrVarU(a, b) => {
+                let (va, vb) = (x86_val_into(e, kernel, ra, a, 0)?, x86_val_into(e, kernel, ra, b, 11)?);
+                e.bmi2_shift(if matches!(op, Op::ShlVar(_, _)) { 1 } else { 3 }, dst, va, vb);
             }
             Op::Cmp(k, a, b) => { let (va, vb) = (x86_val_into(e, kernel, ra, a, 0)?, x86_val_into(e, kernel, ra, b, 11)?); emit_x86_cmp(e, k, dst, va, vb); }
             Op::Select { cond, t_val, f_val } => {
@@ -1156,7 +1412,7 @@ fn emit_x86_module(kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms:
         e.vzeroupper();
     } else if let Some(ref w32) = w32_plan {
         emit_x86_w32_consts(&mut e, w32);
-        emit_x86_w32_body(&mut e, w32, ra)?;
+        emit_x86_w32_body(&mut e, kernel, w32, ra, 0)?;
         e.vzeroupper();
     } else {
         emit_x86_body(&mut e, kernel, sched, ra, doms)?;
@@ -1205,22 +1461,43 @@ fn emit_x86_module(kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms:
         if let Some(&b2) = ra.buf_reg.get(2).filter(|&&r| r != 2) { e.mov_rr(b2, 2); }
         if let Some(ref b4) = b4_plan {
             e.op_imm8(0x83, 7, cnt_reg, 4, false);
-            let jb_pos = e.code.len();
+            let jb_skip_all = e.code.len();
             e.code.extend_from_slice(&[0x0F, 0x82, 0, 0, 0, 0]); e.insns += 1;
-            for &(r, c) in &b4.hoisted { e.vex_broadcast_imm(r, c, true); }
-            let b4_top = e.code.len();
-            emit_x86_batch4_body(&mut e, kernel, sched, ra, doms, b4)?;
+            for &(r, c) in &b4.hoisted { e.vex_broadcast_rip(r, c); }
+            e.op_imm8(0x83, 7, cnt_reg, 8, false);
+            let jb_skip8 = e.code.len();
+            e.code.extend_from_slice(&[0x0F, 0x82, 0, 0, 0, 0]); e.insns += 1;
+            let b8_top = e.code.len();
+            for (&br, b) in ra.buf_reg.iter().zip(kernel.bufs.iter()) {
+                if b.access == BufAccess::ReadOnly { e.prefetcht0(br, 256); }
+            }
+            emit_x86_batch4_body(&mut e, kernel, sched, ra, doms, b4, 0)?;
+            emit_x86_batch4_body(&mut e, kernel, sched, ra, doms, b4, 4)?;
+            for (&br, b) in ra.buf_reg.iter().zip(kernel.bufs.iter()) {
+                if !matches!(b.access, BufAccess::LookupTable(_)) { e.add_imm(br, (b.block_bytes() as i32) * 8); }
+            }
+            e.op_imm8(0x83, 5, cnt_reg, 8, false);
+            e.op_imm8(0x83, 7, cnt_reg, 8, false);
+            let back8 = (b8_top as isize) - ((e.code.len() + 6) as isize);
+            e.code.extend_from_slice(&[0x0F, 0x83]); e.code.extend_from_slice(&(back8 as i32).to_le_bytes()); e.insns += 1;
+            let chk4_pos = e.code.len();
+            let fwd8 = (chk4_pos as isize) - ((jb_skip8 + 6) as isize);
+            if let Some(s) = e.code.get_mut(jb_skip8 + 2..jb_skip8 + 6) { s.copy_from_slice(&(fwd8 as i32).to_le_bytes()); }
+            e.op_imm8(0x83, 7, cnt_reg, 4, false);
+            let jb_skip4 = e.code.len();
+            e.code.extend_from_slice(&[0x0F, 0x82, 0, 0, 0, 0]); e.insns += 1;
+            emit_x86_batch4_body(&mut e, kernel, sched, ra, doms, b4, 0)?;
             for (&br, b) in ra.buf_reg.iter().zip(kernel.bufs.iter()) {
                 if !matches!(b.access, BufAccess::LookupTable(_)) { e.add_imm(br, (b.block_bytes() as i32) * 4); }
             }
             e.op_imm8(0x83, 5, cnt_reg, 4, false);
-            e.op_imm8(0x83, 7, cnt_reg, 4, false);
-            let back = (b4_top as isize) - ((e.code.len() + 6) as isize);
-            e.code.extend_from_slice(&[0x0F, 0x83]); e.code.extend_from_slice(&(back as i32).to_le_bytes()); e.insns += 1;
+            let vzu_pos = e.code.len();
+            let fwd4 = (vzu_pos as isize) - ((jb_skip4 + 6) as isize);
+            if let Some(s) = e.code.get_mut(jb_skip4 + 2..jb_skip4 + 6) { s.copy_from_slice(&(fwd4 as i32).to_le_bytes()); }
             e.vzeroupper();
             let tail_pos = e.code.len();
-            let fwd = (tail_pos as isize) - ((jb_pos + 6) as isize);
-            if let Some(s) = e.code.get_mut(jb_pos + 2..jb_pos + 6) { s.copy_from_slice(&(fwd as i32).to_le_bytes()); }
+            let fwd_all = (tail_pos as isize) - ((jb_skip_all + 6) as isize);
+            if let Some(s) = e.code.get_mut(jb_skip_all + 2..jb_skip_all + 6) { s.copy_from_slice(&(fwd_all as i32).to_le_bytes()); }
         }
         e.push_rr(0x85, cnt_reg, cnt_reg);
         let jz_pos = e.code.len();
@@ -1229,21 +1506,47 @@ fn emit_x86_module(kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms:
             emit_x86_avx2_steps(&mut e, steps, ra, Some(true))?;
         } else if let Some(ref w32) = w32_plan {
             emit_x86_w32_consts(&mut e, w32);
+            e.op_imm8(0x83, 7, cnt_reg, 2, false);
+            let jb_w32_2 = e.code.len();
+            e.code.extend_from_slice(&[0x0F, 0x82, 0, 0, 0, 0]); e.insns += 1;
+            let w32_2_top = e.code.len();
+            for (&br, b) in ra.buf_reg.iter().zip(kernel.bufs.iter()) {
+                if b.access == BufAccess::ReadOnly { e.prefetcht0(br, 256); }
+            }
+            emit_x86_w32_body(&mut e, kernel, w32, ra, 0)?;
+            emit_x86_w32_body(&mut e, kernel, w32, ra, 1)?;
+            for (&br, b) in ra.buf_reg.iter().zip(kernel.bufs.iter()) {
+                if !matches!(b.access, BufAccess::LookupTable(_)) { e.add_imm(br, (b.block_bytes() as i32) * 2); }
+            }
+            e.op_imm8(0x83, 5, cnt_reg, 2, false);
+            e.op_imm8(0x83, 7, cnt_reg, 2, false);
+            let back_w32 = (w32_2_top as isize) - ((e.code.len() + 6) as isize);
+            e.code.extend_from_slice(&[0x0F, 0x83]); e.code.extend_from_slice(&(back_w32 as i32).to_le_bytes()); e.insns += 1;
+            let w32_tail_chk = e.code.len();
+            let fwd_w32 = (w32_tail_chk as isize) - ((jb_w32_2 + 6) as isize);
+            if let Some(s) = e.code.get_mut(jb_w32_2 + 2..jb_w32_2 + 6) { s.copy_from_slice(&(fwd_w32 as i32).to_le_bytes()); }
+            e.push_rr(0x85, cnt_reg, cnt_reg);
+            let jz_w32_done = e.code.len();
+            e.code.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]); e.insns += 1;
+            emit_x86_w32_body(&mut e, kernel, w32, ra, 0)?;
+            let w32_vzu = e.code.len();
+            let fwd_w32_done = (w32_vzu as isize) - ((jz_w32_done + 6) as isize);
+            if let Some(s) = e.code.get_mut(jz_w32_done + 2..jz_w32_done + 6) { s.copy_from_slice(&(fwd_w32_done as i32).to_le_bytes()); }
         }
-        let loop_top = e.code.len();
-        if let Some(ref steps) = avx_plan {
-            emit_x86_avx2_steps(&mut e, steps, ra, Some(false))?;
-        } else if let Some(ref w32) = w32_plan {
-            emit_x86_w32_body(&mut e, w32, ra)?;
-        } else {
-            emit_x86_body(&mut e, kernel, sched, ra, doms)?;
+        if w32_plan.is_none() {
+            let loop_top = e.code.len();
+            if let Some(ref steps) = avx_plan {
+                emit_x86_avx2_steps(&mut e, steps, ra, Some(false))?;
+            } else {
+                emit_x86_body(&mut e, kernel, sched, ra, doms)?;
+            }
+            for (&br, b) in ra.buf_reg.iter().zip(kernel.bufs.iter()) {
+                if !matches!(b.access, BufAccess::LookupTable(_)) { e.add_imm(br, b.block_bytes() as i32); }
+            }
+            e.op_imm8(0x83, 0, cnt_reg, 0xFF, false);
+            let back = (loop_top as isize) - ((e.code.len() + 6) as isize);
+            e.code.extend_from_slice(&[0x0F, 0x85]); e.code.extend_from_slice(&(back as i32).to_le_bytes()); e.insns += 1;
         }
-        for (&br, b) in ra.buf_reg.iter().zip(kernel.bufs.iter()) {
-            if !matches!(b.access, BufAccess::LookupTable(_)) { e.add_imm(br, b.block_bytes() as i32); }
-        }
-        e.op_imm8(0x83, 0, cnt_reg, 0xFF, false);
-        let back = (loop_top as isize) - ((e.code.len() + 6) as isize);
-        e.code.extend_from_slice(&[0x0F, 0x85]); e.code.extend_from_slice(&(back as i32).to_le_bytes()); e.insns += 1;
         if single_vec { e.vzeroupper(); }
         let done_pos = e.code.len();
         let fwd = (done_pos as isize) - ((jz_pos + 6) as isize);
@@ -1252,6 +1555,7 @@ fn emit_x86_module(kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms:
         e.ret();
     }
     let b_size = (e.code.len() as u64) - b_off;
+    e.finalize_const_pool();
     let syms = vec![
         ElfSymbol { name: format!("zero_cc_{}", kernel.name), offset: 0, size: k_size },
         ElfSymbol { name: format!("zero_cc_{}_batch", kernel.name), offset: b_off, size: b_size },
@@ -1275,13 +1579,13 @@ impl ArmEmit {
     fn mov_imm64_fixed(&mut self, dst: u8, u: u64) { self.mov_imm_u64(dst, u, true); }
     fn ldst_lane(&mut self, ty: ElemTy, reg: u8, base: u8, lane: u8, store: bool) {
         let op_hi = match (store, ty) {
-            (false, ElemTy::I64) => 0xF940_0000,
+            (false, ElemTy::I64 | ElemTy::U64) => 0xF940_0000,
             (false, ElemTy::I32) => 0xB980_0000,
             (false, ElemTy::I16) => 0x7980_0000,
             (false, ElemTy::U32) => 0xB940_0000,
             (false, ElemTy::U16) => 0x7940_0000,
             (false, ElemTy::U8) => 0x3940_0000,
-            (true, ElemTy::I64) => 0xF900_0000,
+            (true, ElemTy::I64 | ElemTy::U64) => 0xF900_0000,
             (true, ElemTy::I32 | ElemTy::U32) => 0xB900_0000,
             (true, ElemTy::I16 | ElemTy::U16) => 0x7900_0000,
             (true, ElemTy::U8) => 0x3900_0000,
@@ -1292,7 +1596,7 @@ impl ArmEmit {
     fn str_lane(&mut self, ty: ElemTy, src: u8, base: u8, lane: u8) { self.ldst_lane(ty, src, base, lane, true); }
     fn ldr_lut(&mut self, ty: ElemTy, dst: u8, base: u8, idx: u8) {
         let (op_hi, mid) = match ty {
-            ElemTy::I64 => (0xF860_0000, 0x7800), ElemTy::I32 => (0xB8A0_0000, 0x7800),
+            ElemTy::I64 | ElemTy::U64 => (0xF860_0000, 0x7800), ElemTy::I32 => (0xB8A0_0000, 0x7800),
             ElemTy::I16 => (0x78A0_0000, 0x7800), ElemTy::U32 => (0xB860_0000, 0x7800),
             ElemTy::U16 => (0x7860_0000, 0x7800), ElemTy::U8 => (0x3860_0000, 0x6800),
         };
@@ -1345,6 +1649,10 @@ fn emit_arm_body(e: &mut ArmEmit, kernel: &Kernel, sched: &ScheduleReport, ra: &
             Op::Add(a, b) => { let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?); e.put(arm64_rrr(0x8B00_0000, vb, 0, va, dst)); }
             Op::Sub(a, b) => { let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?); e.put(arm64_rrr(0xCB00_0000, vb, 0, va, dst)); }
             Op::BitAnd(a, b) => { let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?); e.put(arm64_rrr(0x8A00_0000, vb, 0, va, dst)); }
+            Op::BitOr(a, b) => { let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?); e.put(arm64_rrr(0xAA00_0000, vb, 0, va, dst)); }
+            Op::BitXor(a, b) => { let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?); e.put(arm64_rrr(0xCA00_0000, vb, 0, va, dst)); }
+            Op::ShlVar(a, b) => { let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?); e.put(arm64_rrr(0x9AC0_0000, vb, 0x2000, va, dst)); }
+            Op::ShrVarU(a, b) => { let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?); e.put(arm64_rrr(0x9AC0_0000, vb, 0x2400, va, dst)); }
             Op::Mul(a, b) => { let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?); e.put(arm64_rrr(0x9B00_0000, vb, 0x7C00, va, dst)); }
             Op::Div(a, b) | Op::Rem(a, b) => {
                 let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?);
@@ -1378,6 +1686,12 @@ fn emit_arm_body(e: &mut ArmEmit, kernel: &Kernel, sched: &ScheduleReport, ra: &
                     e.put(0xD340_0000 | immr | imms | ((va as u32 & 31) << 5) | (dst as u32 & 31));
                 }
             }
+            Op::Ushr(a, s) => {
+                let va = arm_val(e, kernel, ra, a, 16)?;
+                if s == 0 { e.mov_rr(dst, va); } else {
+                    e.put(0xD340_FC00 | ((u32::from(s) & 63) << 16) | ((va as u32 & 31) << 5) | (dst as u32 & 31));
+                }
+            }
             Op::Shr(a, s) => {
                 let va = arm_val(e, kernel, ra, a, 16)?;
                 if s == 0 { e.mov_rr(dst, va); } else {
@@ -1388,7 +1702,10 @@ fn emit_arm_body(e: &mut ArmEmit, kernel: &Kernel, sched: &ScheduleReport, ra: &
             Op::Cmp(k, a, b) => {
                 let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?);
                 e.put(arm64_rrr(0xEB00_0000, vb, 0, va, 31));
-                let inv_cc = match k { CmpKind::Eq => 1, CmpKind::Ne => 0, CmpKind::Lt => 10, CmpKind::Ge => 11, CmpKind::Le => 12, CmpKind::Gt => 13 };
+                let inv_cc = match k {
+                    CmpKind::Eq => 1, CmpKind::Ne => 0, CmpKind::Lt => 10, CmpKind::Ge => 11, CmpKind::Le => 12, CmpKind::Gt => 13,
+                    CmpKind::Ult => 2, CmpKind::Uge => 3, CmpKind::Ule => 8, CmpKind::Ugt => 9,
+                };
                 e.put(0x9A9F_07E0 | (inv_cc << 12) | (dst as u32 & 31));
             }
             Op::Select { cond, t_val, f_val } => {

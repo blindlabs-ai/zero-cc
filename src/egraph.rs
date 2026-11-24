@@ -127,7 +127,31 @@ impl EGraph {
             Op::Mul(a, b) => { self.match_mul_const(cid, a, b, out); self.match_mul_const(cid, b, a, out); }
             Op::Div(x, d_id) | Op::Rem(x, d_id) => self.match_div_rem(cid, x, d_id, matches!(node, Op::Rem(_, _)), out),
             Op::Shl(x, s) | Op::Shr(x, s) => self.match_shift(cid, x, s, matches!(node, Op::Shr(_, _)), out),
+            Op::Ushr(x, s) => {
+                if s == 0 { out.push(Act::Alias(cid, x)); }
+                for &xn in self.class(x).map_or(&[][..], |c| &c.nodes) {
+                    if let Op::Ushr(base, s0) = xn { if u16::from(s0) + u16::from(s) < 64 { out.push(Act::Node(cid, Op::Ushr(base, s0 + s))); } }
+                }
+            }
+            Op::ShlVar(x, s_id) => {
+                if let Some(s) = self.domain(s_id).is_const() { out.push(Act::Node(cid, Op::Shl(x, (s as u8) & 63))); }
+                else if self.domain(x).is_const() == Some(0) { out.push(Act::Node(cid, Op::Const(0))); }
+            }
+            Op::ShrVarU(x, s_id) => {
+                if let Some(s) = self.domain(s_id).is_const() { out.push(Act::Node(cid, Op::Ushr(x, (s as u8) & 63))); }
+                else if self.domain(x).is_const() == Some(0) { out.push(Act::Node(cid, Op::Const(0))); }
+            }
             Op::BitAnd(a, b) => self.match_bitand(cid, a, b, out),
+            Op::BitOr(a, b) => {
+                if a == b || self.domain(b).is_const() == Some(0) { out.push(Act::Alias(cid, a)); }
+                else if self.domain(a).is_const() == Some(0) { out.push(Act::Alias(cid, b)); }
+                else if self.domain(a).is_const() == Some(-1) || self.domain(b).is_const() == Some(-1) { out.push(Act::Node(cid, Op::Const(-1))); }
+            }
+            Op::BitXor(a, b) => {
+                if a == b { out.push(Act::Node(cid, Op::Const(0))); }
+                else if self.domain(b).is_const() == Some(0) { out.push(Act::Alias(cid, a)); }
+                else if self.domain(a).is_const() == Some(0) { out.push(Act::Alias(cid, b)); }
+            }
             Op::Cmp(k, a, b) => for (val, c_id) in [(a, b), (b, a)] {
                 if let Some(c) = self.domain(c_id).is_const() { if self.is_bool(val) && ((k == CmpKind::Ne && c == 0) || (k == CmpKind::Eq && c == 1)) { out.push(Act::Alias(cid, val)); } }
             },

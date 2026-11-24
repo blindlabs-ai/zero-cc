@@ -17,16 +17,31 @@ define_errors! { CompileError;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum CmpKind { Eq, Ne, Lt, Le, Gt, Ge }
+pub enum CmpKind { Eq, Ne, Lt, Le, Gt, Ge, Ult, Ule, Ugt, Uge }
 impl CmpKind {
-    pub const fn eval(self, a: i64, b: i64) -> bool { match self { Self::Eq => a == b, Self::Ne => a != b, Self::Lt => a < b, Self::Le => a <= b, Self::Gt => a > b, Self::Ge => a >= b } }
-    pub const fn sym(self) -> &'static str { match self { Self::Eq => "==", Self::Ne => "!=", Self::Lt => "<", Self::Le => "<=", Self::Gt => ">", Self::Ge => ">=" } }
+    pub const fn eval(self, a: i64, b: i64) -> bool {
+        match self {
+            Self::Eq => a == b, Self::Ne => a != b,
+            Self::Lt => a < b, Self::Le => a <= b, Self::Gt => a > b, Self::Ge => a >= b,
+            Self::Ult => (a as u64) < (b as u64), Self::Ule => (a as u64) <= (b as u64),
+            Self::Ugt => (a as u64) > (b as u64), Self::Uge => (a as u64) >= (b as u64),
+        }
+    }
+    pub const fn is_unsigned(self) -> bool { matches!(self, Self::Ult | Self::Ule | Self::Ugt | Self::Uge) }
+    pub const fn sym(self) -> &'static str {
+        match self {
+            Self::Eq => "==", Self::Ne => "!=",
+            Self::Lt | Self::Ult => "<", Self::Le | Self::Ule => "<=",
+            Self::Gt | Self::Ugt => ">", Self::Ge | Self::Uge => ">=",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ElemTy {
     #[default]
     I64,
+    U64,
     I32,
     I16,
     U32,
@@ -37,6 +52,7 @@ impl ElemTy {
     const fn meta(self) -> (&'static str, u8) {
         match self {
             Self::I64 => ("i64", 3),
+            Self::U64 => ("u64", 3),
             Self::I32 => ("i32", 2),
             Self::I16 => ("i16", 1),
             Self::U32 => ("u32", 2),
@@ -49,24 +65,25 @@ impl ElemTy {
     pub const fn rust_name(self) -> &'static str { self.meta().0 }
     pub fn from_rust_name(name: &str) -> Option<Self> {
         match name {
-            "i64" => Some(Self::I64), "i32" => Some(Self::I32), "i16" => Some(Self::I16),
+            "i64" => Some(Self::I64), "u64" => Some(Self::U64), "i32" => Some(Self::I32), "i16" => Some(Self::I16),
             "u32" => Some(Self::U32), "u16" => Some(Self::U16), "u8" => Some(Self::U8),
             _ => None,
         }
     }
     pub const fn natural_domain(self) -> Domain {
-        match self {
-            Self::I64 => Domain::top(),
-            Self::I32 => Domain::range(i32::MIN as i64, i32::MAX as i64),
-            Self::I16 => Domain::range(i16::MIN as i64, i16::MAX as i64),
-            Self::U32 => Domain::range(0, u32::MAX as i64),
-            Self::U16 => Domain::range(0, u16::MAX as i64),
-            Self::U8 => Domain::range(0, u8::MAX as i64),
-        }
+        let (lo, hi) = match self {
+            Self::I64 | Self::U64 => (i64::MIN, i64::MAX),
+            Self::I32 => (i32::MIN as i64, i32::MAX as i64),
+            Self::I16 => (i16::MIN as i64, i16::MAX as i64),
+            Self::U32 => (0, u32::MAX as i64),
+            Self::U16 => (0, u16::MAX as i64),
+            Self::U8 => (0, u8::MAX as i64),
+        };
+        Domain { lo, hi, modulus: 1, rem: 0 }
     }
     pub const fn cast_i64(self, v: i64) -> i64 {
         match self {
-            Self::I64 => v,
+            Self::I64 | Self::U64 => v,
             Self::I32 => (v as i32) as i64,
             Self::I16 => (v as i16) as i64,
             Self::U32 => (v as u32) as i64,
@@ -76,7 +93,7 @@ impl ElemTy {
     }
     pub fn push_le_elem(self, out: &mut Vec<u8>, v: i64) {
         match self {
-            Self::I64 => out.extend_from_slice(&v.to_le_bytes()),
+            Self::I64 | Self::U64 => out.extend_from_slice(&v.to_le_bytes()),
             Self::I32 => out.extend_from_slice(&(v as i32).to_le_bytes()),
             Self::I16 => out.extend_from_slice(&(v as i16).to_le_bytes()),
             Self::U32 => out.extend_from_slice(&(v as u32).to_le_bytes()),
@@ -241,15 +258,58 @@ impl Domain {
         else if self.is_nonneg() && rhs.is_nonneg() { Self::range(0, self.hi.min(rhs.hi)) }
         else if rhs.is_nonneg() { Self::range(0, rhs.hi) } else if self.is_nonneg() { Self::range(0, self.hi) } else { Self::top() }
     }
+    fn nonneg_bit_hi(v: i64) -> i64 {
+        if v <= 0 { 0 } else if v >= (1i64 << 62) { i64::MAX } else { (1i64 << (64 - v.leading_zeros())) - 1 }
+    }
+    pub fn eval_or(self, rhs: Self) -> Self {
+        if self.is_empty() || rhs.is_empty() { Self::empty() }
+        else if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) { Self::exact(a | b) }
+        else if self.is_nonneg() && rhs.is_nonneg() { Self::range(self.lo.max(rhs.lo), Self::nonneg_bit_hi(self.hi | rhs.hi)) }
+        else { Self::top() }
+    }
+    pub fn eval_xor(self, rhs: Self) -> Self {
+        if self.is_empty() || rhs.is_empty() { Self::empty() }
+        else if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) { Self::exact(a ^ b) }
+        else if self.is_nonneg() && rhs.is_nonneg() { Self::range(0, Self::nonneg_bit_hi(self.hi | rhs.hi)) }
+        else { Self::top() }
+    }
+    pub fn eval_ushr(self, s: u8) -> Self {
+        if self.is_empty() { Self::empty() } else if s >= 64 { Self::top() }
+        else if let Some(c) = self.is_const() { Self::exact(((c as u64) >> s) as i64) }
+        else if s == 0 { self } else if self.is_nonneg() { self.eval_shr(s) }
+        else { Self::range(0, (u64::MAX >> s) as i64) }
+    }
+    pub fn eval_shl_var(self, rhs: Self) -> Self {
+        if self.is_empty() || rhs.is_empty() { Self::empty() }
+        else if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) { Self::exact(((a as u64).wrapping_shl((b as u32) & 63)) as i64) }
+        else if let Some(b) = rhs.is_const() { self.eval_shl((b as u8) & 63) } else { Self::top() }
+    }
+    pub fn eval_shr_var_u(self, rhs: Self) -> Self {
+        if self.is_empty() || rhs.is_empty() { Self::empty() }
+        else if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) { Self::exact(((a as u64).wrapping_shr((b as u32) & 63)) as i64) }
+        else if let Some(b) = rhs.is_const() { self.eval_ushr((b as u8) & 63) }
+        else if self.is_nonneg() { Self::range(0, self.hi) }
+        else if rhs.lo >= 1 && rhs.hi <= 63 { Self::range(0, (u64::MAX >> (rhs.lo as u32)) as i64) } else { Self::top() }
+    }
     pub fn eval_cmp(self, kind: CmpKind, rhs: Self) -> Self {
         if self.is_empty() || rhs.is_empty() { return Self::empty(); }
         if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) { return Self::exact(i64::from(kind.eval(a, b))); }
+        let same_sign = (self.is_nonneg() && rhs.is_nonneg()) || (self.hi < 0 && rhs.hi < 0);
         let known = match kind {
             CmpKind::Eq => self.try_meet(rhs).is_none().then_some(false), CmpKind::Ne => self.try_meet(rhs).is_none().then_some(true),
             CmpKind::Lt => if self.hi < rhs.lo { Some(true) } else if self.lo >= rhs.hi { Some(false) } else { None },
             CmpKind::Le => if self.hi <= rhs.lo { Some(true) } else if self.lo > rhs.hi { Some(false) } else { None },
             CmpKind::Gt => if self.lo > rhs.hi { Some(true) } else if self.hi <= rhs.lo { Some(false) } else { None },
             CmpKind::Ge => if self.lo >= rhs.hi { Some(true) } else if self.hi < rhs.lo { Some(false) } else { None },
+            CmpKind::Ult | CmpKind::Ule | CmpKind::Ugt | CmpKind::Uge if same_sign => {
+                let sk = match kind { CmpKind::Ult => CmpKind::Lt, CmpKind::Ule => CmpKind::Le, CmpKind::Ugt => CmpKind::Gt, _ => CmpKind::Ge };
+                return self.eval_cmp(sk, rhs);
+            }
+            CmpKind::Ult | CmpKind::Ule if self.is_nonneg() && rhs.hi < 0 => Some(true),
+            CmpKind::Ult | CmpKind::Ule if self.hi < 0 && rhs.is_nonneg() => Some(false),
+            CmpKind::Ugt | CmpKind::Uge if self.is_nonneg() && rhs.hi < 0 => Some(false),
+            CmpKind::Ugt | CmpKind::Uge if self.hi < 0 && rhs.is_nonneg() => Some(true),
+            CmpKind::Ult | CmpKind::Ule | CmpKind::Ugt | CmpKind::Uge => None,
         };
         known.map_or(Self::range(0, 1), |b| Self::exact(i64::from(b)))
     }
@@ -269,7 +329,12 @@ define_ops! { f;
     Rem(Id, Id) | Self::Rem(a, b) => Op::Rem(f(a), f(b));
     Shl(Id, u8) | Self::Shl(a, s) => Op::Shl(f(a), s);
     Shr(Id, u8) | Self::Shr(a, s) => Op::Shr(f(a), s);
+    Ushr(Id, u8) | Self::Ushr(a, s) => Op::Ushr(f(a), s);
+    ShlVar(Id, Id) | Self::ShlVar(a, b) => Op::ShlVar(f(a), f(b));
+    ShrVarU(Id, Id) | Self::ShrVarU(a, b) => Op::ShrVarU(f(a), f(b));
     BitAnd(Id, Id) | Self::BitAnd(a, b) => Op::BitAnd(f(a), f(b));
+    BitOr(Id, Id) | Self::BitOr(a, b) => Op::BitOr(f(a), f(b));
+    BitXor(Id, Id) | Self::BitXor(a, b) => Op::BitXor(f(a), f(b));
     Cmp(CmpKind, Id, Id) | Self::Cmp(k, a, b) => Op::Cmp(k, f(a), f(b));
     Select { cond: Id, t_val: Id, f_val: Id } | Self::Select { cond, t_val, f_val } => Op::Select { cond: f(cond), t_val: f(t_val), f_val: f(f_val) };
 }
@@ -285,8 +350,11 @@ impl<Id: Copy> Op<Id> {
             Self::Sub(a, b) => if a == b { Domain::exact(0) } else { dom(a).eval_add_sub(dom(b), true) },
             Self::Mul(a, b) => if a == b { dom(a).eval_square() } else { dom(a).eval_mul(dom(b)) },
             Self::Div(a, b) => dom(a).eval_div(dom(b)), Self::Rem(a, b) => dom(a).eval_rem(dom(b)),
-            Self::Shl(a, s) => dom(a).eval_shl(s), Self::Shr(a, s) => dom(a).eval_shr(s), Self::BitAnd(a, b) => dom(a).eval_and(dom(b)),
-            Self::Cmp(k, a, b) => if a == b { Domain::exact(i64::from(matches!(k, CmpKind::Eq | CmpKind::Le | CmpKind::Ge))) } else { dom(a).eval_cmp(k, dom(b)) },
+            Self::Shl(a, s) => dom(a).eval_shl(s), Self::Shr(a, s) => dom(a).eval_shr(s),
+            Self::Ushr(a, s) => dom(a).eval_ushr(s), Self::ShlVar(a, b) => dom(a).eval_shl_var(dom(b)), Self::ShrVarU(a, b) => dom(a).eval_shr_var_u(dom(b)),
+            Self::BitAnd(a, b) => dom(a).eval_and(dom(b)), Self::BitOr(a, b) => dom(a).eval_or(dom(b)),
+            Self::BitXor(a, b) => if a == b { Domain::exact(0) } else { dom(a).eval_xor(dom(b)) },
+            Self::Cmp(k, a, b) => if a == b { Domain::exact(i64::from(matches!(k, CmpKind::Eq | CmpKind::Le | CmpKind::Ge | CmpKind::Ule | CmpKind::Uge))) } else { dom(a).eval_cmp(k, dom(b)) },
             Self::Select { cond, t_val, f_val } => {
                 let cd = dom(cond);
                 if cd.is_empty() { Domain::empty() } else if cd.is_const() == Some(0) { dom(f_val) } else if !cd.contains(0) { dom(t_val) } else { dom(t_val).join(dom(f_val)) }
@@ -297,7 +365,8 @@ impl<Id: Copy> Op<Id> {
         match self {
             Self::MemInit | Self::Const(_) => (0, 0), Self::Load { mem, .. } => if is_init(mem) { (4, 1) } else { (12, 2) },
             Self::Store { .. } => (10, 2), Self::LoadLut { .. } => (5, 1), Self::BoundsCheck { .. } => (12, 2), Self::Select { .. } => (2, 1),
-            Self::Add(_, _) | Self::Sub(_, _) | Self::Shl(_, _) | Self::Shr(_, _) | Self::BitAnd(_, _) | Self::Cmp(_, _, _) => (1, 1),
+            Self::Add(_, _) | Self::Sub(_, _) | Self::Shl(_, _) | Self::Shr(_, _) | Self::Ushr(_, _) | Self::BitAnd(_, _) | Self::BitOr(_, _) | Self::BitXor(_, _) | Self::Cmp(_, _, _) => (1, 1),
+            Self::ShlVar(_, _) | Self::ShrVarU(_, _) => (2, 1),
             Self::Mul(a, b) => if dom(a).fits_u32() && dom(b).fits_u32() { (4, 1) } else { (10, 2) }, Self::Div(_, _) | Self::Rem(_, _) => (36, 3),
         }
     }
@@ -349,7 +418,7 @@ impl Kernel {
                 Op::Store { buf, lane, .. } => self.check_buf_lane(buf, lane, true)?,
                 Op::LoadLut { buf, .. } if !matches!(self.bufs.get(buf as usize).map(|b| b.access), Some(BufAccess::LookupTable(_))) => return Err(CompileError::InvalidBuffer(buf)),
                 Op::BoundsCheck { limit, .. } if limit <= 0 => return Err(CompileError::OutOfBounds { idx: 0, limit }),
-                Op::Shl(_, s) | Op::Shr(_, s) if s >= 64 => return Err(CompileError::InvalidShift(s)),
+                Op::Shl(_, s) | Op::Shr(_, s) | Op::Ushr(_, s) if s >= 64 => return Err(CompileError::InvalidShift(s)),
                 _ => {}
             }
         }
@@ -406,7 +475,11 @@ impl Kernel {
                 Op::BoundsCheck { idx, limit } => { let iv = vals[idx]; if iv < 0 || iv >= limit { return Err(CompileError::OutOfBounds { idx: iv, limit }); } iv }
                 Op::Add(a, b) => vals[a].wrapping_add(vals[b]), Op::Sub(a, b) => vals[a].wrapping_sub(vals[b]), Op::Mul(a, b) => vals[a].wrapping_mul(vals[b]),
                 Op::Div(a, b) => checked_div_rem(vals[a], vals[b], false)?, Op::Rem(a, b) => checked_div_rem(vals[a], vals[b], true)?,
-                Op::Shl(a, s) => vals[a].wrapping_shl(u32::from(s)), Op::Shr(a, s) => vals[a].wrapping_shr(u32::from(s)), Op::BitAnd(a, b) => vals[a] & vals[b],
+                Op::Shl(a, s) => vals[a].wrapping_shl(u32::from(s)), Op::Shr(a, s) => vals[a].wrapping_shr(u32::from(s)),
+                Op::Ushr(a, s) => ((vals[a] as u64).wrapping_shr(u32::from(s))) as i64,
+                Op::ShlVar(a, b) => ((vals[a] as u64).wrapping_shl((vals[b] as u32) & 63)) as i64,
+                Op::ShrVarU(a, b) => ((vals[a] as u64).wrapping_shr((vals[b] as u32) & 63)) as i64,
+                Op::BitAnd(a, b) => vals[a] & vals[b], Op::BitOr(a, b) => vals[a] | vals[b], Op::BitXor(a, b) => vals[a] ^ vals[b],
                 Op::Cmp(k, a, b) => i64::from(k.eval(vals[a], vals[b])), Op::Select { cond, t_val, f_val } => if vals[cond] != 0 { vals[t_val] } else { vals[f_val] },
             };
         }
@@ -414,4 +487,108 @@ impl Kernel {
         for o in &self.outputs { out[o.buf as usize][o.lane as usize] = self.bufs[o.buf as usize].elem_ty.cast_i64(vals[o.val]); }
         Ok(out)
     }
+}
+
+fn narrow_channel_val(fused: &mut Kernel, elem_ty: ElemTy, val: NodeId) -> NodeId {
+    match elem_ty {
+        ElemTy::I64 | ElemTy::U64 => val,
+        ElemTy::U32 => { let m = fused.push(Op::Const(0xFFFF_FFFF)); fused.push(Op::BitAnd(val, m)) }
+        ElemTy::U16 => { let m = fused.push(Op::Const(0xFFFF)); fused.push(Op::BitAnd(val, m)) }
+        ElemTy::U8 => { let m = fused.push(Op::Const(0xFF)); fused.push(Op::BitAnd(val, m)) }
+        ElemTy::I32 => { let s = fused.push(Op::Shl(val, 32)); fused.push(Op::Shr(s, 32)) }
+        ElemTy::I16 => { let s = fused.push(Op::Shl(val, 48)); fused.push(Op::Shr(s, 48)) }
+    }
+}
+
+/// Fuse a sequential pipeline of kernels into a single SSA kernel, wiring matching-name
+/// intermediate `MutNoAlias -> ReadOnly` buffers directly in registers (zero RAM round-trip).
+pub fn fuse_kernels(name: impl Into<String>, stages: &[&Kernel]) -> Result<Kernel, CompileError> {
+    if stages.is_empty() { return Err(CompileError::ParseError("cannot fuse empty stage list".into())); }
+    for st in stages { st.validate()?; }
+    let mut read_after: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut produced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (idx, st) in stages.iter().enumerate() {
+        for b in &st.bufs {
+            if b.access == BufAccess::ReadOnly && produced.contains(&b.name) { read_after.insert(b.name.clone()); }
+        }
+        if idx + 1 < stages.len() {
+            for b in &st.bufs { if b.access == BufAccess::MutNoAlias { produced.insert(b.name.clone()); } }
+        }
+    }
+    let last_outs: std::collections::BTreeSet<String> = stages.last().map_or_else(Default::default, |st| {
+        st.bufs.iter().filter(|b| b.access == BufAccess::MutNoAlias).map(|b| b.name.clone()).collect()
+    });
+    let mut fused = Kernel::new(name);
+    let mem0 = fused.push(Op::MemInit);
+    let mut ext_bufs: std::collections::BTreeMap<String, u8> = std::collections::BTreeMap::new();
+    let mut ssa_bus: std::collections::BTreeMap<(String, u8), NodeId> = std::collections::BTreeMap::new();
+    for (s_idx, st) in stages.iter().enumerate() {
+        let mut bmap: Vec<Option<u8>> = Vec::with_capacity(st.bufs.len());
+        for b in &st.bufs {
+            let internal_ro = b.access == BufAccess::ReadOnly && read_after.contains(&b.name);
+            let internal_out = b.access == BufAccess::MutNoAlias && read_after.contains(&b.name) && (s_idx + 1 < stages.len() || !last_outs.contains(&b.name));
+            if internal_ro || internal_out {
+                bmap.push(None);
+                continue;
+            }
+            if let Some(&eid) = ext_bufs.get(&b.name) {
+                let eb = fused.bufs.get(eid as usize).ok_or(CompileError::InvalidBuffer(eid))?;
+                if eb.elem_ty != b.elem_ty || eb.lanes != b.lanes || eb.access != b.access {
+                    return Err(CompileError::ParseError(format!("incompatible buffer `{}` across fused stages", b.name)));
+                }
+                bmap.push(Some(eid));
+            } else {
+                let eid = fused.add_typed_buf(b.name.clone(), b.access, b.elem_ty, b.lanes, b.domain);
+                ext_bufs.insert(b.name.clone(), eid);
+                bmap.push(Some(eid));
+            }
+        }
+        let mut nmap: Vec<NodeId> = Vec::with_capacity(st.nodes.len());
+        for &op in &st.nodes {
+            let mapped = match op {
+                Op::MemInit => mem0,
+                Op::Load { mem, buf, lane } => {
+                    let bname = &st.bufs.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?.name;
+                    if let Some(&val) = ssa_bus.get(&(bname.clone(), lane)) {
+                        val
+                    } else {
+                        let eb = bmap.get(buf as usize).copied().flatten().ok_or(CompileError::InvalidBuffer(buf))?;
+                        let nm = if matches!(st.nodes.get(mem), Some(Op::MemInit)) {
+                            mem0
+                        } else {
+                            nmap.get(mem).copied().ok_or(CompileError::InvalidNode(mem))?
+                        };
+                        fused.push(Op::Load { mem: nm, buf: eb, lane })
+                    }
+                }
+                Op::Store { mem, buf, lane, val } => {
+                    let nm = nmap.get(mem).copied().ok_or(CompileError::InvalidNode(mem))?;
+                    let nv = nmap.get(val).copied().ok_or(CompileError::InvalidNode(val))?;
+                    if let Some(eb) = bmap.get(buf as usize).copied().flatten() {
+                        fused.push(Op::Store { mem: nm, buf: eb, lane, val: nv })
+                    } else {
+                        nm
+                    }
+                }
+                Op::LoadLut { buf, idx } => {
+                    let eb = bmap.get(buf as usize).copied().flatten().ok_or(CompileError::InvalidBuffer(buf))?;
+                    let ni = nmap.get(idx).copied().ok_or(CompileError::InvalidNode(idx))?;
+                    fused.push(Op::LoadLut { buf: eb, idx: ni })
+                }
+                other => fused.push(other.map_ids(|k| nmap.get(k).copied().unwrap_or(k))),
+            };
+            nmap.push(mapped);
+        }
+        for o in &st.outputs {
+            let b = st.bufs.get(o.buf as usize).ok_or(CompileError::InvalidBuffer(o.buf))?;
+            let v = nmap.get(o.val).copied().ok_or(CompileError::InvalidNode(o.val))?;
+            if read_after.contains(&b.name) {
+                let nv = narrow_channel_val(&mut fused, b.elem_ty, v);
+                ssa_bus.insert((b.name.clone(), o.lane), nv);
+            }
+            if let Some(eb) = bmap.get(o.buf as usize).copied().flatten() { fused.add_output(eb, o.lane, v); }
+        }
+    }
+    fused.validate()?;
+    Ok(fused)
 }

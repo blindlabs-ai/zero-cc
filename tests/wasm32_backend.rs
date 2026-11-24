@@ -289,7 +289,7 @@ fn wasm32_all_six_elem_ty_widths_node_v22_bit_exact() {
         assert_eq!(cw.vector_mode, WasmVectorMode::VerticalI64x2);
 
         let corners: Vec<i64> = match ty {
-            ElemTy::I64 => vec![
+            ElemTy::I64 | ElemTy::U64 => vec![
                 i64::MIN, -1_000_000_000, -128, -65, -64, -1, 0, 1, 63, 64, 127, 128,
                 1_000_000_000, i64::MAX,
             ],
