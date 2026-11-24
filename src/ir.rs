@@ -133,6 +133,7 @@ impl Domain {
     pub const fn is_const(self) -> Option<i64> { if self.lo == self.hi { Some(self.lo) } else { None } }
     pub const fn is_nonneg(self) -> bool { !self.is_empty() && self.lo >= 0 }
     pub const fn fits_u32(self) -> bool { !self.is_empty() && self.lo >= 0 && self.hi <= u32::MAX as i64 }
+    pub const fn fits_i32(self) -> bool { !self.is_empty() && self.lo >= i32::MIN as i64 && self.hi <= i32::MAX as i64 }
     pub fn contains(self, v: i64) -> bool { v >= self.lo && v <= self.hi && (self.modulus <= 1 || v.rem_euclid(self.modulus) == self.rem) }
     pub fn rem_mod(self, d: i64) -> Option<i64> {
         if d <= 0 || self.is_empty() { None }

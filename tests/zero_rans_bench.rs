@@ -46,7 +46,7 @@ fn set_exec_mode(path: &Path) {
 #[cfg(not(unix))]
 fn set_exec_mode(_path: &Path) {}
 
-fn audit_objdump_x86(path: &Path, expected_syms: Option<&[&str]>) -> (usize, usize) {
+fn audit_objdump_x86(path: &Path, expected_syms: Option<&[&str]>) -> (usize, usize, usize) {
     let out = Command::new("objdump")
         .args(["-d", "-M", "intel"])
         .arg(path)
@@ -55,6 +55,7 @@ fn audit_objdump_x86(path: &Path, expected_syms: Option<&[&str]>) -> (usize, usi
     assert!(out.status.success(), "objdump failed on {}", path.display());
     let text = String::from_utf8_lossy(&out.stdout);
     let mut insns = 0usize;
+    let mut ymm_insns = 0usize;
     let mut syms_seen: Vec<String> = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
@@ -71,6 +72,9 @@ fn audit_objdump_x86(path: &Path, expected_syms: Option<&[&str]>) -> (usize, usi
             continue;
         }
         insns += 1;
+        if asm.contains("ymm") {
+            ymm_insns += 1;
+        }
         let mnemonic = asm.split_whitespace().next().unwrap_or("");
         assert_ne!(mnemonic, "idiv", "forbidden idiv in {}: {asm}", path.display());
         assert_ne!(mnemonic, "div", "forbidden div in {}: {asm}", path.display());
@@ -97,7 +101,7 @@ fn audit_objdump_x86(path: &Path, expected_syms: Option<&[&str]>) -> (usize, usi
             );
         }
     }
-    (insns, syms_seen.len())
+    (insns, syms_seen.len(), ymm_insns)
 }
 
 fn corner_values_for(name: &str, dom: Domain) -> Vec<i64> {
@@ -110,7 +114,10 @@ fn corner_values_for(name: &str, dom: Domain) -> Vec<i64> {
         "even" | "odd" => &[
             -1_000_000_000, -70_000_000, -289, -29, -1, 0, 1, 29, 289, 70_000_000, 1_000_000_000,
         ],
-        "next" => &[0, 1, 32_767, 32_768, 32_769, 65_535, 65_536, 2_147_483_647],
+        "next" => &[
+            0, 1, 32_767, 32_768, 32_769, 65_535, 65_536, 2_147_483_647, 2_147_483_648,
+            4_294_967_295,
+        ],
         "word" => &[0, 1, 255, 256, 32_767, 32_768, 0x55AA, 65_535],
         _ => &[dom.lo, -1, 0, 1, dom.hi],
     };
@@ -447,8 +454,10 @@ fn main() {
     zcc_idct8_1d_combine::idct8_1d_combine_batch(&ceven, &codd, &mut comb_zcc);
     assert_eq!(comb_ref, comb_zcc, "idct8_1d_combine 4096-block parity mismatch");
 
-    // 4. rans_renorm_branchless (next in 0..=2147483647, word in 0..=65535)
-    let next_corners: [u32; 8] = [0, 1, 32_767, 32_768, 32_769, 65_535, 65_536, 2_147_483_647];
+    // 4. rans_renorm_branchless (full u32 next in 0..=u32::MAX, word in 0..=65535)
+    let next_corners: [u32; 10] = [
+        0, 1, 32_767, 32_768, 32_769, 65_535, 65_536, 2_147_483_647, 2_147_483_648, u32::MAX,
+    ];
     let word_corners: [u16; 8] = [0, 1, 255, 256, 32_767, 32_768, 0x55AA, 65_535];
     let mut rnext = vec![[0u32; 8]; PARITY_BLOCKS];
     let mut rword = vec![[0u16; 8]; PARITY_BLOCKS];
@@ -458,7 +467,7 @@ fn main() {
                 rnext[b][l] = next_corners[(b + l) % next_corners.len()];
                 rword[b][l] = word_corners[(b + l * 3) % word_corners.len()];
             } else {
-                rnext[b][l] = rng.range_i64(0, 2_147_483_647) as u32;
+                rnext[b][l] = rng.range_i64(0, i64::from(u32::MAX)) as u32;
                 rword[b][l] = rng.range_i64(0, 65_535) as u16;
             }
         }
@@ -471,6 +480,40 @@ fn main() {
     zcc_rans_renorm_branchless::rans_renorm_branchless_batch(&rnext, &rword, &mut r0_zcc, &mut r1_zcc);
     assert_eq!(r0_ref, r0_zcc, "rans_renorm_branchless out0 4096-block parity mismatch");
     assert_eq!(r1_ref, r1_zcc, "rans_renorm_branchless out1 4096-block parity mismatch");
+
+    // 5. Non-multiple-of-4 scalar tail parity (blocks = 1, 3, 7) across all 6 kernels
+    for &tail_n in &[1usize, 3, 7] {
+        let mut te = vec![[0i64; 4]; tail_n];
+        zcc_idct8_1d_even::idct8_1d_even_batch(&raw[..tail_n], &mut te);
+        assert_eq!(&even_ref[..tail_n], &te[..], "idct8_1d_even tail_n={tail_n} mismatch");
+
+        let mut to = vec![[0i64; 4]; tail_n];
+        zcc_idct8_1d_odd::idct8_1d_odd_batch(&raw[..tail_n], &mut to);
+        assert_eq!(&odd_ref[..tail_n], &to[..], "idct8_1d_odd tail_n={tail_n} mismatch");
+
+        let mut tde = vec![[0i32; 8]; tail_n];
+        zcc_dct8_1d_even::dct8_1d_even_batch(&xbuf[..tail_n], &mut tde);
+        assert_eq!(&de_ref[..tail_n], &tde[..], "dct8_1d_even tail_n={tail_n} mismatch");
+
+        let mut tdo = vec![[0i32; 8]; tail_n];
+        zcc_dct8_1d_odd::dct8_1d_odd_batch(&xbuf[..tail_n], &mut tdo);
+        assert_eq!(&do_ref[..tail_n], &tdo[..], "dct8_1d_odd tail_n={tail_n} mismatch");
+
+        let mut tc = vec![[0i32; 8]; tail_n];
+        zcc_idct8_1d_combine::idct8_1d_combine_batch(&ceven[..tail_n], &codd[..tail_n], &mut tc);
+        assert_eq!(&comb_ref[..tail_n], &tc[..], "idct8_1d_combine tail_n={tail_n} mismatch");
+
+        let mut tr0 = vec![[0u32; 8]; tail_n];
+        let mut tr1 = vec![[0i64; 8]; tail_n];
+        zcc_rans_renorm_branchless::rans_renorm_branchless_batch(
+            &rnext[..tail_n],
+            &rword[..tail_n],
+            &mut tr0,
+            &mut tr1,
+        );
+        assert_eq!(&r0_ref[..tail_n], &tr0[..], "rans_renorm_branchless out0 tail_n={tail_n} mismatch");
+        assert_eq!(&r1_ref[..tail_n], &tr1[..], "rans_renorm_branchless out1 tail_n={tail_n} mismatch");
+    }
 
     // Live hardware timing (512 blocks x 256 iters = 131,072 calls/trial, median of 9)
     let raw_b = &raw[..BENCH_BLOCKS];
@@ -594,6 +637,7 @@ fn zero_rans_six_kernels_bit_exact_et_exec_objdump_and_live_bench() {
     doms.insert("x".to_string(), Domain::range(-32_768, 32_767));
     doms.insert("even".to_string(), Domain::range(-1_000_000_000, 1_000_000_000));
     doms.insert("odd".to_string(), Domain::range(-1_000_000_000, 1_000_000_000));
+    doms.insert("next".to_string(), Domain::range(0, i64::from(u32::MAX)));
     let mut overrides = BTreeMap::new();
     overrides.insert("*".to_string(), doms);
 
@@ -635,8 +679,9 @@ fn zero_rans_six_kernels_bit_exact_et_exec_objdump_and_live_bench() {
 
         let obj_path = dir.join(format!("{name}.o"));
         fs::write(&obj_path, &obj.elf_bytes).expect("write .o");
-        let (rel_insns, _) = audit_objdump_x86(&obj_path, None);
+        let (rel_insns, _, rel_ymm) = audit_objdump_x86(&obj_path, None);
         assert!(rel_insns > 0, "{name} ET_REL must disassemble non-empty");
+        assert!(rel_ymm > 0, "{name} ET_REL must emit packed AVX2 ymm instructions");
         obj_paths.push(obj_path);
         shims.insert(name.to_string(), obj.rust_ffi_shim.clone());
 
@@ -657,8 +702,9 @@ fn zero_rans_six_kernels_bit_exact_et_exec_objdump_and_live_bench() {
         set_exec_mode(&exec_path);
 
         let want_syms = [exec.kernel_sym.as_str(), exec.batch_sym.as_str(), exec.entry_sym.as_str()];
-        let (exec_insns, sym_cnt) = audit_objdump_x86(&exec_path, Some(&want_syms));
+        let (exec_insns, sym_cnt, exec_ymm) = audit_objdump_x86(&exec_path, Some(&want_syms));
         assert_eq!(sym_cnt, 3, "{name} ET_EXEC must contain only 3 direct zero-cc symbols");
+        assert!(exec_ymm > 0, "{name} ET_EXEC must emit packed AVX2 ymm instructions");
 
         let expected_stdout = eval_expected_stdout(kernel, &exec_inputs, EXEC_BLOCKS);
         let expected_exit = i32::from(expected_stdout.iter().fold(0u8, |a, &b| a.wrapping_add(b)) & 0x7F);
@@ -674,7 +720,7 @@ fn zero_rans_six_kernels_bit_exact_et_exec_objdump_and_live_bench() {
         );
 
         println!(
-            "KERNEL|{name}|ops={}->{}|divs={}->{}|rel_insns={rel_insns}|exec_insns={exec_insns}|rel_B={}|exec_B={}|entry=0x{:x}|stdout_B={}|exit={expected_exit}",
+            "KERNEL|{name}|ops={}->{}|divs={}->{}|rel_insns={rel_insns}|rel_ymm={rel_ymm}|exec_insns={exec_insns}|exec_ymm={exec_ymm}|rel_B={}|exec_B={}|entry=0x{:x}|stdout_B={}|exit={expected_exit}",
             orig_cost.total_nodes,
             opt_cost.total_nodes,
             orig_cost.divs_rems,
@@ -714,6 +760,14 @@ fn zero_rans_six_kernels_bit_exact_et_exec_objdump_and_live_bench() {
 
     let bench_lines: Vec<&str> = stdout.lines().filter(|l| l.starts_with("BENCH|")).collect();
     assert_eq!(bench_lines.len(), targets.len(), "expected 6 BENCH lines");
+    for line in &bench_lines {
+        let sp_str = line
+            .split('|')
+            .nth(4)
+            .unwrap_or_else(|| panic!("missing speedup in {line}"));
+        let sp: f64 = sp_str.parse().unwrap_or_else(|_| panic!("bad speedup in {line}"));
+        assert!(sp > 1.05, "expected >1.05x AVX2 speedup over rustc -O3, got {sp:.2}x in {line}");
+    }
 
     let _ = fs::remove_dir_all(&dir);
 }

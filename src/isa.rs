@@ -233,6 +233,11 @@ impl X86Emit {
             self.insns += 1;
         }
     }
+    fn add_imm(&mut self, dst: u8, imm: i32) {
+        if imm == 0 { return; }
+        if let Ok(c8) = i8::try_from(imm) { self.op_imm8(0x83, 0, dst, c8 as u8, false); }
+        else { self.code.extend_from_slice(&[x86_rex_w(0, dst), 0x81, x86_modrm(3, 0, dst)]); self.code.extend_from_slice(&imm.to_le_bytes()); self.insns += 1; }
+    }
     fn stack_op(&mut self, r: u8, is_pop: bool) {
         if r >= 8 { self.code.push(0x41); }
         self.code.push((if is_pop { 0x58 } else { 0x50 }) + (r & 7));
@@ -243,14 +248,39 @@ impl X86Emit {
         self.code.extend_from_slice(&[0xC4, vw[0], vw[1], opc, x86_modrm(3, dst, rm)]);
         self.insns += 1;
     }
-    fn vex_mem(&mut self, l: u8, pp: u8, opc: u8, reg: u8, base: u8, disp: i8) {
-        let (vw, b7) = (x86_vex3_word((reg >> 3) & 1, (base >> 3) & 1, 1, 0, 0, l, pp).to_le_bytes(), base & 7);
-        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], opc]);
-        if disp == 0 && b7 != 5 { self.code.push(x86_modrm(0, reg, base)); if b7 == 4 { self.code.push(0x24); } }
-        else { self.code.push(x86_modrm(1, reg, base)); if b7 == 4 { self.code.push(0x24); } self.code.push(disp as u8); }
+    fn vex_ymm_imm(&mut self, map: u8, opc: u8, dst: u8, vvvv: u8, rm: u8, imm: u8) {
+        self.vex_ymm_op(map, opc, dst, vvvv, rm);
+        self.code.push(imm);
+    }
+    fn vex_extracti128(&mut self, dst_xmm: u8, src_ymm: u8, imm: u8) {
+        let vw = x86_vex3_word((src_ymm >> 3) & 1, (dst_xmm >> 3) & 1, 3, 0, 0, 1, 1).to_le_bytes();
+        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], 0x39, x86_modrm(3, src_ymm, dst_xmm), imm]);
         self.insns += 1;
     }
-    fn vzeroall(&mut self) { self.code.extend_from_slice(&[0xC5, 0xFC, 0x77]); self.insns += 1; }
+    fn vex_shift_imm(&mut self, opc: u8, sub: u8, dst: u8, src: u8, imm: u8) {
+        let vw = x86_vex3_word(0, (src >> 3) & 1, 1, 0, dst, 1, 1).to_le_bytes();
+        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], opc, x86_modrm(3, sub, src), imm]);
+        self.insns += 1;
+    }
+    fn vex_mem_op(&mut self, enc: [u8; 6], reg: u8, base: u8, disp: i32) {
+        let [map, l, pp, w, vvvv, opc] = enc;
+        let vw = x86_vex3_word((reg >> 3) & 1, (base >> 3) & 1, map, w, vvvv, l, pp).to_le_bytes();
+        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], opc]);
+        self.push_mem_disp(reg, base, disp);
+    }
+    fn vex_mem_imm(&mut self, enc: [u8; 6], reg: u8, base: u8, disp: i32, imm: u8) {
+        self.vex_mem_op(enc, reg, base, disp);
+        self.code.push(imm);
+    }
+    fn vex_broadcast_imm(&mut self, dst: u8, val: i64, is_64: bool) {
+        if val == 0 { self.vex_ymm_op(1, 0xEF, dst, dst, dst); return; }
+        self.mov_imm(0, if is_64 { val } else { i64::from(val as i32) });
+        let vw = x86_vex3_word((dst >> 3) & 1, 0, 1, u8::from(is_64), 0, 0, 1).to_le_bytes();
+        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], 0x6E, x86_modrm(3, dst, 0)]);
+        self.insns += 1;
+        self.vex_ymm_op(2, if is_64 { 0x59 } else { 0x58 }, dst, 0, dst);
+    }
+    fn vzeroupper(&mut self) { self.code.extend_from_slice(&[0xC5, 0xF8, 0x77]); self.insns += 1; }
     fn ret(&mut self) { self.code.push(0xC3); self.insns += 1; }
     fn ud2(&mut self) { self.code.extend_from_slice(&[0x0F, 0x0B]); self.insns += 1; }
 }
@@ -391,28 +421,595 @@ fn try_plan_avx2(k: &Kernel, sched: &ScheduleReport, doms: &[Domain], max_vecs: 
     Some(steps)
 }
 
-fn emit_x86_avx2_steps(e: &mut X86Emit, steps: &[AvxStep], ra: &RegAlloc) -> Result<(), CompileError> {
+impl AvxStep {
+    fn dst(&self) -> Option<u8> {
+        match *self {
+            Self::Const(d, _) | Self::Load(d, _, _) | Self::Add(d, _, _) | Self::Sub(d, _, _)
+            | Self::BitAnd(d, _, _) | Self::MulU32(d, _, _) | Self::Shl(d, _, _) | Self::ShrU64(d, _, _) => Some(d),
+            Self::Store(_, _, _) => None,
+        }
+    }
+}
+
+fn emit_x86_avx2_steps(e: &mut X86Emit, steps: &[AvxStep], ra: &RegAlloc, only_hoist: Option<bool>) -> Result<(), CompileError> {
+    let mut dst_cnt = [0u16; 16];
+    for st in steps { if let Some(d) = st.dst() { dst_cnt[usize::from(d & 15)] += 1; } }
     for st in steps {
+        let is_hoisted = matches!(*st, AvxStep::Const(d, _) if dst_cnt[usize::from(d & 15)] == 1);
+        if only_hoist.is_some_and(|want| want != is_hoisted) { continue; }
         match *st {
-            AvxStep::Const(d, c) => {
-                e.mov_imm(0, c);
-                let vw = x86_vex3_word((d >> 3) & 1, 0, 1, 1, 0, 0, 1).to_le_bytes();
-                e.code.extend_from_slice(&[0xC4, vw[0], vw[1], 0x6E, x86_modrm(3, d, 0)]); e.insns += 1;
-                e.vex_ymm_op(2, 0x59, d, 0, d);
-            }
-            AvxStep::Load(d, buf, disp) => e.vex_mem(1, 2, 0x6F, d, *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?, disp),
-            AvxStep::Store(s, buf, disp) => e.vex_mem(1, 2, 0x7F, s, *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?, disp),
+            AvxStep::Const(d, c) => e.vex_broadcast_imm(d, c, true),
+            AvxStep::Load(d, buf, disp) => e.vex_mem_op([1, 1, 2, 0, 0, 0x6F], d, *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?, i32::from(disp)),
+            AvxStep::Store(s, buf, disp) => e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], s, *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?, i32::from(disp)),
             AvxStep::Add(d, a, b) => e.vex_ymm_op(1, 0xD4, d, a, b),
             AvxStep::Sub(d, a, b) => e.vex_ymm_op(1, 0xFB, d, a, b),
             AvxStep::BitAnd(d, a, b) => e.vex_ymm_op(1, 0xDB, d, a, b),
             AvxStep::MulU32(d, a, b) => e.vex_ymm_op(1, 0xF4, d, a, b),
-            AvxStep::Shl(d, a, s) | AvxStep::ShrU64(d, a, s) => {
-                let sub = if matches!(*st, AvxStep::Shl(_, _, _)) { 6 } else { 2 };
-                let vw = x86_vex3_word(0, (a >> 3) & 1, 1, 0, d, 1, 1).to_le_bytes();
-                e.code.extend_from_slice(&[0xC4, vw[0], vw[1], 0x73, x86_modrm(3, sub, a), s]);
-                e.insns += 1;
+            AvxStep::Shl(d, a, s) | AvxStep::ShrU64(d, a, s) => e.vex_shift_imm(0x73, if matches!(*st, AvxStep::Shl(_, _, _)) { 6 } else { 2 }, d, a, s),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+enum W32Step {
+    Load(usize, u8, ElemTy),
+    Store32(usize, u8),
+    StoreI64 { src: usize, buf: u8, signed: bool },
+    Add(usize, usize, usize),
+    Sub(usize, usize, usize),
+    BitAnd(usize, usize, usize),
+    Mul(usize, usize, usize),
+    Shl(usize, usize, u8),
+    ShrU(usize, usize, u8),
+    ShrS(usize, usize, u8),
+    Cmp { dst: usize, kind: CmpKind, a: usize, b: usize, bias: Option<usize>, one: Option<usize> },
+    Select { dst: usize, cond: usize, t_val: usize, f_val: usize, zero: usize },
+}
+
+impl W32Step {
+    fn dst(&self) -> Option<usize> {
+        match *self {
+            Self::Load(d, _, _) | Self::Add(d, _, _) | Self::Sub(d, _, _) | Self::BitAnd(d, _, _)
+            | Self::Mul(d, _, _) | Self::Shl(d, _, _) | Self::ShrU(d, _, _) | Self::ShrS(d, _, _)
+            | Self::Cmp { dst: d, .. } | Self::Select { dst: d, .. } => Some(d),
+            Self::Store32(_, _) | Self::StoreI64 { .. } => None,
+        }
+    }
+    fn for_each_src(&self, mut f: impl FnMut(usize)) {
+        match *self {
+            Self::Load(_, _, _) => {}
+            Self::Store32(s, _) | Self::StoreI64 { src: s, .. } | Self::Shl(_, s, _) | Self::ShrU(_, s, _) | Self::ShrS(_, s, _) => f(s),
+            Self::Add(_, a, b) | Self::Sub(_, a, b) | Self::BitAnd(_, a, b) | Self::Mul(_, a, b) => { f(a); f(b); }
+            Self::Cmp { a, b, bias, one, .. } => {
+                f(a);
+                f(b);
+                if let Some(x) = bias { f(x); }
+                if let Some(x) = one { f(x); }
+            }
+            Self::Select { cond, t_val, f_val, zero, .. } => { f(cond); f(t_val); f(f_val); f(zero); }
+        }
+    }
+    fn remap(&self, m: &[u8]) -> Self {
+        let g = |v: usize| usize::from(m[v]);
+        match *self {
+            Self::Load(d, buf, ty) => Self::Load(g(d), buf, ty),
+            Self::Store32(s, buf) => Self::Store32(g(s), buf),
+            Self::StoreI64 { src, buf, signed } => Self::StoreI64 { src: g(src), buf, signed },
+            Self::Add(d, a, b) => Self::Add(g(d), g(a), g(b)),
+            Self::Sub(d, a, b) => Self::Sub(g(d), g(a), g(b)),
+            Self::BitAnd(d, a, b) => Self::BitAnd(g(d), g(a), g(b)),
+            Self::Mul(d, a, b) => Self::Mul(g(d), g(a), g(b)),
+            Self::Shl(d, a, s) => Self::Shl(g(d), g(a), s),
+            Self::ShrU(d, a, s) => Self::ShrU(g(d), g(a), s),
+            Self::ShrS(d, a, s) => Self::ShrS(g(d), g(a), s),
+            Self::Cmp { dst, kind, a, b, bias, one } => Self::Cmp { dst: g(dst), kind, a: g(a), b: g(b), bias: bias.map(g), one: one.map(g) },
+            Self::Select { dst, cond, t_val, f_val, zero } => Self::Select { dst: g(dst), cond: g(cond), t_val: g(t_val), f_val: g(f_val), zero: g(zero) },
+        }
+    }
+}
+
+struct W32Plan { consts: Vec<(u8, u32)>, steps: Vec<W32Step> }
+
+struct W32Ctx<'a> {
+    k: &'a Kernel, doms: &'a [Domain], needs_full: Vec<bool>,
+    memo: Vec<([NodeId; LANES], usize)>, consts: Vec<(usize, u32)>,
+    steps: Vec<W32Step>, next_v: usize,
+}
+impl<'a> W32Ctx<'a> {
+    fn alloc_v(&mut self) -> usize { let v = self.next_v; self.next_v += 1; v }
+    fn get_const(&mut self, val: u32) -> usize {
+        if let Some(&(v, _)) = self.consts.iter().find(|&&(_, c)| c == val) { return v; }
+        let v = self.alloc_v();
+        self.consts.push((v, val));
+        v
+    }
+    fn match_vec8(&mut self, ids: [NodeId; LANES]) -> Option<usize> {
+        if let Some(&(_, v)) = self.memo.iter().find(|&&(m, _)| m == ids) { return Some(v); }
+        for &id in &ids {
+            if self.needs_full[id] {
+                let d = self.doms.get(id).copied()?;
+                if !(d.fits_i32() || d.fits_u32()) { return None; }
             }
         }
+        let o0 = *self.k.nodes.get(ids[0])?;
+        let r = match o0 {
+            Op::Const(c) => {
+                if !ids[1..].iter().all(|&id| self.k.nodes.get(id).copied() == Some(Op::Const(c))) { return None; }
+                self.get_const(c as u32)
+            }
+            Op::Load { mem, buf, lane: 0 } if self.k.nodes.get(mem).copied() == Some(Op::MemInit) => {
+                for (i, &id) in ids.iter().enumerate().skip(1) {
+                    if self.k.nodes.get(id).copied() != Some(Op::Load { mem, buf, lane: i as u8 }) { return None; }
+                }
+                let ty = self.k.bufs.get(buf as usize)?.elem_ty;
+                if matches!(ty, ElemTy::I64) { return None; }
+                let d = self.alloc_v();
+                self.steps.push(W32Step::Load(d, buf, ty));
+                d
+            }
+            Op::Add(a0, b0) | Op::Sub(a0, b0) | Op::BitAnd(a0, b0) | Op::Mul(a0, b0) => {
+                let (mut la, mut lb) = ([a0; LANES], [b0; LANES]);
+                for i in 1..LANES {
+                    match (o0, *self.k.nodes.get(ids[i])?) {
+                        (Op::Add(_, _), Op::Add(ai, bi)) | (Op::Sub(_, _), Op::Sub(ai, bi))
+                        | (Op::BitAnd(_, _), Op::BitAnd(ai, bi)) | (Op::Mul(_, _), Op::Mul(ai, bi)) => { la[i] = ai; lb[i] = bi; }
+                        _ => return None,
+                    }
+                }
+                let (va, vb) = (self.match_vec8(la)?, self.match_vec8(lb)?);
+                let d = self.alloc_v();
+                self.steps.push(match o0 {
+                    Op::Add(_, _) => W32Step::Add(d, va, vb), Op::Sub(_, _) => W32Step::Sub(d, va, vb),
+                    Op::BitAnd(_, _) => W32Step::BitAnd(d, va, vb), _ => W32Step::Mul(d, va, vb),
+                });
+                d
+            }
+            Op::Shl(a0, s) | Op::Shr(a0, s) if s < 32 => {
+                let mut la = [a0; LANES];
+                for i in 1..LANES {
+                    match (o0, *self.k.nodes.get(ids[i])?) {
+                        (Op::Shl(_, _), Op::Shl(ai, si)) | (Op::Shr(_, _), Op::Shr(ai, si)) if si == s => la[i] = ai,
+                        _ => return None,
+                    }
+                }
+                let is_shr = matches!(o0, Op::Shr(_, _));
+                let is_u = is_shr && la.iter().all(|&a| self.doms.get(a).copied().is_some_and(|dm| dm.is_nonneg() && dm.fits_u32()));
+                if is_shr && !is_u && !la.iter().all(|&a| self.doms.get(a).copied().is_some_and(Domain::fits_i32)) { return None; }
+                let va = self.match_vec8(la)?;
+                let d = self.alloc_v();
+                self.steps.push(if !is_shr { W32Step::Shl(d, va, s) } else if is_u { W32Step::ShrU(d, va, s) } else { W32Step::ShrS(d, va, s) });
+                d
+            }
+            Op::Cmp(kind, a0, b0) => {
+                let (mut la, mut lb) = ([a0; LANES], [b0; LANES]);
+                for i in 1..LANES {
+                    match *self.k.nodes.get(ids[i])? {
+                        Op::Cmp(ki, ai, bi) if ki == kind => { la[i] = ai; lb[i] = bi; }
+                        _ => return None,
+                    }
+                }
+                let all_i32 = la.iter().chain(lb.iter()).all(|&x| self.doms.get(x).copied().is_some_and(Domain::fits_i32));
+                let all_u32 = la.iter().chain(lb.iter()).all(|&x| self.doms.get(x).copied().is_some_and(Domain::fits_u32));
+                if !all_i32 && !all_u32 { return None; }
+                let need_bias = !all_i32 && !matches!(kind, CmpKind::Eq | CmpKind::Ne);
+                let need_one = matches!(kind, CmpKind::Ne | CmpKind::Ge | CmpKind::Le);
+                let (va, vb) = (self.match_vec8(la)?, self.match_vec8(lb)?);
+                let bias = if need_bias { Some(self.get_const(0x8000_0000)) } else { None };
+                let one = if need_one { Some(self.get_const(1)) } else { None };
+                let d = self.alloc_v();
+                self.steps.push(W32Step::Cmp { dst: d, kind, a: va, b: vb, bias, one });
+                d
+            }
+            Op::Select { cond: c0, t_val: t0, f_val: f0 } => {
+                let (mut lc, mut lt, mut lf) = ([c0; LANES], [t0; LANES], [f0; LANES]);
+                for i in 1..LANES {
+                    match *self.k.nodes.get(ids[i])? {
+                        Op::Select { cond, t_val, f_val } => { lc[i] = cond; lt[i] = t_val; lf[i] = f_val; }
+                        _ => return None,
+                    }
+                }
+                let (vc, vt, vf) = (self.match_vec8(lc)?, self.match_vec8(lt)?, self.match_vec8(lf)?);
+                let zero = self.get_const(0);
+                let d = self.alloc_v();
+                self.steps.push(W32Step::Select { dst: d, cond: vc, t_val: vt, f_val: vf, zero });
+                d
+            }
+            _ => return None,
+        };
+        self.memo.push((ids, r));
+        Some(r)
+    }
+}
+
+fn try_plan_avx2_w32(k: &Kernel, sched: &ScheduleReport, doms: &[Domain], max_vecs: usize) -> Option<W32Plan> {
+    if k.outputs.is_empty() || k.bufs.iter().any(|b| matches!(b.access, BufAccess::LookupTable(_)) || usize::from(b.lanes) != LANES) {
+        return None;
+    }
+    if sched.order.iter().any(|&id| matches!(k.nodes.get(id), Some(Op::Store { .. } | Op::LoadLut { .. } | Op::BoundsCheck { .. } | Op::Div(_, _) | Op::Rem(_, _)))
+        || matches!(k.nodes.get(id), Some(&Op::Load { mem, .. }) if k.nodes.get(mem).copied() != Some(Op::MemInit)))
+    {
+        return None;
+    }
+    let mut out_groups: Vec<(u8, ElemTy, [NodeId; LANES])> = Vec::new();
+    for b in &k.bufs {
+        if b.access == BufAccess::MutNoAlias {
+            if !matches!(b.elem_ty, ElemTy::I32 | ElemTy::U32 | ElemTy::I64) { return None; }
+            out_groups.push((b.id, b.elem_ty, [usize::MAX; LANES]));
+        }
+    }
+    if out_groups.is_empty() { return None; }
+    for o in &k.outputs {
+        let g = out_groups.iter_mut().find(|g| g.0 == o.buf)?;
+        if usize::from(o.lane) >= LANES || g.2[usize::from(o.lane)] != usize::MAX { return None; }
+        g.2[usize::from(o.lane)] = o.val;
+    }
+    if out_groups.iter().any(|g| g.2.contains(&usize::MAX)) { return None; }
+
+    let mut needs_full = vec![false; k.nodes.len()];
+    for g in &out_groups {
+        if g.1 == ElemTy::I64 { for &v in &g.2 { needs_full[v] = true; } }
+    }
+    for &id in sched.order.iter().rev() {
+        match k.nodes[id] {
+            Op::Cmp(_, a, b) => { needs_full[a] = true; needs_full[b] = true; }
+            Op::Shr(a, s) if s > 0 => { needs_full[a] = true; }
+            Op::Select { cond, t_val, f_val } => {
+                needs_full[cond] = true;
+                if needs_full[id] { needs_full[t_val] = true; needs_full[f_val] = true; }
+            }
+            _ => {}
+        }
+    }
+
+    let mut ctx = W32Ctx { k, doms, needs_full, memo: Vec::new(), consts: Vec::new(), steps: Vec::new(), next_v: 0 };
+    let mut out_vregs = Vec::with_capacity(out_groups.len());
+    for &(buf, ty, lanes) in &out_groups {
+        let vr = ctx.match_vec8(lanes)?;
+        out_vregs.push((buf, ty, lanes, vr));
+    }
+    for (buf, ty, lanes, vr) in out_vregs {
+        if ty == ElemTy::I64 {
+            let signed = lanes.iter().all(|&id| doms.get(id).copied().is_some_and(Domain::fits_i32));
+            let unsigned = lanes.iter().all(|&id| doms.get(id).copied().is_some_and(Domain::fits_u32));
+            if !signed && !unsigned { return None; }
+            ctx.steps.push(W32Step::StoreI64 { src: vr, buf, signed });
+        } else {
+            ctx.steps.push(W32Step::Store32(vr, buf));
+        }
+    }
+
+    let limit = max_vecs.min(14);
+    if ctx.consts.len() >= limit { return None; }
+    let mut phys = vec![255u8; ctx.next_v];
+    let mut is_const = vec![false; ctx.next_v];
+    let mut hoisted = Vec::with_capacity(ctx.consts.len());
+    for (idx, &(v, c)) in ctx.consts.iter().enumerate() {
+        phys[v] = idx as u8;
+        is_const[v] = true;
+        hoisted.push((idx as u8, c));
+    }
+    let mut last_use = vec![0usize; ctx.next_v];
+    for (i, st) in ctx.steps.iter().enumerate() { st.for_each_src(|s| last_use[s] = last_use[s].max(i)); }
+    let mut free: Vec<u8> = (ctx.consts.len() as u8..limit as u8).rev().collect();
+    let mut mapped = Vec::with_capacity(ctx.steps.len());
+    for (i, st) in ctx.steps.iter().enumerate() {
+        let mut to_free = Vec::new();
+        st.for_each_src(|s| {
+            if !is_const[s] && last_use[s] == i && !to_free.contains(&s) { to_free.push(s); }
+        });
+        for s in to_free { free.push(phys[s]); }
+        if let Some(d) = st.dst() {
+            let pr = free.pop()?;
+            phys[d] = pr;
+            if last_use[d] <= i { free.push(pr); }
+        }
+        mapped.push(st.remap(&phys));
+    }
+    Some(W32Plan { consts: hoisted, steps: mapped })
+}
+
+fn emit_x86_w32_consts(e: &mut X86Emit, plan: &W32Plan) {
+    for &(reg, val) in &plan.consts { e.vex_broadcast_imm(reg, i64::from(val as i32), false); }
+}
+
+fn emit_x86_w32_body(e: &mut X86Emit, plan: &W32Plan, ra: &RegAlloc) -> Result<(), CompileError> {
+    for st in &plan.steps {
+        match *st {
+            W32Step::Load(d, buf, ty) => {
+                let breg = *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
+                match ty {
+                    ElemTy::I32 | ElemTy::U32 => e.vex_mem_op([1, 1, 2, 0, 0, 0x6F], d as u8, breg, 0),
+                    ElemTy::U16 => e.vex_mem_op([2, 1, 1, 0, 0, 0x33], d as u8, breg, 0),
+                    ElemTy::I16 => e.vex_mem_op([2, 1, 1, 0, 0, 0x23], d as u8, breg, 0),
+                    ElemTy::U8 => e.vex_mem_op([2, 1, 1, 0, 0, 0x31], d as u8, breg, 0),
+                    ElemTy::I64 => return Err(berr("unexpected i64 load in w32")),
+                }
+            }
+            W32Step::Store32(s, buf) => {
+                let breg = *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
+                e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], s as u8, breg, 0);
+            }
+            W32Step::StoreI64 { src, buf, signed } => {
+                let breg = *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
+                let ext_opc = if signed { 0x25 } else { 0x35 };
+                e.vex_ymm_op(2, ext_opc, 15, 0, src as u8);
+                e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, 0);
+                e.vex_extracti128(14, src as u8, 1);
+                e.vex_ymm_op(2, ext_opc, 15, 0, 14);
+                e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, 32);
+            }
+            W32Step::Add(d, a, b) => e.vex_ymm_op(1, 0xFE, d as u8, a as u8, b as u8),
+            W32Step::Sub(d, a, b) => e.vex_ymm_op(1, 0xFA, d as u8, a as u8, b as u8),
+            W32Step::BitAnd(d, a, b) => e.vex_ymm_op(1, 0xDB, d as u8, a as u8, b as u8),
+            W32Step::Mul(d, a, b) => e.vex_ymm_op(2, 0x40, d as u8, a as u8, b as u8),
+            W32Step::Shl(d, a, s) => e.vex_shift_imm(0x72, 6, d as u8, a as u8, s),
+            W32Step::ShrU(d, a, s) => e.vex_shift_imm(0x72, 2, d as u8, a as u8, s),
+            W32Step::ShrS(d, a, s) => e.vex_shift_imm(0x72, 4, d as u8, a as u8, s),
+            W32Step::Cmp { dst, kind, a, b, bias, one } => {
+                let (d, mut va, mut vb) = (dst as u8, a as u8, b as u8);
+                if let Some(br) = bias {
+                    e.vex_ymm_op(1, 0xEF, 14, va, br as u8);
+                    e.vex_ymm_op(1, 0xEF, 15, vb, br as u8);
+                    va = 14; vb = 15;
+                }
+                match kind {
+                    CmpKind::Eq | CmpKind::Ne => e.vex_ymm_op(1, 0x76, d, va, vb),
+                    CmpKind::Gt | CmpKind::Le => e.vex_ymm_op(1, 0x66, d, va, vb),
+                    CmpKind::Lt | CmpKind::Ge => e.vex_ymm_op(1, 0x66, d, vb, va),
+                }
+                e.vex_shift_imm(0x72, 2, d, d, 31);
+                if let Some(or) = one { e.vex_ymm_op(1, 0xEF, d, d, or as u8); }
+            }
+            W32Step::Select { dst, cond, t_val, f_val, zero } => {
+                e.vex_ymm_op(1, 0x76, 15, cond as u8, zero as u8);
+                e.vex_ymm_imm(3, 0x4C, dst as u8, t_val as u8, f_val as u8, 15 << 4);
+            }
+        }
+    }
+    Ok(())
+}
+
+struct Batch4Plan {
+    node_ymm: Vec<Option<u8>>,
+    hoisted: Vec<(u8, i64)>,
+    transpose_out: Option<(u8, [NodeId; 4])>,
+}
+
+fn alloc_batch4_ymms(k: &Kernel, sched: &ScheduleReport, pool_limit: usize, hold_outs: Option<[NodeId; 4]>) -> Option<(Vec<Option<u8>>, u16)> {
+    let n = k.nodes.len();
+    let mut last_step = vec![0usize; n];
+    for (step, &id) in sched.order.iter().enumerate() {
+        let (kids, cnt) = k.nodes[id].children();
+        for &kid in &kids[..cnt] { if let Some(ls) = last_step.get_mut(kid) { *ls = (*ls).max(step); } }
+    }
+    if let Some(outs) = hold_outs {
+        for o in outs { if let Some(ls) = last_step.get_mut(o) { *ls = sched.order.len().saturating_add(1); } }
+    } else {
+        for &(ostep, oi) in &sched.output_order {
+            if let Some(o) = k.outputs.get(oi) {
+                if let Some(ls) = last_step.get_mut(o.val) { *ls = (*ls).max(ostep.saturating_add(1)); }
+            }
+        }
+    }
+    let mut free: Vec<u8> = (0..pool_limit as u8).rev().collect();
+    let (mut node_ymm, mut active, mut used_mask) = (vec![None; n], Vec::<(NodeId, u8)>::new(), 0u16);
+    for (step, &id) in sched.order.iter().enumerate() {
+        let op = *k.nodes.get(id)?;
+        if !is_inline(op) {
+            let reg = free.pop()?;
+            used_mask |= 1u16 << reg;
+            node_ymm[id] = Some(reg);
+            if last_step[id] > step { active.push((id, reg)); } else { free.push(reg); }
+        }
+        let mut i = 0usize;
+        while i < active.len() {
+            let (aid, areg) = active[i];
+            if last_step[aid] <= step { active.swap_remove(i); free.push(areg); } else { i += 1; }
+        }
+        if hold_outs.is_none() {
+            for &(ostep, _) in sched.output_order.iter().filter(|&&(os, _)| os == step + 1) {
+                let mut j = 0usize;
+                while j < active.len() {
+                    let (aid, areg) = active[j];
+                    if last_step[aid] <= ostep { active.swap_remove(j); free.push(areg); } else { j += 1; }
+                }
+            }
+        }
+    }
+    Some((node_ymm, used_mask))
+}
+
+fn try_plan_avx2_batch4(k: &Kernel, sched: &ScheduleReport, doms: &[Domain], max_vecs: usize) -> Option<Batch4Plan> {
+    if k.outputs.is_empty() || k.bufs.iter().any(|b| matches!(b.access, BufAccess::LookupTable(_)) || b.lanes == 0 || !matches!(b.elem_ty, ElemTy::I64 | ElemTy::I32 | ElemTy::U32)) {
+        return None;
+    }
+    for &id in &sched.order {
+        match *k.nodes.get(id)? {
+            Op::MemInit | Op::Const(_) | Op::Add(_, _) | Op::Sub(_, _) | Op::BitAnd(_, _) => {}
+            Op::Load { mem, .. } if k.nodes.get(mem).copied() == Some(Op::MemInit) => {}
+            Op::Mul(a, b) => {
+                let (da, db) = (doms.get(a).copied()?, doms.get(b).copied()?);
+                if !((da.fits_i32() && db.fits_i32()) || (da.fits_u32() && db.fits_u32())) { return None; }
+            }
+            Op::Shl(_, s) | Op::Shr(_, s) if s < 64 => {}
+            _ => return None,
+        }
+    }
+    let mut cand_transpose: Option<(u8, [NodeId; 4])> = None;
+    if k.outputs.len() == 4 {
+        let ob = k.outputs[0].buf;
+        let bdecl = k.bufs.get(ob as usize)?;
+        let mut lanes = [usize::MAX; 4];
+        let mut ok = bdecl.elem_ty == ElemTy::I64 && bdecl.lanes == 4 && k.bufs.iter().filter(|b| b.access == BufAccess::MutNoAlias).count() == 1;
+        for o in &k.outputs {
+            if o.buf != ob || o.lane >= 4 || lanes[usize::from(o.lane)] != usize::MAX || matches!(k.nodes.get(o.val), Some(Op::Const(_) | Op::MemInit)) {
+                ok = false; break;
+            }
+            lanes[usize::from(o.lane)] = o.val;
+        }
+        if ok && !lanes.contains(&usize::MAX) { cand_transpose = Some((ob, lanes)); }
+    }
+    let (node_ymm, used_mask, pool_limit, transpose_out) = if let Some((ob, lanes)) = cand_transpose {
+        let lim13 = max_vecs.min(13);
+        if let Some((ny, um)) = alloc_batch4_ymms(k, sched, lim13, Some(lanes)) {
+            (ny, um, lim13, Some((ob, lanes)))
+        } else {
+            let lim14 = max_vecs.min(14);
+            let (ny, um) = alloc_batch4_ymms(k, sched, lim14, None)?;
+            (ny, um, lim14, None)
+        }
+    } else {
+        let lim14 = max_vecs.min(14);
+        let (ny, um) = alloc_batch4_ymms(k, sched, lim14, None)?;
+        (ny, um, lim14, None)
+    };
+
+    let mut const_counts: Vec<(i64, usize)> = Vec::new();
+    let mut bump = |c: i64| {
+        if let Some(e) = const_counts.iter_mut().find(|e| e.0 == c) { e.1 += 1; } else { const_counts.push((c, 1)); }
+    };
+    for &id in &sched.order {
+        let Some(&op) = k.nodes.get(id) else { continue; };
+        let (kids, cnt) = op.children();
+        for &kid in &kids[..cnt] {
+            if let Some(Op::Const(c)) = k.nodes.get(kid).copied() { bump(c); }
+        }
+        if let Op::Shr(a, s) = op {
+            if s > 0 && doms.get(a).is_some_and(|d| !d.is_nonneg()) {
+                if s == 63 { bump(0); } else { bump(i64::MIN); bump(((1u64 << 63) >> s) as i64); }
+            }
+        }
+    }
+    for o in &k.outputs { if let Op::Const(c) = k.nodes[o.val] { bump(c); } }
+    const_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut hoisted = Vec::new();
+    for r in 0..pool_limit as u8 {
+        if (used_mask & (1u16 << r)) == 0 {
+            if let Some(&(c, _)) = const_counts.get(hoisted.len()) { hoisted.push((r, c)); }
+        }
+    }
+    Some(Batch4Plan { node_ymm, hoisted, transpose_out })
+}
+
+fn b4_const_reg(e: &mut X86Emit, plan: &Batch4Plan, c: i64, scratch: u8) -> u8 {
+    if let Some(&(r, _)) = plan.hoisted.iter().find(|&&(_, v)| v == c) { return r; }
+    e.vex_broadcast_imm(scratch, c, true);
+    scratch
+}
+
+fn b4_val_reg(e: &mut X86Emit, k: &Kernel, plan: &Batch4Plan, id: NodeId, scratch: u8) -> Result<u8, CompileError> {
+    match k.nodes.get(id).copied().ok_or(CompileError::InvalidNode(id))? {
+        Op::Const(c) => Ok(b4_const_reg(e, plan, c, scratch)),
+        Op::MemInit => Ok(b4_const_reg(e, plan, 0, scratch)),
+        _ => plan.node_ymm.get(id).and_then(|&r| r).ok_or(CompileError::InvalidNode(id)),
+    }
+}
+
+fn emit_b4_store_scatter(e: &mut X86Emit, ty: ElemTy, vreg: u8, breg: u8, stride: i32, lane: u8) {
+    let off = i32::from(lane) * i32::from(ty.bytes());
+    let (mov_opc, w, idx) = if ty == ElemTy::I64 { (0xD6u8, 1u8, 1u8) } else { (0x7Eu8, 0u8, 2u8) };
+    e.vex_mem_op([1, 0, 1, 0, 0, mov_opc], vreg, breg, off);
+    e.vex_mem_imm([3, 0, 1, w, 0, 0x16], vreg, breg, stride + off, idx);
+    e.vex_extracti128(15, vreg, 1);
+    e.vex_mem_op([1, 0, 1, 0, 0, mov_opc], 15, breg, 2 * stride + off);
+    e.vex_mem_imm([3, 0, 1, w, 0, 0x16], 15, breg, 3 * stride + off, idx);
+}
+
+fn emit_x86_batch4_body(e: &mut X86Emit, k: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms: &[Domain], plan: &Batch4Plan) -> Result<(), CompileError> {
+    let mut oc = 0usize;
+    let scatter_outputs = plan.transpose_out.is_none();
+    for (step, &id) in sched.order.iter().enumerate() {
+        if scatter_outputs {
+            drain_scheduled_outputs(k, sched, ra, &mut oc, Some(step), |ty, breg, lane, val| {
+                let bdecl = k.bufs.iter().find(|b| ra.buf_reg.get(usize::from(b.id)).copied() == Some(breg)).ok_or(CompileError::InvalidBuffer(0))?;
+                let vreg = b4_val_reg(e, k, plan, val, 14)?;
+                emit_b4_store_scatter(e, ty, vreg, breg, bdecl.block_bytes() as i32, lane);
+                Ok(())
+            })?;
+        }
+        let op = k.nodes.get(id).copied().ok_or(CompileError::InvalidNode(id))?;
+        if is_inline(op) { continue; }
+        let dst = plan.node_ymm.get(id).and_then(|&r| r).ok_or(CompileError::InvalidNode(id))?;
+        match op {
+            Op::Load { buf, lane, .. } => {
+                let bdecl = k.bufs.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
+                let breg = *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
+                let (stride, off) = (bdecl.block_bytes() as i32, i32::from(lane) * i32::from(bdecl.elem_ty.bytes()));
+                if bdecl.elem_ty == ElemTy::I64 {
+                    e.vex_mem_op([1, 0, 2, 0, 0, 0x7E], dst, breg, off);
+                    e.vex_mem_imm([3, 0, 1, 1, dst, 0x22], dst, breg, stride + off, 1);
+                    e.vex_mem_op([1, 0, 2, 0, 0, 0x7E], 15, breg, 2 * stride + off);
+                    e.vex_mem_imm([3, 0, 1, 1, 15, 0x22], 15, breg, 3 * stride + off, 1);
+                    e.vex_ymm_imm(3, 0x38, dst, dst, 15, 1);
+                } else {
+                    e.vex_mem_op([1, 0, 1, 0, 0, 0x6E], dst, breg, off);
+                    e.vex_mem_imm([3, 0, 1, 0, dst, 0x22], dst, breg, stride + off, 1);
+                    e.vex_mem_imm([3, 0, 1, 0, dst, 0x22], dst, breg, 2 * stride + off, 2);
+                    e.vex_mem_imm([3, 0, 1, 0, dst, 0x22], dst, breg, 3 * stride + off, 3);
+                    e.vex_ymm_op(2, if bdecl.elem_ty == ElemTy::I32 { 0x25 } else { 0x35 }, dst, 0, dst);
+                }
+            }
+            Op::Add(a, b) | Op::Sub(a, b) | Op::BitAnd(a, b) => {
+                let (va, vb) = (b4_val_reg(e, k, plan, a, 14)?, b4_val_reg(e, k, plan, b, 15)?);
+                let opc = match op { Op::Add(_, _) => 0xD4, Op::Sub(_, _) => 0xFB, _ => 0xDB };
+                e.vex_ymm_op(1, opc, dst, va, vb);
+            }
+            Op::Mul(a, b) => {
+                let (va, vb) = (b4_val_reg(e, k, plan, a, 14)?, b4_val_reg(e, k, plan, b, 15)?);
+                if doms[a].fits_i32() && doms[b].fits_i32() { e.vex_ymm_op(2, 0x28, dst, va, vb); }
+                else { e.vex_ymm_op(1, 0xF4, dst, va, vb); }
+            }
+            Op::Shl(a, s) => {
+                let va = b4_val_reg(e, k, plan, a, dst)?;
+                if s > 0 { e.vex_shift_imm(0x73, 6, dst, va, s); } else if dst != va { e.vex_ymm_op(1, 0xEB, dst, va, va); }
+            }
+            Op::Shr(a, s) => {
+                let va = b4_val_reg(e, k, plan, a, dst)?;
+                if s == 0 {
+                    if dst != va { e.vex_ymm_op(1, 0xEB, dst, va, va); }
+                } else if doms[a].is_nonneg() {
+                    e.vex_shift_imm(0x73, 2, dst, va, s);
+                } else if s == 63 {
+                    let zr = b4_const_reg(e, plan, 0, 15);
+                    e.vex_ymm_op(2, 0x37, dst, zr, va);
+                } else {
+                    let sb = b4_const_reg(e, plan, i64::MIN, 14);
+                    let sbs = b4_const_reg(e, plan, ((1u64 << 63) >> s) as i64, 15);
+                    e.vex_ymm_op(1, 0xEF, dst, va, sb);
+                    e.vex_shift_imm(0x73, 2, dst, dst, s);
+                    e.vex_ymm_op(1, 0xFB, dst, dst, sbs);
+                }
+            }
+            _ => return Err(berr("unsupported op in batch4")),
+        }
+    }
+    if let Some((ob, lanes)) = plan.transpose_out {
+        let breg = *ra.buf_reg.get(ob as usize).ok_or(CompileError::InvalidBuffer(ob))?;
+        let [r0, r1, r2, r3] = [
+            b4_val_reg(e, k, plan, lanes[0], 13)?, b4_val_reg(e, k, plan, lanes[1], 13)?,
+            b4_val_reg(e, k, plan, lanes[2], 13)?, b4_val_reg(e, k, plan, lanes[3], 13)?,
+        ];
+        e.vex_ymm_op(1, 0x6C, 13, r0, r1);
+        e.vex_ymm_op(1, 0x6C, 14, r2, r3);
+        e.vex_ymm_imm(3, 0x46, 15, 13, 14, 0x20);
+        e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, 0);
+        e.vex_ymm_imm(3, 0x46, 15, 13, 14, 0x31);
+        e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, 64);
+        e.vex_ymm_op(1, 0x6D, 13, r0, r1);
+        e.vex_ymm_op(1, 0x6D, 14, r2, r3);
+        e.vex_ymm_imm(3, 0x46, 15, 13, 14, 0x20);
+        e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, 32);
+        e.vex_ymm_imm(3, 0x46, 15, 13, 14, 0x31);
+        e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 15, breg, 96);
+    } else {
+        drain_scheduled_outputs(k, sched, ra, &mut oc, None, |ty, breg, lane, val| {
+            let bdecl = k.bufs.iter().find(|b| ra.buf_reg.get(usize::from(b.id)).copied() == Some(breg)).ok_or(CompileError::InvalidBuffer(0))?;
+            let vreg = b4_val_reg(e, k, plan, val, 14)?;
+            emit_b4_store_scatter(e, ty, vreg, breg, bdecl.block_bytes() as i32, lane);
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -547,13 +1144,20 @@ fn emit_x86_body(e: &mut X86Emit, kernel: &Kernel, sched: &ScheduleReport, ra: &
 fn emit_x86_module(kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms: &[Domain], max_vecs: usize, call_batch: bool) -> Result<ModuleCode, CompileError> {
     let mut e = X86Emit::new();
     let avx_plan = try_plan_avx2(kernel, sched, doms, max_vecs);
-    let mut saved: Vec<u8> = if avx_plan.is_some() { Vec::new() } else { ra.callee_saved.clone() };
+    let w32_plan = if avx_plan.is_none() { try_plan_avx2_w32(kernel, sched, doms, max_vecs) } else { None };
+    let b4_plan = if avx_plan.is_none() && w32_plan.is_none() { try_plan_avx2_batch4(kernel, sched, doms, max_vecs) } else { None };
+    let single_vec = avx_plan.is_some() || w32_plan.is_some();
+    let mut saved: Vec<u8> = if single_vec { Vec::new() } else { ra.callee_saved.clone() };
     if ra.buf_reg.get(2).copied() == Some(15) && !saved.contains(&15) { saved.push(15); }
     for &r in &saved { e.stack_op(r, false); }
     if let Some(&b2) = ra.buf_reg.get(2).filter(|&&r| r != 2) { e.mov_rr(b2, 2); }
     if let Some(ref steps) = avx_plan {
-        emit_x86_avx2_steps(&mut e, steps, ra)?;
-        e.vzeroall();
+        emit_x86_avx2_steps(&mut e, steps, ra, None)?;
+        e.vzeroupper();
+    } else if let Some(ref w32) = w32_plan {
+        emit_x86_w32_consts(&mut e, w32);
+        emit_x86_w32_body(&mut e, w32, ra)?;
+        e.vzeroupper();
     } else {
         emit_x86_body(&mut e, kernel, sched, ra, doms)?;
     }
@@ -585,7 +1189,7 @@ fn emit_x86_module(kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms:
         e.code.extend_from_slice(&0i32.to_le_bytes()); e.insns += 1;
         relocs.push(ElfReloc { offset: rel_off, sym_idx: 0, r_type: R_X86_64_PLT32, addend: -4 });
         for (&bs, b) in bsaved.iter().zip(kernel.bufs.iter()) {
-            if !matches!(b.access, BufAccess::LookupTable(_)) { e.op_imm8(0x83, 0, bs, b.block_bytes() as u8, false); }
+            if !matches!(b.access, BufAccess::LookupTable(_)) { e.add_imm(bs, b.block_bytes() as i32); }
         }
         e.op_imm8(0x83, 0, c_hold, 0xFF, false);
         let back = (loop_top as isize) - ((e.code.len() + 6) as isize);
@@ -599,25 +1203,51 @@ fn emit_x86_module(kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms:
     } else {
         for &r in &saved { e.stack_op(r, false); }
         if let Some(&b2) = ra.buf_reg.get(2).filter(|&&r| r != 2) { e.mov_rr(b2, 2); }
+        if let Some(ref b4) = b4_plan {
+            e.op_imm8(0x83, 7, cnt_reg, 4, false);
+            let jb_pos = e.code.len();
+            e.code.extend_from_slice(&[0x0F, 0x82, 0, 0, 0, 0]); e.insns += 1;
+            for &(r, c) in &b4.hoisted { e.vex_broadcast_imm(r, c, true); }
+            let b4_top = e.code.len();
+            emit_x86_batch4_body(&mut e, kernel, sched, ra, doms, b4)?;
+            for (&br, b) in ra.buf_reg.iter().zip(kernel.bufs.iter()) {
+                if !matches!(b.access, BufAccess::LookupTable(_)) { e.add_imm(br, (b.block_bytes() as i32) * 4); }
+            }
+            e.op_imm8(0x83, 5, cnt_reg, 4, false);
+            e.op_imm8(0x83, 7, cnt_reg, 4, false);
+            let back = (b4_top as isize) - ((e.code.len() + 6) as isize);
+            e.code.extend_from_slice(&[0x0F, 0x83]); e.code.extend_from_slice(&(back as i32).to_le_bytes()); e.insns += 1;
+            e.vzeroupper();
+            let tail_pos = e.code.len();
+            let fwd = (tail_pos as isize) - ((jb_pos + 6) as isize);
+            if let Some(s) = e.code.get_mut(jb_pos + 2..jb_pos + 6) { s.copy_from_slice(&(fwd as i32).to_le_bytes()); }
+        }
         e.push_rr(0x85, cnt_reg, cnt_reg);
         let jz_pos = e.code.len();
         e.code.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]); e.insns += 1;
+        if let Some(ref steps) = avx_plan {
+            emit_x86_avx2_steps(&mut e, steps, ra, Some(true))?;
+        } else if let Some(ref w32) = w32_plan {
+            emit_x86_w32_consts(&mut e, w32);
+        }
         let loop_top = e.code.len();
         if let Some(ref steps) = avx_plan {
-            emit_x86_avx2_steps(&mut e, steps, ra)?;
+            emit_x86_avx2_steps(&mut e, steps, ra, Some(false))?;
+        } else if let Some(ref w32) = w32_plan {
+            emit_x86_w32_body(&mut e, w32, ra)?;
         } else {
             emit_x86_body(&mut e, kernel, sched, ra, doms)?;
         }
         for (&br, b) in ra.buf_reg.iter().zip(kernel.bufs.iter()) {
-            if !matches!(b.access, BufAccess::LookupTable(_)) { e.op_imm8(0x83, 0, br, b.block_bytes() as u8, false); }
+            if !matches!(b.access, BufAccess::LookupTable(_)) { e.add_imm(br, b.block_bytes() as i32); }
         }
         e.op_imm8(0x83, 0, cnt_reg, 0xFF, false);
         let back = (loop_top as isize) - ((e.code.len() + 6) as isize);
         e.code.extend_from_slice(&[0x0F, 0x85]); e.code.extend_from_slice(&(back as i32).to_le_bytes()); e.insns += 1;
+        if single_vec { e.vzeroupper(); }
         let done_pos = e.code.len();
         let fwd = (done_pos as isize) - ((jz_pos + 6) as isize);
         if let Some(s) = e.code.get_mut(jz_pos + 2..jz_pos + 6) { s.copy_from_slice(&(fwd as i32).to_le_bytes()); }
-        if avx_plan.is_some() { e.vzeroall(); }
         for &r in saved.iter().rev() { e.stack_op(r, true); }
         e.ret();
     }

@@ -133,7 +133,9 @@ impl EGraph {
             },
             Op::Select { cond, t_val, f_val } => {
                 let cd = self.domain(cond);
-                if t_val == f_val || (!cd.is_empty() && !cd.contains(0)) { out.push(Act::Alias(cid, t_val)); } else if cd.is_const() == Some(0) { out.push(Act::Alias(cid, f_val)); }
+                if t_val == f_val || (!cd.is_empty() && !cd.contains(0)) { out.push(Act::Alias(cid, t_val)); }
+                else if cd.is_const() == Some(0) { out.push(Act::Alias(cid, f_val)); }
+                else if self.is_bool(cond) && self.domain(t_val).is_const() == Some(1) && self.domain(f_val).is_const() == Some(0) { out.push(Act::Alias(cid, cond)); }
             }
             Op::MemInit | Op::Const(_) | Op::Store { .. } | Op::LoadLut { .. } => {}
         }
