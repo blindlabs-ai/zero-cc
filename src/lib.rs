@@ -52,9 +52,10 @@ pub use isa::{
 pub use ntf1::{emit_ntf1, export_kernel_ntf1, parse_ntf1, verify_ntf1_airlock, Ntf1Error, Ntf1Spec, Ntf1Stmt};
 pub use rust_fe::{compile_rust_source, parse_rust_kernel};
 pub use wasm32::{
-    compile_kernel_wasm, compile_kernel_wasm_opts, compile_kernels_wasm, compile_rust_to_wasm,
-    verify_wasm_module, CompiledWasm, TargetArch, WasmExport, WasmSummary, WasmVectorMode,
-    WASM_DEFAULT_MEM_PAGES, WASM_MAGIC_VERSION,
+    compile_kernel_wasm, compile_kernel_wasm_opts, compile_kernels_wasm,
+    compile_kernels_wasm_with_memory, compile_rust_to_wasm, verify_wasm_module,
+    verify_wasm_module_with_opts, CompiledWasm, TargetArch, WasmExport, WasmSummary,
+    WasmVectorMode, WASM_DEFAULT_MEM_PAGES, WASM_MAGIC_VERSION,
 };
 
 #[derive(Clone, Debug)]

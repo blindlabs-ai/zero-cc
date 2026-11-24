@@ -693,6 +693,62 @@ fn wasm32_cli_emit_wasm_zero_rans_dir_and_single() {
     let one_sum = verify_wasm_module(&one_bytes).expect("verify foo.wasm");
     assert_eq!(one_sum.div_rem_insns, 0);
     assert_eq!(one_sum.func_count, 2);
+    assert!(!one_sum.imports_memory);
+
+    // Imported-memory multi-kernel CLI bundle (--wasm-import-memory + comma-separated --kernel)
+    let imp_path = dir.join("zero_cc_imported.wasm");
+    let out5 = Command::new(bin)
+        .arg(&zr_src)
+        .args([
+            "--domain",
+            "raw: -262144..=262144, x: -2097152..=2097152, even: -1000000000..=1000000000, odd: -1000000000..=1000000000, next: 0..=4294967295",
+            "--kernel",
+            "dct8_1d_even,dct8_1d_odd,idct8_1d_even,idct8_1d_odd,idct8_1d_combine,rans_renorm_branchless",
+            "--wasm-import-memory",
+            "--emit-wasm",
+        ])
+        .arg(&imp_path)
+        .output()
+        .expect("run zero-cc --wasm-import-memory");
+    assert!(
+        out5.status.success(),
+        "CLI --wasm-import-memory failed:\n{}",
+        String::from_utf8_lossy(&out5.stderr)
+    );
+    let imp_bytes = fs::read(&imp_path).expect("read imported wasm");
+    let imp_sum = verify_wasm_module(&imp_bytes).expect("verify imported wasm");
+    assert!(imp_sum.imports_memory);
+    assert_eq!(imp_sum.func_count, 12);
+    assert_eq!(imp_sum.div_rem_insns, 0);
+    assert!(imp_sum.has_simd128);
+    let imp_check = Command::new("node")
+        .args([
+            "-e",
+            &format!(
+                "const b=require('fs').readFileSync({:?}); \
+                 const m=new WebAssembly.Module(b); \
+                 const imps=WebAssembly.Module.imports(m); \
+                 if(imps.length!==1||imps[0].module!=='env'||imps[0].name!=='memory'||imps[0].kind!=='memory') process.exit(2); \
+                 const mem=new WebAssembly.Memory({{initial:4,maximum:16}}); \
+                 const inst=new WebAssembly.Instance(m,{{env:{{memory:mem}}}}); \
+                 const e=inst.exports; \
+                 if('memory' in e) process.exit(3); \
+                 const i32=new Int32Array(mem.buffer,0,16); \
+                 for(let i=0;i<8;i++) i32[i]=i*10-35; \
+                 e.zero_cc_dct8_1d_even_batch(0,64,2); \
+                 e.zero_cc_dct8_1d_odd_batch(0,64,2); \
+                 const o32=new Int32Array(mem.buffer,64,8); \
+                 if(o32[0]!==0||o32[1]===0) process.exit(4);",
+                imp_path.to_string_lossy()
+            ),
+        ])
+        .output()
+        .expect("node validate imported memory bundle");
+    assert!(
+        imp_check.status.success(),
+        "Node v22 failed imported-memory bundle:\n{}",
+        String::from_utf8_lossy(&imp_check.stderr)
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }

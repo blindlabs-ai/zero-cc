@@ -12,9 +12,9 @@ use zero_cc::rust_fe::{
     parse_rust_kernel_with_domains, ExtractedKernel,
 };
 use zero_cc::{
-    compile_kernel_direct, compile_kernel_wasm, compile_kernels_wasm, compile_standalone_elf_exec,
-    verify_elf64_executable, verify_elf64_object, verify_wasm_module, CompileError, Domain,
-    RegBudget, TargetArch, TargetIsa,
+    compile_kernel_direct, compile_kernel_wasm, compile_kernels_wasm_with_memory,
+    compile_standalone_elf_exec, verify_elf64_executable, verify_elf64_object, verify_wasm_module,
+    CompileError, Domain, RegBudget, TargetArch, TargetIsa,
 };
 
 struct CliArgs {
@@ -22,6 +22,7 @@ struct CliArgs {
     emit_elf: Option<PathBuf>,
     emit_exec: Option<PathBuf>,
     emit_wasm: Option<PathBuf>,
+    wasm_import_memory: bool,
     target: TargetArch,
     kernel_filter: Option<String>,
     domains: BTreeMap<String, Domain>,
@@ -29,7 +30,7 @@ struct CliArgs {
 }
 
 fn usage() -> &'static str {
-    "Usage: zero-cc <file_or_dir> [--emit-elf <out.o>] [--emit-exec <out_bin>] [--emit-wasm <out.wasm|dir>] [--target x86_64|aarch64|wasm32] [--isa x86_64|aarch64|wasm32] [--kernel <name>] [--domain <spec>] [--bench]"
+    "Usage: zero-cc <file_or_dir> [--emit-elf <out.o>] [--emit-exec <out_bin>] [--emit-wasm <out.wasm|dir>] [--wasm-import-memory] [--target x86_64|aarch64|wasm32] [--isa x86_64|aarch64|wasm32] [--kernel <name[,name...]>] [--domain <spec>] [--bench]"
 }
 
 fn parse_target_name(v: &str) -> Result<TargetArch, String> {
@@ -47,6 +48,7 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut emit_elf: Option<PathBuf> = None;
     let mut emit_exec: Option<PathBuf> = None;
     let mut emit_wasm: Option<PathBuf> = None;
+    let mut wasm_import_memory = false;
     let mut target = TargetArch::X86_64;
     let mut target_explicit = false;
     let mut kernel_filter: Option<String> = None;
@@ -67,6 +69,9 @@ fn parse_args() -> Result<CliArgs, String> {
             "--emit-wasm" => {
                 let v = args.next().ok_or_else(|| "missing path after --emit-wasm".to_string())?;
                 emit_wasm = Some(PathBuf::from(v));
+            }
+            "--wasm-import-memory" => {
+                wasm_import_memory = true;
             }
             "--isa" | "--target" => {
                 let v = args.next().ok_or_else(|| format!("missing value after {arg}"))?;
@@ -94,7 +99,7 @@ fn parse_args() -> Result<CliArgs, String> {
     if emit_wasm.is_some() && !target_explicit && emit_elf.is_none() && emit_exec.is_none() {
         target = TargetArch::Wasm32;
     }
-    Ok(CliArgs { input, emit_elf, emit_exec, emit_wasm, target, kernel_filter, domains, bench })
+    Ok(CliArgs { input, emit_elf, emit_exec, emit_wasm, wasm_import_memory, target, kernel_filter, domains, bench })
 }
 
 fn load_selected_kernel(
@@ -132,21 +137,33 @@ fn set_exec_mode(path: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 fn set_exec_mode(_path: &Path) -> Result<(), String> { Ok(()) }
 
-fn emit_wasm_single(ek: &ExtractedKernel, budget: RegBudget, out_path: Option<&Path>, t0: Instant) -> Result<(), String> {
+fn emit_wasm_single(
+    ek: &ExtractedKernel,
+    budget: RegBudget,
+    out_path: Option<&Path>,
+    import_memory: bool,
+    t0: Instant,
+) -> Result<(), String> {
     let orig = ek.kernel.cost();
     let opt = zero_cc::optimize_kernel(&ek.kernel).map_err(|e| e.to_string())?.cost();
     let k_budget = kernel_reg_budget(&ek.kernel, budget);
     let wasm = compile_kernel_wasm(&ek.kernel, k_budget).map_err(|e| e.to_string())?;
-    let wsum = verify_wasm_module(&wasm.wasm_bytes).map_err(|e| e.to_string())?;
+    let (bytes, wsum) = if import_memory {
+        compile_kernels_wasm_with_memory(std::slice::from_ref(&ek.kernel), k_budget, true)
+            .map_err(|e| e.to_string())?
+    } else {
+        let sum = verify_wasm_module(&wasm.wasm_bytes).map_err(|e| e.to_string())?;
+        (wasm.wasm_bytes, sum)
+    };
     if let Some(p) = out_path {
         let dest = if p.is_dir() { p.join(format!("{}.wasm", ek.name)) } else { p.to_path_buf() };
-        fs::write(&dest, &wasm.wasm_bytes).map_err(|e| format!("write '{}': {e}", dest.display()))?;
+        fs::write(&dest, &bytes).map_err(|e| format!("write '{}': {e}", dest.display()))?;
     }
     let elapsed_us = t0.elapsed().as_micros();
     println!(
-        "zero-cc kernel={} file={} target=Wasm32 mode={:?} ops={}->{} divs={}->{} wasm_bytes={} insns={} simd_insns={} wasm_divs={} compile_us={}",
+        "zero-cc kernel={} file={} target=Wasm32 mode={:?} ops={}->{} divs={}->{} wasm_bytes={} insns={} simd_insns={} wasm_divs={} import_mem={} compile_us={}",
         ek.name, ek.file, wasm.vector_mode, orig.total_nodes, opt.total_nodes, orig.divs_rems,
-        opt.divs_rems, wasm.wasm_bytes.len(), wsum.total_insns, wsum.simd_insns, wsum.div_rem_insns, elapsed_us
+        opt.divs_rems, bytes.len(), wsum.total_insns, wsum.simd_insns, wsum.div_rem_insns, wsum.imports_memory, elapsed_us
     );
     Ok(())
 }
@@ -155,17 +172,36 @@ fn run_wasm_crate_scan(cfg: &CliArgs, budget: RegBudget, t0: Instant) -> Result<
     let mut ov = BTreeMap::new();
     if !cfg.domains.is_empty() { ov.insert("*".to_string(), cfg.domains.clone()); }
     let (files_scanned, fns_seen, kernels) = extract_crate_kernels(&cfg.input, &ov).map_err(|e| e.to_string())?;
+    let selected: Vec<&ExtractedKernel> = if let Some(filter) = &cfg.kernel_filter {
+        let names: Vec<&str> = filter.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let mut out = Vec::with_capacity(names.len());
+        for want in names {
+            let found = kernels
+                .iter()
+                .find(|k| k.name == want)
+                .ok_or_else(|| format!("kernel '{want}' not found in '{}'", cfg.input.display()))?;
+            out.push(found);
+        }
+        out
+    } else {
+        kernels.iter().collect()
+    };
     let mut compiled_list = Vec::new();
     let mut skipped = 0usize;
-    for ek in &kernels {
+    for ek in &selected {
         let kb = kernel_reg_budget(&ek.kernel, budget);
         match compile_kernel_wasm(&ek.kernel, kb) {
             Ok(cw) => {
                 let orig = ek.kernel.cost();
                 let opt = zero_cc::optimize_kernel(&ek.kernel).map_err(|e| e.to_string())?.cost();
-                compiled_list.push((ek, cw, orig, opt));
+                compiled_list.push((*ek, cw, orig, opt));
             }
-            Err(_) => { skipped += 1; }
+            Err(e) => {
+                if cfg.kernel_filter.is_some() {
+                    return Err(format!("kernel '{}' failed wasm compile: {e}", ek.name));
+                }
+                skipped += 1;
+            }
         }
     }
     if let Some(out_p) = &cfg.emit_wasm {
@@ -176,20 +212,29 @@ fn run_wasm_crate_scan(cfg: &CliArgs, budget: RegBudget, t0: Instant) -> Result<
                 let kb = kernel_reg_budget(k, budget);
                 RegBudget { max_gprs: acc.max_gprs.max(kb.max_gprs), max_vecs: acc.max_vecs.max(kb.max_vecs) }
             });
-            let (bytes, _) = compile_kernels_wasm(&ks, max_b).map_err(|e| e.to_string())?;
+            let (bytes, _) = compile_kernels_wasm_with_memory(&ks, max_b, cfg.wasm_import_memory)
+                .map_err(|e| e.to_string())?;
             fs::write(out_p, &bytes).map_err(|e| format!("write '{}': {e}", out_p.display()))?;
         } else {
             fs::create_dir_all(out_p).map_err(|e| format!("mkdir '{}': {e}", out_p.display()))?;
             for (ek, cw, _, _) in &compiled_list {
                 let dest = out_p.join(format!("{}.wasm", ek.name));
-                fs::write(&dest, &cw.wasm_bytes).map_err(|e| format!("write '{}': {e}", dest.display()))?;
+                let out_bytes = if cfg.wasm_import_memory {
+                    let kb = kernel_reg_budget(&ek.kernel, budget);
+                    compile_kernels_wasm_with_memory(std::slice::from_ref(&ek.kernel), kb, true)
+                        .map_err(|e| e.to_string())?
+                        .0
+                } else {
+                    cw.wasm_bytes.clone()
+                };
+                fs::write(&dest, &out_bytes).map_err(|e| format!("write '{}': {e}", dest.display()))?;
             }
         }
     }
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!(
-        "zero-cc scan root={} target=Wasm32 files={} fns={} extracted={} compiled={} skipped={} elapsed_ms={:.2}",
-        cfg.input.display(), files_scanned, fns_seen, kernels.len(), compiled_list.len(), skipped, elapsed_ms
+        "zero-cc scan root={} target=Wasm32 files={} fns={} extracted={} compiled={} skipped={} import_mem={} elapsed_ms={:.2}",
+        cfg.input.display(), files_scanned, fns_seen, kernels.len(), compiled_list.len(), skipped, cfg.wasm_import_memory, elapsed_ms
     );
     for (ek, cw, orig, opt) in &compiled_list {
         println!(
@@ -207,10 +252,11 @@ fn run() -> Result<(), String> {
     let budget = RegBudget::default();
 
     if cfg.target == TargetArch::Wasm32 && cfg.emit_elf.is_none() && cfg.emit_exec.is_none() {
-        if cfg.kernel_filter.is_some() || cfg.input.is_file() {
+        let multi_filter = cfg.kernel_filter.as_deref().is_some_and(|f| f.contains(','));
+        if !multi_filter && (cfg.kernel_filter.is_some() || cfg.input.is_file()) {
             let ek = load_selected_kernel(&cfg.input, cfg.kernel_filter.as_deref(), &cfg.domains)
                 .map_err(|e| e.to_string())?;
-            return emit_wasm_single(&ek, budget, cfg.emit_wasm.as_deref(), t0);
+            return emit_wasm_single(&ek, budget, cfg.emit_wasm.as_deref(), cfg.wasm_import_memory, t0);
         }
         return run_wasm_crate_scan(&cfg, budget, t0);
     }

@@ -7,6 +7,7 @@ pub const WASM_MAGIC_VERSION: [u8; 8] = [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x0
 pub const WASM_DEFAULT_MEM_PAGES: u32 = 4;
 
 const SEC_TYPE: u8 = 1;
+const SEC_IMPORT: u8 = 2;
 const SEC_FUNC: u8 = 3;
 const SEC_MEM: u8 = 5;
 const SEC_EXPORT: u8 = 7;
@@ -96,6 +97,7 @@ pub struct WasmSummary {
     pub simd_insns: usize,
     pub div_rem_insns: usize,
     pub has_simd128: bool,
+    pub imports_memory: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1253,7 +1255,7 @@ fn lower_kernel_pair(
     })
 }
 
-fn assemble_wasm_module(lowered: &[LoweredKernel], mem_pages: u32) -> Vec<u8> {
+fn assemble_wasm_module(lowered: &[LoweredKernel], mem_pages: u32, import_memory: bool) -> Vec<u8> {
     let mut type_sec = Vec::new();
     let mut func_sec = Vec::new();
     let mut exp_sec = Vec::new();
@@ -1262,10 +1264,12 @@ fn assemble_wasm_module(lowered: &[LoweredKernel], mem_pages: u32) -> Vec<u8> {
     let fn_count = (lowered.len() * 2) as u32;
     push_uleb_u32(&mut type_sec, fn_count);
     push_uleb_u32(&mut func_sec, fn_count);
-    push_uleb_u32(&mut exp_sec, fn_count + 1);
-    push_name(&mut exp_sec, "memory");
-    exp_sec.push(EXPORT_MEM);
-    push_uleb_u32(&mut exp_sec, 0);
+    push_uleb_u32(&mut exp_sec, if import_memory { fn_count } else { fn_count + 1 });
+    if !import_memory {
+        push_name(&mut exp_sec, "memory");
+        exp_sec.push(EXPORT_MEM);
+        push_uleb_u32(&mut exp_sec, 0);
+    }
     push_uleb_u32(&mut code_sec, fn_count);
 
     for (idx, lk) in lowered.iter().enumerate() {
@@ -1299,16 +1303,27 @@ fn assemble_wasm_module(lowered: &[LoweredKernel], mem_pages: u32) -> Vec<u8> {
         code_sec.extend_from_slice(&lk.batch_body);
     }
 
-    let mut mem_sec = Vec::new();
-    push_uleb_u32(&mut mem_sec, 1);
-    mem_sec.push(0x00);
-    push_uleb_u32(&mut mem_sec, mem_pages);
-
     let mut out = Vec::with_capacity(64 + type_sec.len() + func_sec.len() + exp_sec.len() + code_sec.len());
     out.extend_from_slice(&WASM_MAGIC_VERSION);
     push_section(&mut out, SEC_TYPE, &type_sec);
-    push_section(&mut out, SEC_FUNC, &func_sec);
-    push_section(&mut out, SEC_MEM, &mem_sec);
+    if import_memory {
+        let mut imp_sec = Vec::new();
+        push_uleb_u32(&mut imp_sec, 1);
+        push_name(&mut imp_sec, "env");
+        push_name(&mut imp_sec, "memory");
+        imp_sec.push(EXPORT_MEM);
+        imp_sec.push(0x00);
+        push_uleb_u32(&mut imp_sec, mem_pages.max(1));
+        push_section(&mut out, SEC_IMPORT, &imp_sec);
+        push_section(&mut out, SEC_FUNC, &func_sec);
+    } else {
+        let mut mem_sec = Vec::new();
+        push_uleb_u32(&mut mem_sec, 1);
+        mem_sec.push(0x00);
+        push_uleb_u32(&mut mem_sec, mem_pages);
+        push_section(&mut out, SEC_FUNC, &func_sec);
+        push_section(&mut out, SEC_MEM, &mem_sec);
+    }
     push_section(&mut out, SEC_EXPORT, &exp_sec);
     push_section(&mut out, SEC_CODE, &code_sec);
     out
@@ -1324,7 +1339,7 @@ pub fn compile_kernel_wasm_opts(kernel: &Kernel, budget: RegBudget, optimize: bo
     let kernel_sym = lk.kernel_sym.clone();
     let batch_sym = lk.batch_sym.clone();
     let vector_mode = lk.vector_mode;
-    let wasm_bytes = assemble_wasm_module(&[lk], WASM_DEFAULT_MEM_PAGES);
+    let wasm_bytes = assemble_wasm_module(&[lk], WASM_DEFAULT_MEM_PAGES, false);
     let summary = verify_wasm_module(&wasm_bytes)?;
     Ok(CompiledWasm { kernel_sym, batch_sym, wasm_bytes, vector_mode, summary })
 }
@@ -1340,8 +1355,14 @@ pub fn compile_rust_to_wasm(src: &str, budget: RegBudget) -> Result<CompiledWasm
     compile_kernel_wasm(&kernel, budget)
 }
 
-/// Compile multiple kernels into a single standalone 0-import `WASM32` (+`SIMD128`) binary module.
-pub fn compile_kernels_wasm(kernels: &[Kernel], budget: RegBudget) -> Result<(Vec<u8>, WasmSummary), CompileError> {
+/// Compile multiple kernels into a single `WASM32` (+`SIMD128`) binary module, either owning
+/// and exporting its own memory (`import_memory == false`) or importing `("env", "memory")`
+/// (`import_memory == true`) for zero-copy shared-memory linking with a host WASM module.
+pub fn compile_kernels_wasm_with_memory(
+    kernels: &[Kernel],
+    budget: RegBudget,
+    import_memory: bool,
+) -> Result<(Vec<u8>, WasmSummary), CompileError> {
     if kernels.is_empty() {
         return Err(werr("cannot emit wasm module with zero kernels"));
     }
@@ -1353,9 +1374,15 @@ pub fn compile_kernels_wasm(kernels: &[Kernel], budget: RegBudget) -> Result<(Ve
         let doms = opt.infer_domains();
         lowered.push(lower_kernel_pair(&opt, &sched, &doms, (idx * 2) as u32)?);
     }
-    let wasm_bytes = assemble_wasm_module(&lowered, WASM_DEFAULT_MEM_PAGES);
+    let pages = if import_memory { 1 } else { WASM_DEFAULT_MEM_PAGES };
+    let wasm_bytes = assemble_wasm_module(&lowered, pages, import_memory);
     let summary = verify_wasm_module(&wasm_bytes)?;
     Ok((wasm_bytes, summary))
+}
+
+/// Compile multiple kernels into a single standalone 0-import `WASM32` (+`SIMD128`) binary module.
+pub fn compile_kernels_wasm(kernels: &[Kernel], budget: RegBudget) -> Result<(Vec<u8>, WasmSummary), CompileError> {
+    compile_kernels_wasm_with_memory(kernels, budget, false)
 }
 
 fn read_byte(bytes: &[u8], pos: &mut usize) -> Result<u8, CompileError> {
@@ -1545,6 +1572,7 @@ pub fn verify_wasm_module(bytes: &[u8]) -> Result<WasmSummary, CompileError> {
     let mut func_count = 0usize;
     let mut mem_count = 0usize;
     let mut mem_min_pages = 0u32;
+    let mut imports_memory = false;
     let mut exports = Vec::new();
     let mut code_body_count = 0usize;
     let mut total_insns = 0usize;
@@ -1586,6 +1614,34 @@ pub fn verify_wasm_module(bytes: &[u8]) -> Result<WasmSummary, CompileError> {
                     }
                 }
             }
+            SEC_IMPORT => {
+                let nimp = read_uleb_u32(payload, &mut p)? as usize;
+                for _ in 0..nimp {
+                    let mod_name = read_utf8_name(payload, &mut p)?;
+                    let field_name = read_utf8_name(payload, &mut p)?;
+                    let kind = read_byte(payload, &mut p)?;
+                    if kind != EXPORT_MEM || mod_name != "env" || field_name != "memory" {
+                        return Err(werr("wasm import section only permits env.memory"));
+                    }
+                    let flags = read_byte(payload, &mut p)?;
+                    let min_p = read_uleb_u32(payload, &mut p)?;
+                    if mem_count == 0 {
+                        mem_min_pages = min_p;
+                    }
+                    match flags {
+                        0x00 => {}
+                        0x01 => {
+                            let max_p = read_uleb_u32(payload, &mut p)?;
+                            if max_p < min_p {
+                                return Err(werr("wasm imported memory max < min"));
+                            }
+                        }
+                        _ => return Err(werr("wasm invalid imported memory limits flag")),
+                    }
+                    mem_count += 1;
+                    imports_memory = true;
+                }
+            }
             SEC_FUNC => {
                 func_count = read_uleb_u32(payload, &mut p)? as usize;
                 for _ in 0..func_count {
@@ -1596,6 +1652,9 @@ pub fn verify_wasm_module(bytes: &[u8]) -> Result<WasmSummary, CompileError> {
                 }
             }
             SEC_MEM => {
+                if imports_memory {
+                    return Err(werr("wasm module cannot both import and define memory"));
+                }
                 mem_count = read_uleb_u32(payload, &mut p)? as usize;
                 if mem_count == 0 {
                     return Err(werr("wasm memory section empty"));
@@ -1659,7 +1718,7 @@ pub fn verify_wasm_module(bytes: &[u8]) -> Result<WasmSummary, CompileError> {
     if type_count == 0 || func_count == 0 || mem_count == 0 || code_body_count != func_count {
         return Err(werr("wasm module missing mandatory section"));
     }
-    if !exports.iter().any(|e| e.kind == EXPORT_MEM && e.name == "memory") {
+    if !imports_memory && !exports.iter().any(|e| e.kind == EXPORT_MEM && e.name == "memory") {
         return Err(werr("wasm module missing exported memory"));
     }
     Ok(WasmSummary {
@@ -1672,5 +1731,22 @@ pub fn verify_wasm_module(bytes: &[u8]) -> Result<WasmSummary, CompileError> {
         simd_insns,
         div_rem_insns,
         has_simd128: simd_insns > 0,
+        imports_memory,
     })
+}
+
+/// Self-verifying `0t` airlock parser enforcing an explicit imported-memory expectation.
+pub fn verify_wasm_module_with_opts(
+    bytes: &[u8],
+    expect_imported_memory: bool,
+) -> Result<WasmSummary, CompileError> {
+    let sum = verify_wasm_module(bytes)?;
+    if sum.imports_memory != expect_imported_memory {
+        return Err(werr(if expect_imported_memory {
+            "wasm module expected imported env.memory"
+        } else {
+            "wasm module unexpectedly imported memory"
+        }));
+    }
+    Ok(sum)
 }
