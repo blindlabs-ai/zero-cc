@@ -23,7 +23,7 @@ fn calc_su(uniq: &[usize], su: &[usize]) -> usize {
 
 struct SchedGraph {
     reach: Vec<bool>, su: Vec<usize>, deps: Vec<Vec<NodeId>>, consumers: Vec<Vec<NodeId>>,
-    rem_uses: Vec<usize>, pending_reads: BTreeMap<(u8, u8), usize>,
+    rem_uses: Vec<usize>, pending_mem_ops: BTreeMap<(u8, u8), usize>,
 }
 
 fn build_sched_graph(kernel: &Kernel) -> SchedGraph {
@@ -31,18 +31,34 @@ fn build_sched_graph(kernel: &Kernel) -> SchedGraph {
     while let Some(u) = stack.pop() {
         if !reach[u] { reach[u] = true; let (kids, cnt) = kernel.nodes[u].children(); stack.extend_from_slice(&kids[..cnt]); }
     }
-    let (mut su, mut deps, mut consumers, mut rem_uses, mut pending_reads) = (vec![0; n], vec![Vec::new(); n], vec![Vec::new(); n], vec![0; n], BTreeMap::new());
+    let (mut su, mut deps, mut consumers, mut rem_uses, mut pending_mem_ops) = (vec![0; n], vec![Vec::new(); n], vec![Vec::new(); n], vec![0; n], BTreeMap::new());
+    let mut mem_loads = BTreeMap::<(NodeId, u8, u8), Vec<NodeId>>::new();
     for id in 0..n {
         if !reach[id] || is_inline(kernel.nodes[id]) { continue; }
-        if let Op::Load { buf, lane, .. } = kernel.nodes[id] { *pending_reads.entry((buf, lane)).or_insert(0) += 1; }
         let ((kids, cnt), mut uniq) = (kernel.nodes[id].children(), Vec::new());
         for &k in &kids[..cnt] { if !is_inline(kernel.nodes[k]) && !uniq.contains(&k) { uniq.push(k); } }
+        if let Op::Load { mem, buf, lane } = kernel.nodes[id] {
+            *pending_mem_ops.entry((buf, lane)).or_insert(0) += 1;
+            mem_loads.entry((mem, buf, lane)).or_default().push(id);
+        } else if let Op::Store { mem, buf, lane, .. } = kernel.nodes[id] {
+            *pending_mem_ops.entry((buf, lane)).or_insert(0) += 1;
+            let mut m = mem;
+            loop {
+                if let Some(lds) = mem_loads.get(&(m, buf, lane)) {
+                    for &ld in lds { if !uniq.contains(&ld) { uniq.push(ld); } }
+                }
+                match kernel.nodes.get(m).copied() {
+                    Some(Op::Store { mem: prev, buf: sb, lane: sl, .. }) if (sb, sl) != (buf, lane) => m = prev,
+                    _ => break,
+                }
+            }
+        }
         su[id] = calc_su(&uniq, &su);
         for &k in &uniq { consumers[k].push(id); rem_uses[k] += 1; }
         deps[id] = uniq;
     }
     for o in &kernel.outputs { if !is_inline(kernel.nodes[o.val]) { rem_uses[o.val] += 1; } }
-    SchedGraph { reach, su, deps, consumers, rem_uses, pending_reads }
+    SchedGraph { reach, su, deps, consumers, rem_uses, pending_mem_ops }
 }
 
 /// Minimum-live-register Sethi-Ullman DAG scheduler with hard zero-spill cliff guard.
@@ -56,20 +72,24 @@ pub fn schedule_and_verify(kernel: &Kernel, budget: RegBudget) -> Result<Schedul
     while !ready.is_empty() {
         let mut best = (0usize, (isize::MAX, 1usize, 0usize, usize::MAX));
         for (pos, &u) in ready.iter().enumerate() {
-            let delta = isize::from(g.rem_uses[u] > 0) - g.deps[u].iter().filter(|&&d| g.rem_uses[d] == 1).count() as isize;
+            let is_store = matches!(kernel.nodes[u], Op::Store { .. });
+            let delta = isize::from(!is_store && g.rem_uses[u] > 0) - g.deps[u].iter().filter(|&&d| !matches!(kernel.nodes[d], Op::Store { .. }) && g.rem_uses[d] == 1).count() as isize;
             let helps = usize::from(!g.consumers[u].iter().any(|&c| g.deps[c].iter().any(|d| live.contains(d))));
             let key = (delta, helps, usize::MAX - g.su[u], u);
             if key < best.1 { best = (pos, key); }
         }
         let u = ready.swap_remove(best.0);
         sched[u] = true; order.push(u);
-        if let Op::Load { buf, lane, .. } = kernel.nodes[u] { if let Some(cnt) = g.pending_reads.get_mut(&(buf, lane)) { *cnt = cnt.saturating_sub(1); } }
-        peak_ssa = peak_ssa.max(live.len() + usize::from(g.rem_uses[u] > 0));
-        if g.rem_uses[u] > 0 { live.insert(u); }
+        if let Op::Load { buf, lane, .. } | Op::Store { buf, lane, .. } = kernel.nodes[u] {
+            if let Some(cnt) = g.pending_mem_ops.get_mut(&(buf, lane)) { *cnt = cnt.saturating_sub(1); }
+        }
+        let holds_reg = !matches!(kernel.nodes[u], Op::Store { .. }) && g.rem_uses[u] > 0;
+        peak_ssa = peak_ssa.max(live.len() + usize::from(holds_reg));
+        if holds_reg { live.insert(u); }
         for &d in &g.deps[u] { g.rem_uses[d] -= 1; if g.rem_uses[d] == 0 { live.remove(&d); } }
         for &c in &g.consumers[u] { rem_deps[c] -= 1; if rem_deps[c] == 0 { ready.push(c); } }
         for (oi, o) in kernel.outputs.iter().enumerate() {
-            if !out_done[oi] && (is_inline(kernel.nodes[o.val]) || sched[o.val]) && g.pending_reads.get(&(o.buf, o.lane)).copied().unwrap_or(0) == 0 {
+            if !out_done[oi] && (is_inline(kernel.nodes[o.val]) || sched[o.val]) && g.pending_mem_ops.get(&(o.buf, o.lane)).copied().unwrap_or(0) == 0 {
                 out_done[oi] = true; output_order.push((order.len(), oi));
                 if !is_inline(kernel.nodes[o.val]) { g.rem_uses[o.val] -= 1; if g.rem_uses[o.val] == 0 { live.remove(&o.val); } }
             }
@@ -141,7 +161,11 @@ pub fn emit_rust(kernel: &Kernel, sched: &ScheduleReport) -> Result<String, Comp
     let _ = writeln!(s, "#[inline(always)]\npub fn {}({}) {{", kernel.name, params.join(", "));
     for (step, &id) in sched.order.iter().enumerate() {
         drain_outputs(&mut s, kernel, sched, &mut oc, Some(step));
-        if !matches!(kernel.nodes[id], Op::Store { .. }) { let _ = writeln!(s, "    let v{id}: i64 = {};", emit_op_rhs(kernel, &doms, id)); }
+        if let Op::Store { buf, lane, val, .. } = kernel.nodes[id] {
+            let _ = writeln!(s, "    {}[{lane}] = {};", kernel.bufs[buf as usize].name, ref_expr(kernel, val));
+        } else {
+            let _ = writeln!(s, "    let v{id}: i64 = {};", emit_op_rhs(kernel, &doms, id));
+        }
     }
     drain_outputs(&mut s, kernel, sched, &mut oc, None);
     let _ = writeln!(s, "}}");

@@ -1,8 +1,8 @@
 NTF1 zero_cc
 # zero-cc >< zero-check recursive compiler-verifier contract
-RustSrc.Parse |> Kernel.IR |> Domain.CRT_Quad |> EGraph.Rewrite |> Select.Cmov |> SethiUllman.Sched |> RustO3.Emit
-+t zero_cc -> RustSrc.Parse |> Kernel.IR |> EGraph.Rewrite |> Select.Cmov |> RustO3.Emit
-+t zero_check -> RustO3.Emit |> Lint.ZeroDep |> Verify.Airlock
+RustSrc.Parse |> Kernel.IR |> Domain.CRT_Quad |> EGraph.Rewrite |> Select.Cmov |> SethiUllman.Sched |> RegAlloc.LinearScan |> Isa.X86_64_Aarch64 |> Elf64.Emit |> Elf64.ParseHeader |> RustO3.Emit
++t zero_cc -> RustSrc.Parse |> Kernel.IR |> EGraph.Rewrite |> Select.Cmov |> RegAlloc.LinearScan |> Elf64.Emit |> RustO3.Emit
++t zero_check -> Elf64.ParseHeader |> RustO3.Emit |> Lint.ZeroDep |> Verify.Airlock
 +t Domain.Meet -> Domain.CRT_LCM |> Domain.Tighten
 +t Domain.Mul -> Domain.CongruenceLift |> Domain.QuadResidue
 -t Fault.RustParse <- Guard.RustFe_Precedence_Cast
@@ -10,8 +10,10 @@ RustSrc.Parse |> Kernel.IR |> Domain.CRT_Quad |> EGraph.Rewrite |> Select.Cmov |
 -t Fault.Div0 <- Guard.Barrett_u128
 -t Fault.OOB <- Guard.BoundsCheckElim
 -t Fault.RegSpill <- Guard.RegBudget_14_16
+-t Fault.LlvmPoisonDrift <- Guard.DirectElf64Backend
 -t Fault.SvoTax <- Guard.Ntf1Lexer
 0t zero_cc >< zero_check
 0t RustSrc.Parse >< RustO3.Emit
+0t Elf64.Emit >< Elf64.ParseHeader
 0t EGraph.Rewrite >< EGraph.Rewrite
 0t Ntf1.Emit >< Ntf1.Emit

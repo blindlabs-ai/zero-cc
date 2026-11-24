@@ -12,6 +12,7 @@ define_errors! { CompileError;
     DivByZero | Self::DivByZero => "division or remainder by zero/overflow";
     RegisterSpill { peak_gprs: usize, max_gprs: usize, peak_vecs: usize, max_vecs: usize }
         | Self::RegisterSpill { peak_gprs, max_gprs, peak_vecs, max_vecs } => "register spill: gprs {peak_gprs}/{max_gprs}, vecs {peak_vecs}/{max_vecs}";
+    BackendError(String) | Self::BackendError(msg) => "backend error: {msg}";
     ParseError(String) | Self::ParseError(msg) => "parse error: {msg}";
 }
 
@@ -266,6 +267,7 @@ impl Kernel {
                 Op::Load { buf, lane, .. } => self.check_buf_lane(buf, lane, false)?,
                 Op::Store { buf, lane, .. } => self.check_buf_lane(buf, lane, true)?,
                 Op::LoadLut { buf, .. } if !matches!(self.bufs.get(buf as usize).map(|b| b.access), Some(BufAccess::LookupTable(_))) => return Err(CompileError::InvalidBuffer(buf)),
+                Op::BoundsCheck { limit, .. } if limit <= 0 => return Err(CompileError::OutOfBounds { idx: 0, limit }),
                 Op::Shl(_, s) | Op::Shr(_, s) if s >= 64 => return Err(CompileError::InvalidShift(s)),
                 _ => {}
             }
