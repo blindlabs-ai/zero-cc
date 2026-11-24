@@ -23,10 +23,76 @@ impl CmpKind {
     pub const fn sym(self) -> &'static str { match self { Self::Eq => "==", Self::Ne => "!=", Self::Lt => "<", Self::Le => "<=", Self::Gt => ">", Self::Ge => ">=" } }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ElemTy {
+    #[default]
+    I64,
+    I32,
+    I16,
+    U32,
+    U16,
+    U8,
+}
+impl ElemTy {
+    const fn meta(self) -> (&'static str, u8) {
+        match self {
+            Self::I64 => ("i64", 3),
+            Self::I32 => ("i32", 2),
+            Self::I16 => ("i16", 1),
+            Self::U32 => ("u32", 2),
+            Self::U16 => ("u16", 1),
+            Self::U8 => ("u8", 0),
+        }
+    }
+    pub const fn bytes(self) -> u8 { 1u8 << self.scale_shift() }
+    pub const fn scale_shift(self) -> u8 { self.meta().1 }
+    pub const fn rust_name(self) -> &'static str { self.meta().0 }
+    pub fn from_rust_name(name: &str) -> Option<Self> {
+        match name {
+            "i64" => Some(Self::I64), "i32" => Some(Self::I32), "i16" => Some(Self::I16),
+            "u32" => Some(Self::U32), "u16" => Some(Self::U16), "u8" => Some(Self::U8),
+            _ => None,
+        }
+    }
+    pub const fn natural_domain(self) -> Domain {
+        match self {
+            Self::I64 => Domain::top(),
+            Self::I32 => Domain::range(i32::MIN as i64, i32::MAX as i64),
+            Self::I16 => Domain::range(i16::MIN as i64, i16::MAX as i64),
+            Self::U32 => Domain::range(0, u32::MAX as i64),
+            Self::U16 => Domain::range(0, u16::MAX as i64),
+            Self::U8 => Domain::range(0, u8::MAX as i64),
+        }
+    }
+    pub const fn cast_i64(self, v: i64) -> i64 {
+        match self {
+            Self::I64 => v,
+            Self::I32 => (v as i32) as i64,
+            Self::I16 => (v as i16) as i64,
+            Self::U32 => (v as u32) as i64,
+            Self::U16 => (v as u16) as i64,
+            Self::U8 => (v as u8) as i64,
+        }
+    }
+    pub fn push_le_elem(self, out: &mut Vec<u8>, v: i64) {
+        match self {
+            Self::I64 => out.extend_from_slice(&v.to_le_bytes()),
+            Self::I32 => out.extend_from_slice(&(v as i32).to_le_bytes()),
+            Self::I16 => out.extend_from_slice(&(v as i16).to_le_bytes()),
+            Self::U32 => out.extend_from_slice(&(v as u32).to_le_bytes()),
+            Self::U16 => out.extend_from_slice(&(v as u16).to_le_bytes()),
+            Self::U8 => out.push(v as u8),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BufAccess { ReadOnly, MutNoAlias, LookupTable(usize) }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BufDecl { pub id: u8, pub name: String, pub access: BufAccess, pub domain: Domain }
+pub struct BufDecl { pub id: u8, pub name: String, pub access: BufAccess, pub domain: Domain, pub elem_ty: ElemTy, pub lanes: u8 }
+impl BufDecl {
+    pub const fn block_bytes(&self) -> usize { (self.elem_ty.bytes() as usize) * (self.lanes as usize) }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Domain { pub lo: i64, pub hi: i64, pub modulus: i64, pub rem: i64 }
 
@@ -249,17 +315,31 @@ fn checked_div_rem(lhs: i64, rhs: i64, is_rem: bool) -> Result<i64, CompileError
 
 impl Kernel {
     pub fn new(name: impl Into<String>) -> Self { Self { name: name.into(), ..Self::default() } }
-    pub fn add_buf(&mut self, name: impl Into<String>, access: BufAccess, domain: Domain) -> u8 { let id = self.bufs.len() as u8; self.bufs.push(BufDecl { id, name: name.into(), access, domain }); id }
+    pub fn add_buf(&mut self, name: impl Into<String>, access: BufAccess, domain: Domain) -> u8 {
+        self.add_typed_buf(name, access, ElemTy::I64, LANES as u8, domain)
+    }
+    pub fn add_typed_buf(&mut self, name: impl Into<String>, access: BufAccess, elem_ty: ElemTy, lanes: u8, domain: Domain) -> u8 {
+        let id = self.bufs.len() as u8;
+        let tight = domain.meet(elem_ty.natural_domain());
+        let eff_dom = if tight.is_empty() && !domain.is_empty() { elem_ty.natural_domain() } else { tight };
+        self.bufs.push(BufDecl { id, name: name.into(), access, domain: eff_dom, elem_ty, lanes });
+        id
+    }
     pub fn push(&mut self, op: IrOp) -> NodeId { let id = self.nodes.len(); self.nodes.push(op); id }
     pub fn add_output(&mut self, buf: u8, lane: u8, val: NodeId) { self.outputs.push(OutputWrite { buf, lane, val }); }
     fn check_buf_lane(&self, buf: u8, lane: u8, require_mut: bool) -> Result<(), CompileError> {
         let b = self.bufs.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
         if require_mut && b.access != BufAccess::MutNoAlias { return Err(CompileError::WriteToReadOnlyBuf(buf)); }
         if !require_mut && matches!(b.access, BufAccess::LookupTable(_)) { return Err(CompileError::InvalidBuffer(buf)); }
-        if usize::from(lane) >= LANES { return Err(CompileError::InvalidLane(lane)); }
+        if b.lanes == 0 || usize::from(b.lanes) > LANES || lane >= b.lanes { return Err(CompileError::InvalidLane(lane)); }
         Ok(())
     }
     pub fn validate(&self) -> Result<(), CompileError> {
+        for b in &self.bufs {
+            if !matches!(b.access, BufAccess::LookupTable(_)) && (b.lanes == 0 || usize::from(b.lanes) > LANES) {
+                return Err(CompileError::InvalidLane(b.lanes));
+            }
+        }
         for (id, &op) in self.nodes.iter().enumerate() {
             let (kids, cnt) = op.children();
             for &k in &kids[..cnt] { if k >= id { return Err(CompileError::InvalidNode(k)); } }
@@ -297,10 +377,12 @@ impl Kernel {
         if inputs.len() != self.bufs.len() { return Err(CompileError::InvalidBuffer(inputs.len() as u8)); }
         let mut init_mem = Vec::with_capacity(self.bufs.len());
         for (idx, decl) in self.bufs.iter().enumerate() {
-            let need = match decl.access { BufAccess::LookupTable(n) => n, _ => LANES };
+            let need = match decl.access { BufAccess::LookupTable(n) => n, _ => usize::from(decl.lanes) };
             if inputs[idx].len() < need { return Err(CompileError::OutOfBounds { idx: inputs[idx].len() as i64, limit: need as i64 }); }
             let mut arr = [0i64; LANES];
-            if !matches!(decl.access, BufAccess::LookupTable(_)) { arr.copy_from_slice(&inputs[idx][..LANES]); }
+            if !matches!(decl.access, BufAccess::LookupTable(_)) {
+                for (slot, &val) in arr.iter_mut().zip(inputs[idx].iter()).take(need) { *slot = decl.elem_ty.cast_i64(val); }
+            }
             init_mem.push(arr);
         }
         let (mut vals, mut mems, mut mslot) = (vec![0i64; self.nodes.len()], Vec::new(), vec![0usize; self.nodes.len()]);
@@ -309,10 +391,16 @@ impl Kernel {
                 Op::MemInit => { mslot[id] = mems.len(); mems.push(init_mem.clone()); 0 }
                 Op::Const(c) => c,
                 Op::Load { mem, buf, lane } => mems[mslot[mem]][buf as usize][lane as usize],
-                Op::Store { mem, buf, lane, val } => { let mut n = mems[mslot[mem]].clone(); n[buf as usize][lane as usize] = vals[val]; mslot[id] = mems.len(); mems.push(n); 0 }
+                Op::Store { mem, buf, lane, val } => {
+                    let mut n = mems[mslot[mem]].clone();
+                    n[buf as usize][lane as usize] = self.bufs[buf as usize].elem_ty.cast_i64(vals[val]);
+                    mslot[id] = mems.len(); mems.push(n); 0
+                }
                 Op::LoadLut { buf, idx } => {
-                    let (lim, iv) = (match self.bufs[buf as usize].access { BufAccess::LookupTable(n) => n as i64, _ => 0 }, vals[idx]);
-                    if iv < 0 || iv >= lim { return Err(CompileError::OutOfBounds { idx: iv, limit: lim }); } inputs[buf as usize][iv as usize]
+                    let b = &self.bufs[buf as usize];
+                    let (lim, iv) = (match b.access { BufAccess::LookupTable(n) => n as i64, _ => 0 }, vals[idx]);
+                    if iv < 0 || iv >= lim { return Err(CompileError::OutOfBounds { idx: iv, limit: lim }); }
+                    b.elem_ty.cast_i64(inputs[buf as usize][iv as usize])
                 }
                 Op::BoundsCheck { idx, limit } => { let iv = vals[idx]; if iv < 0 || iv >= limit { return Err(CompileError::OutOfBounds { idx: iv, limit }); } iv }
                 Op::Add(a, b) => vals[a].wrapping_add(vals[b]), Op::Sub(a, b) => vals[a].wrapping_sub(vals[b]), Op::Mul(a, b) => vals[a].wrapping_mul(vals[b]),
@@ -322,7 +410,7 @@ impl Kernel {
             };
         }
         let mut out = init_mem;
-        for o in &self.outputs { out[o.buf as usize][o.lane as usize] = vals[o.val]; }
+        for o in &self.outputs { out[o.buf as usize][o.lane as usize] = self.bufs[o.buf as usize].elem_ty.cast_i64(vals[o.val]); }
         Ok(out)
     }
 }

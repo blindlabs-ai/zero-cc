@@ -4,8 +4,9 @@ use std::fs;
 use std::process::Command;
 
 use zero_cc::{
-    compile_kernel_direct, compile_rust_to_elf, emit_kernel_elf, parse_rust_kernel,
-    verify_elf64_object, BufAccess, CompileError, Domain, Kernel, Op, RegBudget, TargetIsa,
+    compile_kernel_direct, compile_rust_to_elf, compile_rust_to_elf_exec,
+    compile_standalone_elf_exec, emit_kernel_elf, parse_rust_kernel, verify_elf64_executable,
+    verify_elf64_object, BufAccess, CompileError, Domain, ElemTy, Kernel, Op, RegBudget, TargetIsa,
     EM_AARCH64, EM_X86_64, LANES,
 };
 
@@ -973,5 +974,433 @@ fn main() {
         assert_eq!(f3_eval[2], [11, 22, 33, 44, 55, 66, 77, 88]);
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+fn expected_multiblock_output_bytes(k: &Kernel, inputs: &[&[i64]], blocks: usize) -> Vec<u8> {
+    let out_idx = k
+        .bufs
+        .iter()
+        .position(|b| b.access == BufAccess::MutNoAlias)
+        .expect("kernel must have a primary MutNoAlias output buffer");
+    let out_decl = &k.bufs[out_idx];
+    let mut bytes = Vec::with_capacity(blocks * out_decl.block_bytes());
+    for blk in 0..blocks {
+        let mut slices: Vec<&[i64]> = Vec::with_capacity(k.bufs.len());
+        for (idx, decl) in k.bufs.iter().enumerate() {
+            match decl.access {
+                BufAccess::LookupTable(_) => slices.push(inputs[idx]),
+                _ => {
+                    let lanes = usize::from(decl.lanes);
+                    let start = blk * lanes;
+                    slices.push(&inputs[idx][start..start + lanes]);
+                }
+            }
+        }
+        let res = k.eval(&slices).expect("Kernel::eval block parity");
+        for &val in res[out_idx].iter().take(usize::from(out_decl.lanes)) {
+            out_decl.elem_ty.push_le_elem(&mut bytes, val);
+        }
+    }
+    bytes
+}
+
+#[cfg(not(miri))]
+fn write_exec_file(path: &std::path::Path, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(path, bytes).expect("write ET_EXEC binary");
+    let mut perms = fs::metadata(path).expect("stat ET_EXEC").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod 0755 ET_EXEC");
+}
+
+#[cfg(not(miri))]
+fn verify_live_et_exec_readelf_objdump_and_run(
+    tmp: &std::path::Path,
+    tag: &str,
+    exec: &zero_cc::StandaloneExec,
+    expected: &[u8],
+) {
+    let bin_path = tmp.join(tag);
+    write_exec_file(&bin_path, &exec.elf_bytes);
+
+    let re = Command::new("readelf")
+        .args(["-h", "-l", "-S", "-s", "-W"])
+        .arg(&bin_path)
+        .output()
+        .expect("run readelf on ET_EXEC");
+    assert!(
+        re.status.success(),
+        "readelf failed on {tag}:\n{}",
+        String::from_utf8_lossy(&re.stderr)
+    );
+    let re_txt = String::from_utf8_lossy(&re.stdout);
+    assert!(!re_txt.contains("RWE"), "{tag} readelf reported W+X RWE segment:\n{re_txt}");
+    assert!(re_txt.contains("EXEC"), "{tag} readelf missing EXEC type:\n{re_txt}");
+    assert!(re_txt.contains("GNU_STACK"), "{tag} readelf missing PT_GNU_STACK:\n{re_txt}");
+    assert!(re_txt.contains("_start"), "{tag} readelf missing _start symbol:\n{re_txt}");
+
+    let od = Command::new("objdump")
+        .args(["-d", "-M", "intel"])
+        .arg(&bin_path)
+        .output()
+        .expect("run objdump on ET_EXEC");
+    assert!(
+        od.status.success(),
+        "objdump failed on {tag}:\n{}",
+        String::from_utf8_lossy(&od.stderr)
+    );
+    let asm = String::from_utf8_lossy(&od.stdout);
+    let sym_headers: Vec<&str> = asm.lines().filter(|l| l.ends_with(">:")).collect();
+    assert_eq!(
+        sym_headers.len(),
+        3,
+        "{tag} expected exactly 3 direct symbols (100% zero-cc, zero libc/crt glue), got: {sym_headers:?}"
+    );
+    for sym in [&exec.kernel_sym, &exec.batch_sym, &exec.entry_sym] {
+        let stats = inspect_intel_symbol(&asm, sym);
+        assert!(stats.insns > 0, "{tag} empty disassembly for {sym}");
+        assert_eq!(stats.rsp_mem_ops, 0, "{tag} unexpected stack spill in {sym}:\n{asm}");
+    }
+
+    let run = Command::new(&bin_path).output().expect("execute standalone ET_EXEC directly");
+    assert_eq!(
+        run.stdout.as_slice(),
+        expected,
+        "{tag} live ET_EXEC stdout mismatch against Kernel::eval"
+    );
+    assert_eq!(expected.len(), exec.output_bytes, "{tag} output_bytes metadata mismatch");
+    let expected_exit = (expected.iter().fold(0u64, |acc, &b| acc + u64::from(b)) & 0x7F) as i32;
+    assert_eq!(
+        run.status.code(),
+        Some(expected_exit),
+        "{tag} live ET_EXEC exit code mismatch (sum(stdout) & 0x7F)"
+    );
+}
+
+#[test]
+fn standalone_et_exec_100pct_direct_linux_kernel_and_wx_airlock() {
+    let k_hash = build_modular_hash_lut();
+    let budget = RegBudget::default();
+
+    for (isa, mach) in [(TargetIsa::X86_64, EM_X86_64), (TargetIsa::Aarch64, EM_AARCH64)] {
+        let def = compile_standalone_elf_exec(&k_hash, budget, isa, &[])
+            .expect("empty default 1-block ET_EXEC");
+        assert_eq!(def.shim_glue_insns, 0);
+        assert_eq!(def.direct_share_pct, 100);
+        assert_eq!(def.blocks, 1);
+        assert_eq!(def.entry_sym, "_start");
+        assert!(def.zero_spills);
+        let summary = verify_elf64_executable(&def.elf_bytes).expect("verify default ET_EXEC");
+        assert_eq!(summary.machine, mach);
+        assert_eq!(summary.entry_vaddr, def.entry_vaddr);
+        assert_eq!(summary.data_vaddr, def.data_vaddr);
+        assert_eq!(summary.text_size, def.code_bytes.len() as u64);
+    }
+
+    let base_x86 = compile_standalone_elf_exec(&k_hash, budget, TargetIsa::X86_64, &[])
+        .expect("x86_64 ET_EXEC for W^X knockouts");
+    let mut bad_wx = base_x86.elf_bytes.clone();
+    bad_wx[64 + 4] |= 2;
+    assert!(verify_elf64_executable(&bad_wx).is_err(), "RX+W PT_LOAD must be rejected");
+
+    let mut bad_stack = base_x86.elf_bytes.clone();
+    bad_stack[64 + 2 * 56 + 4] |= 1;
+    assert!(verify_elf64_executable(&bad_stack).is_err(), "executable PT_GNU_STACK must be rejected");
+
+    let mut bad_align = base_x86.elf_bytes.clone();
+    bad_align[64 + 56 + 16] = bad_align[64 + 56 + 16].wrapping_add(1);
+    assert!(verify_elf64_executable(&bad_align).is_err(), "broken page congruence must be rejected");
+
+    let mut k_narrow = Kernel::new("narrow_i32_8_to_i64_4");
+    let a = k_narrow.add_typed_buf("a", BufAccess::ReadOnly, ElemTy::I32, 8, ElemTy::I32.natural_domain());
+    let out = k_narrow.add_typed_buf("out", BufAccess::MutNoAlias, ElemTy::I64, 4, Domain::top());
+    let mem = k_narrow.push(Op::MemInit);
+    for lane in 0..4u8 {
+        let lo = k_narrow.push(Op::Load { mem, buf: a, lane: lane * 2 });
+        let hi = k_narrow.push(Op::Load { mem, buf: a, lane: lane * 2 + 1 });
+        let sum = k_narrow.push(Op::Add(lo, hi));
+        k_narrow.add_output(out, lane, sum);
+    }
+
+    #[cfg(not(miri))]
+    {
+        let tmp = std::env::temp_dir().join(format!("zero_cc_et_exec_wx_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("create et_exec tmp dir");
+
+        let mut rng = SplitMix64(0xE1F6_4001_5EED_CAFE);
+        let hash_blocks = 4usize;
+        let hash_a: Vec<i64> = (0..hash_blocks * LANES).map(|_| rng.range(0, 65535)).collect();
+        let hash_b: Vec<i64> = (0..hash_blocks * LANES).map(|_| rng.range(0, 65535)).collect();
+        let hash_lut: Vec<i64> = (0..8).map(|_| rng.range(0, 1023)).collect();
+        let hash_out = vec![0i64; hash_blocks * LANES];
+        let hash_inputs: [&[i64]; 4] = [&hash_a, &hash_b, &hash_lut, &hash_out];
+        let hash_exec = compile_standalone_elf_exec(&k_hash, budget, TargetIsa::X86_64, &hash_inputs)
+            .expect("compile 4-block modular_hash_lut ET_EXEC");
+        assert_eq!(hash_exec.blocks, hash_blocks);
+        assert_eq!(hash_exec.shim_glue_insns, 0);
+        assert_eq!(hash_exec.direct_share_pct, 100);
+        let hash_exp = expected_multiblock_output_bytes(&k_hash, &hash_inputs, hash_blocks);
+        verify_live_et_exec_readelf_objdump_and_run(&tmp, "modular_hash_lut_4blk", &hash_exec, &hash_exp);
+
+        let sel_blocks = 3usize;
+        let mut sel_a: Vec<i64> = (0..sel_blocks * LANES).map(|_| rng.range(-100_000, 100_000)).collect();
+        let mut sel_b: Vec<i64> = (0..sel_blocks * LANES).map(|_| rng.range(-100_000, 100_000)).collect();
+        sel_a[0] = -99_999;
+        sel_b[0] = -99_999;
+        sel_a[1] = -8_191;
+        sel_b[1] = 42_000;
+        let sel_out = vec![0i64; sel_blocks * LANES];
+        let sel_inputs: [&[i64]; 3] = [&sel_a, &sel_b, &sel_out];
+        let k_sel = parse_rust_kernel(SIGNED_SELECT_SRC).expect("parse signed_select_ashr");
+        let sel_exec = compile_rust_to_elf_exec(SIGNED_SELECT_SRC, budget, TargetIsa::X86_64, &sel_inputs)
+            .expect("compile 3-block signed_select_ashr ET_EXEC");
+        assert_eq!(sel_exec.blocks, sel_blocks);
+        assert_eq!(sel_exec.shim_glue_insns, 0);
+        assert_eq!(sel_exec.direct_share_pct, 100);
+        let sel_exp = expected_multiblock_output_bytes(&k_sel, &sel_inputs, sel_blocks);
+        verify_live_et_exec_readelf_objdump_and_run(&tmp, "signed_select_ashr_3blk", &sel_exec, &sel_exp);
+
+        let nar_blocks = 4usize;
+        let mut nar_a: Vec<i64> = (0..nar_blocks * 8)
+            .map(|i| match i % 6 {
+                0 => i64::from(i32::MIN),
+                1 => i64::from(i32::MAX),
+                2 => -1,
+                3 => 0x7FFF_FFFF,
+                4 => -1_234_567,
+                _ => rng.range(i64::from(i32::MIN), i64::from(i32::MAX)),
+            })
+            .collect();
+        nar_a[5] = 0;
+        let nar_out = vec![0i64; nar_blocks * 4];
+        let nar_inputs: [&[i64]; 2] = [&nar_a, &nar_out];
+        let nar_exec = compile_standalone_elf_exec(&k_narrow, budget, TargetIsa::X86_64, &nar_inputs)
+            .expect("compile 4-block narrow [i32; 8] -> [i64; 4] ET_EXEC");
+        assert_eq!(nar_exec.blocks, nar_blocks);
+        assert_eq!(nar_exec.shim_glue_insns, 0);
+        assert_eq!(nar_exec.direct_share_pct, 100);
+        let nar_exp = expected_multiblock_output_bytes(&k_narrow, &nar_inputs, nar_blocks);
+        verify_live_et_exec_readelf_objdump_and_run(&tmp, "narrow_i32_8_to_i64_4_4blk", &nar_exec, &nar_exp);
+
+        let arm_exec = compile_standalone_elf_exec(&k_hash, budget, TargetIsa::Aarch64, &hash_inputs)
+            .expect("compile 4-block AArch64 ET_EXEC");
+        assert_eq!(arm_exec.shim_glue_insns, 0);
+        assert_eq!(arm_exec.direct_share_pct, 100);
+        let arm_path = tmp.join("modular_hash_lut_arm64");
+        write_exec_file(&arm_path, &arm_exec.elf_bytes);
+        let re_arm = Command::new("readelf")
+            .args(["-h", "-l", "-S", "-s", "-W"])
+            .arg(&arm_path)
+            .output()
+            .expect("readelf on AArch64 ET_EXEC");
+        assert!(re_arm.status.success());
+        let re_arm_txt = String::from_utf8_lossy(&re_arm.stdout);
+        assert!(!re_arm_txt.contains("RWE"), "AArch64 ET_EXEC has RWE:\n{re_arm_txt}");
+        assert!(re_arm_txt.contains("EXEC"));
+        assert!(re_arm_txt.contains("AArch64"));
+        assert!(re_arm_txt.contains("GNU_STACK"));
+        assert!(re_arm_txt.contains("_start"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+#[test]
+fn narrow_elem_ty_all_six_widths_variable_lanes_and_u8_rex_pressure() {
+    let budget = RegBudget::default();
+    let all_tys = [ElemTy::I64, ElemTy::I32, ElemTy::I16, ElemTy::U32, ElemTy::U16, ElemTy::U8];
+    let edge_vals: [i64; 16] = [
+        -1,
+        0,
+        1,
+        7,
+        -7,
+        0x7F,
+        0x80,
+        0xFE,
+        0xFF,
+        0x7FFF,
+        0x8000,
+        0xFFFF,
+        -32_768,
+        0x7FFF_FFFF,
+        -2_147_483_648,
+        i64::MIN,
+    ];
+
+    #[cfg(not(miri))]
+    let tmp = {
+        let dir = std::env::temp_dir().join(format!("zero_cc_narrow_elem_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create narrow_elem tmp dir");
+        dir
+    };
+
+    for &ty in &all_tys {
+        let rty = ty.rust_name();
+        let (exp_ldr, exp_str, exp_lut) = match ty {
+            ElemTy::I64 => (0xF940_0000u32, 0xF900_0000u32, 0xF860_7800u32),
+            ElemTy::I32 => (0xB980_0000u32, 0xB900_0000u32, 0xB8A0_7800u32),
+            ElemTy::I16 => (0x7980_0000u32, 0x7900_0000u32, 0x78A0_7800u32),
+            ElemTy::U32 => (0xB940_0000u32, 0xB900_0000u32, 0xB860_7800u32),
+            ElemTy::U16 => (0x7940_0000u32, 0x7900_0000u32, 0x7860_7800u32),
+            ElemTy::U8 => (0x3940_0000u32, 0x3900_0000u32, 0x3860_6800u32),
+        };
+
+        for lanes in [4u8, 8u8] {
+            let mut k = Kernel::new(format!("narrow_{rty}_{lanes}"));
+            let a = k.add_typed_buf("a", BufAccess::ReadOnly, ty, lanes, ty.natural_domain());
+            let lut = k.add_typed_buf("lut", BufAccess::LookupTable(8), ty, lanes, ty.natural_domain());
+            let out = k.add_typed_buf("out", BufAccess::MutNoAlias, ty, lanes, ty.natural_domain());
+            let mem = k.push(Op::MemInit);
+            let c7 = k.push(Op::Const(7));
+            for lane in 0..lanes {
+                let v = k.push(Op::Load { mem, buf: a, lane });
+                let raw_idx = k.push(Op::BitAnd(v, c7));
+                let idx = k.push(Op::BoundsCheck { idx: raw_idx, limit: 8 });
+                let lv = k.push(Op::LoadLut { buf: lut, idx });
+                let sum = k.push(Op::Add(v, lv));
+                k.add_output(out, lane, sum);
+            }
+
+            let obj_x86 = compile_kernel_direct(&k, budget, TargetIsa::X86_64)
+                .expect("compile narrow x86_64 object");
+            assert!(obj_x86.rust_ffi_shim.contains(&format!("a: &[{rty}; {lanes}]")));
+            assert!(obj_x86.rust_ffi_shim.contains(&format!("lut: &[{rty}; 8]")));
+            assert!(obj_x86.rust_ffi_shim.contains(&format!("out: &mut [{rty}; {lanes}]")));
+            assert!(obj_x86.rust_ffi_shim.contains(&format!("a: &[[{rty}; {lanes}]]")));
+            assert!(obj_x86.rust_ffi_shim.contains(&format!("out: &mut [[{rty}; {lanes}]]")));
+
+            let obj_arm = compile_kernel_direct(&k, budget, TargetIsa::Aarch64)
+                .expect("compile narrow AArch64 object");
+            assert_eq!(obj_arm.code_bytes.len() % 4, 0);
+            let words: Vec<u32> = obj_arm
+                .code_bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            assert!(
+                words.iter().any(|&w| (w & 0xFFC0_0000) == exp_ldr),
+                "AArch64 narrow_{rty}_{lanes} missing load opcode {exp_ldr:#010X}"
+            );
+            assert!(
+                words.iter().any(|&w| (w & 0xFFC0_0000) == exp_str),
+                "AArch64 narrow_{rty}_{lanes} missing store opcode {exp_str:#010X}"
+            );
+            assert!(
+                words.iter().any(|&w| (w & 0xFFE0_FC00) == exp_lut),
+                "AArch64 narrow_{rty}_{lanes} missing LUT opcode {exp_lut:#010X}"
+            );
+
+            let blocks = 3usize;
+            let n_elems = blocks * usize::from(lanes);
+            let a_in: Vec<i64> = (0..n_elems)
+                .map(|i| ty.cast_i64(edge_vals[(i + usize::from(lanes)) % edge_vals.len()]))
+                .collect();
+            let lut_in: Vec<i64> = (0..8)
+                .map(|i| ty.cast_i64(edge_vals[(i * 2 + 1) % edge_vals.len()]))
+                .collect();
+            let out_init = vec![0i64; n_elems];
+            let inputs: [&[i64]; 3] = [&a_in, &lut_in, &out_init];
+            let expected = expected_multiblock_output_bytes(&k, &inputs, blocks);
+
+            #[cfg(not(miri))]
+            {
+                let exec = compile_standalone_elf_exec(&k, budget, TargetIsa::X86_64, &inputs)
+                    .expect("compile narrow ET_EXEC");
+                assert_eq!(exec.shim_glue_insns, 0);
+                assert_eq!(exec.direct_share_pct, 100);
+                let tag = format!("narrow_{rty}_{lanes}_3blk");
+                verify_live_et_exec_readelf_objdump_and_run(&tmp, &tag, &exec, &expected);
+            }
+            #[cfg(miri)]
+            {
+                assert_eq!(expected.len(), blocks * usize::from(lanes) * usize::from(ty.bytes()));
+            }
+        }
+    }
+
+    let mut k_u8 = Kernel::new("u8_rex_sil_dil_pressure");
+    let b0 = k_u8.add_typed_buf("b0", BufAccess::ReadOnly, ElemTy::U8, 8, ElemTy::U8.natural_domain());
+    let b1 = k_u8.add_typed_buf("b1", BufAccess::ReadOnly, ElemTy::U8, 8, ElemTy::U8.natural_domain());
+    let b2 = k_u8.add_typed_buf("b2", BufAccess::ReadOnly, ElemTy::U8, 8, ElemTy::U8.natural_domain());
+    let b3 = k_u8.add_typed_buf("b3", BufAccess::ReadOnly, ElemTy::U8, 8, ElemTy::U8.natural_domain());
+    let out = k_u8.add_typed_buf("out", BufAccess::MutNoAlias, ElemTy::U8, 8, ElemTy::U8.natural_domain());
+    let mem = k_u8.push(Op::MemInit);
+    let mut ring = [0usize; 2];
+    for i in 0..2u8 {
+        let v0 = k_u8.push(Op::Load { mem, buf: b0, lane: i });
+        let v1 = k_u8.push(Op::Load { mem, buf: b1, lane: (i + 1) & 7 });
+        ring[i as usize] = k_u8.push(Op::Add(v0, v1));
+    }
+    for lane in 0..8u8 {
+        let v0 = k_u8.push(Op::Load { mem, buf: b0, lane });
+        let v1 = k_u8.push(Op::Load { mem, buf: b1, lane: (lane + 1) & 7 });
+        let v2 = k_u8.push(Op::Load { mem, buf: b2, lane: (lane + 2) & 7 });
+        let v3 = k_u8.push(Op::Load { mem, buf: b3, lane: (lane + 3) & 7 });
+        let s01 = k_u8.push(Op::Add(v0, v1));
+        let s23 = k_u8.push(Op::Sub(v2, v3));
+        let mix = k_u8.push(Op::Add(s01, s23));
+        let fin = k_u8.push(Op::Add(mix, ring[(lane & 1) as usize]));
+        k_u8.add_output(out, lane, fin);
+    }
+
+    let u8_blocks = 4usize;
+    let mut rng = SplitMix64(0x0808_511D_11F0_0001);
+    let mk_u8 = |r: &mut SplitMix64| -> Vec<i64> {
+        (0..u8_blocks * 8)
+            .map(|i| match i % 7 {
+                0 => 0x00,
+                1 => 0x7F,
+                2 => 0x80,
+                3 => 0xFE,
+                4 => 0xFF,
+                _ => r.range(0, 255),
+            })
+            .collect()
+    };
+    let d0 = mk_u8(&mut rng);
+    let d1 = mk_u8(&mut rng);
+    let d2 = mk_u8(&mut rng);
+    let d3 = mk_u8(&mut rng);
+    let dout = vec![0i64; u8_blocks * 8];
+    let u8_inputs: [&[i64]; 5] = [&d0, &d1, &d2, &d3, &dout];
+    let u8_exp = expected_multiblock_output_bytes(&k_u8, &u8_inputs, u8_blocks);
+
+    #[cfg(not(miri))]
+    {
+        let u8_exec = compile_standalone_elf_exec(&k_u8, budget, TargetIsa::X86_64, &u8_inputs)
+            .expect("compile 4-block u8_rex_sil_dil_pressure ET_EXEC");
+        verify_live_et_exec_readelf_objdump_and_run(&tmp, "u8_rex_sil_dil_pressure_4blk", &u8_exec, &u8_exp);
+
+        let bin_path = tmp.join("u8_rex_sil_dil_pressure_4blk");
+        let od = Command::new("objdump")
+            .args(["-d", "-M", "intel"])
+            .arg(&bin_path)
+            .output()
+            .expect("objdump u8_rex_sil_dil_pressure");
+        assert!(od.status.success());
+        let asm = String::from_utf8_lossy(&od.stdout);
+        for line in asm.lines() {
+            let mut parts = line.split('\t');
+            let Some(_) = parts.next() else { continue; };
+            if parts.next().is_none() { continue; }
+            let Some(insn_txt) = parts.next() else { continue; };
+            let clean = insn_txt.split('#').next().unwrap_or("");
+            for tok in clean.split(|c: char| !c.is_ascii_alphanumeric()) {
+                assert!(
+                    !matches!(tok, "ah" | "ch" | "dh" | "bh"),
+                    "u8_rex_sil_dil_pressure emitted illegal high-8-bit register {tok} (missing REX prefix!) in:\n{line}"
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+    #[cfg(miri)]
+    {
+        assert_eq!(u8_exp.len(), u8_blocks * 8);
     }
 }

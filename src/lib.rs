@@ -35,9 +35,19 @@ pub mod rust_fe;
 
 pub use codegen::{emit_rust, schedule_and_verify, RegBudget, ScheduleReport};
 pub use egraph::optimize_kernel;
-pub use elf64::{emit_elf64_object, verify_elf64_object, ElfReloc, ElfSummary, ElfSymbol, TargetIsa, EM_AARCH64, EM_X86_64};
-pub use ir::{barrett_params, BufAccess, BufDecl, CmpKind, CompileError, Domain, IrOp, Kernel, KernelCost, NodeId, Op, OutputWrite, LANES};
-pub use isa::{allocate_registers, compile_kernel_direct, compile_rust_to_elf, emit_kernel_elf, CompiledObject, RegAlloc};
+pub use elf64::{
+    elf64_exec_data_vaddr, emit_elf64_executable, emit_elf64_object, verify_elf64_executable,
+    verify_elf64_object, ElfExecSummary, ElfReloc, ElfSummary, ElfSymbol, TargetIsa,
+    ELF_EXEC_BASE, ELF_EXEC_TEXT_OFF, ELF_EXEC_TEXT_VADDR, EM_AARCH64, EM_X86_64, ET_EXEC, ET_REL,
+};
+pub use ir::{
+    barrett_params, BufAccess, BufDecl, CmpKind, CompileError, Domain, ElemTy, IrOp, Kernel,
+    KernelCost, NodeId, Op, OutputWrite, LANES,
+};
+pub use isa::{
+    allocate_registers, compile_kernel_direct, compile_rust_to_elf, compile_rust_to_elf_exec,
+    compile_standalone_elf_exec, emit_kernel_elf, CompiledObject, RegAlloc, StandaloneExec,
+};
 pub use ntf1::{emit_ntf1, export_kernel_ntf1, parse_ntf1, verify_ntf1_airlock, Ntf1Error, Ntf1Spec, Ntf1Stmt};
 pub use rust_fe::{compile_rust_source, parse_rust_kernel};
 

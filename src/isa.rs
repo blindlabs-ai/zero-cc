@@ -1,8 +1,12 @@
 use std::fmt::Write as _;
 
 use crate::codegen::{schedule_and_verify, RegBudget, ScheduleReport};
-use crate::elf64::{emit_elf64_object, verify_elf64_object, ElfReloc, ElfSymbol, TargetIsa, R_AARCH64_CALL26, R_X86_64_PLT32};
-use crate::ir::{BufAccess, CmpKind, CompileError, Domain, Kernel, NodeId, Op, LANES};
+use crate::elf64::{
+    elf64_exec_data_vaddr, emit_elf64_executable, emit_elf64_object, verify_elf64_executable,
+    verify_elf64_object, ElfReloc, ElfSymbol, TargetIsa, ELF_EXEC_TEXT_VADDR, R_AARCH64_CALL26,
+    R_X86_64_PLT32,
+};
+use crate::ir::{BufAccess, CmpKind, CompileError, Domain, ElemTy, Kernel, NodeId, Op, LANES};
 use crate::optimize_kernel;
 use crate::rust_fe::parse_rust_kernel;
 
@@ -25,14 +29,27 @@ pub struct CompiledObject {
     pub zero_spills: bool, pub rust_ffi_shim: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct StandaloneExec {
+    pub isa: TargetIsa, pub kernel_sym: String, pub batch_sym: String, pub entry_sym: String,
+    pub entry_vaddr: u64, pub data_vaddr: u64, pub code_bytes: Vec<u8>, pub elf_bytes: Vec<u8>,
+    pub direct_insns: usize, pub shim_glue_insns: usize, pub direct_share_pct: u8,
+    pub zero_spills: bool, pub blocks: usize, pub output_bytes: usize,
+}
+
 fn berr(msg: impl Into<String>) -> CompileError { CompileError::BackendError(msg.into()) }
 fn is_inline(op: Op<NodeId>) -> bool { matches!(op, Op::MemInit | Op::Const(_) | Op::Store { .. }) }
+
+/// @domain reg: 0..=15, idx: 0..=15, base: 0..=15
+pub const fn x86_rex_byte(w: bool, reg: u8, idx: u8, base: u8) -> u8 {
+    0x40 | (if w { 8 } else { 0 }) | (((reg >> 3) & 1) << 2) | (((idx >> 3) & 1) << 1) | ((base >> 3) & 1)
+}
 
 /// @domain reg: 0..=15, rm: 0..=15
 pub const fn x86_rex_w(reg: u8, rm: u8) -> u8 { 0x48 | (((reg >> 3) & 1) << 2) | ((rm >> 3) & 1) }
 
 /// @domain reg: 0..=15, idx: 0..=15, base: 0..=15
-pub const fn x86_rex_sib(reg: u8, idx: u8, base: u8) -> u8 { 0x48 | (((reg >> 3) & 1) << 2) | (((idx >> 3) & 1) << 1) | ((base >> 3) & 1) }
+pub const fn x86_rex_sib(reg: u8, idx: u8, base: u8) -> u8 { x86_rex_byte(true, reg, idx, base) }
 
 /// @domain md: 0..=3, reg: 0..=15, rm: 0..=15
 pub const fn x86_modrm(md: u8, reg: u8, rm: u8) -> u8 { ((md & 3) << 6) | ((reg & 7) << 3) | (rm & 7) }
@@ -129,22 +146,26 @@ impl X86Emit {
     fn new() -> Self { Self { code: Vec::with_capacity(512), insns: 0 } }
     fn push_rr(&mut self, op: u8, reg: u8, rm: u8) { self.code.extend_from_slice(&[x86_rex_w(reg, rm), op, x86_modrm(3, reg, rm)]); self.insns += 1; }
     fn mov_rr(&mut self, dst: u8, src: u8) { if dst != src { self.push_rr(0x89, src, dst); } }
+    fn movabs_imm64(&mut self, dst: u8, val: u64) {
+        self.code.extend_from_slice(&[x86_rex_w(0, dst), 0xB8 + (dst & 7)]);
+        self.code.extend_from_slice(&val.to_le_bytes());
+        self.insns += 1;
+    }
     fn mov_imm(&mut self, dst: u8, v: i64) {
         if v == 0 {
             let hi = (dst >> 3) & 1;
             if hi != 0 { self.code.push(0x40 | (hi << 2) | hi); }
             self.code.extend_from_slice(&[0x31, x86_modrm(3, dst, dst)]);
+            self.insns += 1;
         } else if let Ok(v32) = i32::try_from(v) {
             self.code.extend_from_slice(&[x86_rex_w(0, dst), 0xC7, x86_modrm(3, 0, dst)]);
             self.code.extend_from_slice(&v32.to_le_bytes());
+            self.insns += 1;
         } else {
-            self.code.extend_from_slice(&[x86_rex_w(0, dst), 0xB8 + (dst & 7)]);
-            self.code.extend_from_slice(&v.to_le_bytes());
+            self.movabs_imm64(dst, v as u64);
         }
-        self.insns += 1;
     }
-    fn mem_disp(&mut self, op: u8, reg: u8, base: u8, disp: i32) {
-        self.code.push(x86_rex_w(reg, base)); self.code.push(op);
+    fn push_mem_disp(&mut self, reg: u8, base: u8, disp: i32) {
         let b7 = base & 7;
         if disp == 0 && b7 != 5 {
             self.code.push(x86_modrm(0, reg, base));
@@ -160,12 +181,49 @@ impl X86Emit {
         }
         self.insns += 1;
     }
-    fn load_lut(&mut self, dst: u8, base: u8, idx: u8) {
-        self.code.extend_from_slice(&[x86_rex_sib(dst, idx, base), 0x8B]);
+    fn push_load_prefix_opc(&mut self, ty: ElemTy, dst: u8, idx: u8, base: u8) {
+        let need_w = matches!(ty, ElemTy::I64 | ElemTy::I32 | ElemTy::I16);
+        if need_w || dst >= 8 || idx >= 8 || base >= 8 {
+            self.code.push(x86_rex_byte(need_w, dst, idx, base));
+        }
+        match ty {
+            ElemTy::I64 | ElemTy::U32 => self.code.push(0x8B),
+            ElemTy::I32 => self.code.push(0x63),
+            ElemTy::I16 => self.code.extend_from_slice(&[0x0F, 0xBF]),
+            ElemTy::U16 => self.code.extend_from_slice(&[0x0F, 0xB7]),
+            ElemTy::U8 => self.code.extend_from_slice(&[0x0F, 0xB6]),
+        }
+    }
+    fn load_lane(&mut self, ty: ElemTy, dst: u8, base: u8, lane: u8) {
+        self.push_load_prefix_opc(ty, dst, 0, base);
+        self.push_mem_disp(dst, base, i32::from(lane) * i32::from(ty.bytes()));
+    }
+    fn store_lane(&mut self, ty: ElemTy, src: u8, base: u8, lane: u8) {
+        match ty {
+            ElemTy::I64 => self.code.extend_from_slice(&[x86_rex_w(src, base), 0x89]),
+            ElemTy::I32 | ElemTy::U32 => {
+                if src >= 8 || base >= 8 { self.code.push(x86_rex_byte(false, src, 0, base)); }
+                self.code.push(0x89);
+            }
+            ElemTy::I16 | ElemTy::U16 => {
+                self.code.push(0x66);
+                if src >= 8 || base >= 8 { self.code.push(x86_rex_byte(false, src, 0, base)); }
+                self.code.push(0x89);
+            }
+            ElemTy::U8 => {
+                if src >= 4 || base >= 8 { self.code.push(x86_rex_byte(false, src, 0, base)); }
+                self.code.push(0x88);
+            }
+        }
+        self.push_mem_disp(src, base, i32::from(lane) * i32::from(ty.bytes()));
+    }
+    fn load_lut(&mut self, ty: ElemTy, dst: u8, base: u8, idx: u8) {
+        self.push_load_prefix_opc(ty, dst, idx, base);
+        let scale = ty.scale_shift();
         if (base & 7) == 5 {
-            self.code.extend_from_slice(&[x86_modrm(1, dst, 4), x86_sib(3, idx, base), 0]);
+            self.code.extend_from_slice(&[x86_modrm(1, dst, 4), x86_sib(scale, idx, base), 0]);
         } else {
-            self.code.extend_from_slice(&[x86_modrm(0, dst, 4), x86_sib(3, idx, base)]);
+            self.code.extend_from_slice(&[x86_modrm(0, dst, 4), x86_sib(scale, idx, base)]);
         }
         self.insns += 1;
     }
@@ -205,15 +263,19 @@ fn resolve_node_reg(kernel: &Kernel, ra: &RegAlloc, id: NodeId, scratch: u8, mut
     }
 }
 
+fn buf_elem_ty(kernel: &Kernel, buf: u8) -> Result<ElemTy, CompileError> {
+    kernel.bufs.get(buf as usize).map(|b| b.elem_ty).ok_or(CompileError::InvalidBuffer(buf))
+}
+
 fn drain_scheduled_outputs(
     kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, oc: &mut usize, step: Option<usize>,
-    mut emit_store: impl FnMut(u8, u8, NodeId) -> Result<(), CompileError>,
+    mut emit_store: impl FnMut(ElemTy, u8, u8, NodeId) -> Result<(), CompileError>,
 ) -> Result<(), CompileError> {
     while let Some(&(ostep, oi)) = sched.output_order.get(*oc) {
         if step.is_some_and(|st| ostep != st) { break; }
         let o = kernel.outputs.get(oi).copied().ok_or(CompileError::InvalidNode(oi))?;
         let breg = *ra.buf_reg.get(o.buf as usize).ok_or(CompileError::InvalidBuffer(o.buf))?;
-        emit_store(breg, o.lane, o.val)?;
+        emit_store(buf_elem_ty(kernel, o.buf)?, breg, o.lane, o.val)?;
         *oc += 1;
     }
     Ok(())
@@ -296,6 +358,9 @@ fn match_vec4(
 
 fn try_plan_avx2(k: &Kernel, sched: &ScheduleReport, doms: &[Domain], max_vecs: usize) -> Option<Vec<AvxStep>> {
     if k.outputs.len() != LANES { return None; }
+    if k.bufs.iter().any(|b| b.elem_ty != ElemTy::I64 || (!matches!(b.access, BufAccess::LookupTable(_)) && usize::from(b.lanes) != LANES)) {
+        return None;
+    }
     if sched.order.iter().any(|&id| matches!(k.nodes.get(id), Some(Op::Store { .. })) || matches!(k.nodes.get(id), Some(&Op::Load { mem, .. }) if k.nodes.get(mem).copied() != Some(Op::MemInit))) {
         return None;
     }
@@ -380,33 +445,35 @@ fn emit_x86_div_rem(e: &mut X86Emit, dst: u8, ra: u8, rb: u8, is_rem: bool) {
 fn emit_x86_body(e: &mut X86Emit, kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms: &[Domain]) -> Result<(), CompileError> {
     let mut oc = 0usize;
     for (step, &id) in sched.order.iter().enumerate() {
-        drain_scheduled_outputs(kernel, sched, ra, &mut oc, Some(step), |breg, lane, val| {
+        drain_scheduled_outputs(kernel, sched, ra, &mut oc, Some(step), |ty, breg, lane, val| {
             let vreg = x86_val_into(e, kernel, ra, val, 0)?;
-            e.mem_disp(0x89, vreg, breg, i32::from(lane) * 8);
+            e.store_lane(ty, vreg, breg, lane);
             Ok(())
         })?;
         let op = kernel.nodes.get(id).copied().ok_or(CompileError::InvalidNode(id))?;
         if let Op::Store { buf, lane, val, .. } = op {
             let breg = *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
             let vreg = x86_val_into(e, kernel, ra, val, 0)?;
-            e.mem_disp(0x89, vreg, breg, i32::from(lane) * 8);
+            e.store_lane(buf_elem_ty(kernel, buf)?, vreg, breg, lane);
             continue;
         }
         if matches!(op, Op::MemInit | Op::Const(_)) { continue; }
         let dst = ra.node_reg.get(id).and_then(|&r| r).ok_or(CompileError::InvalidNode(id))?;
         match op {
-            Op::Load { buf, lane, .. } => e.mem_disp(0x8B, dst, *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?, i32::from(lane) * 8),
+            Op::Load { buf, lane, .. } => {
+                let breg = *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
+                e.load_lane(buf_elem_ty(kernel, buf)?, dst, breg, lane);
+            }
             Op::LoadLut { buf, idx } => {
                 let (breg, ireg) = (*ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?, x86_val_into(e, kernel, ra, idx, 0)?);
-                let Some(BufAccess::LookupTable(len)) = kernel.bufs.get(buf as usize).map(|b| b.access) else {
-                    return Err(CompileError::InvalidBuffer(buf));
-                };
+                let b = kernel.bufs.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
+                let BufAccess::LookupTable(len) = b.access else { return Err(CompileError::InvalidBuffer(buf)); };
                 let d = doms.get(idx).copied().unwrap_or_else(Domain::top);
                 if d.is_empty() || d.lo < 0 || d.hi >= len as i64 {
                     e.mov_imm(11, len as i64); e.push_rr(0x39, 11, ireg);
                     e.code.extend_from_slice(&[0x72, 0x02]); e.insns += 1; e.ud2();
                 }
-                e.load_lut(dst, breg, ireg);
+                e.load_lut(b.elem_ty, dst, breg, ireg);
             }
             Op::BoundsCheck { idx, limit } => {
                 let ireg = x86_val_into(e, kernel, ra, idx, 0)?;
@@ -470,9 +537,9 @@ fn emit_x86_body(e: &mut X86Emit, kernel: &Kernel, sched: &ScheduleReport, ra: &
             Op::MemInit | Op::Const(_) | Op::Store { .. } => {}
         }
     }
-    drain_scheduled_outputs(kernel, sched, ra, &mut oc, None, |breg, lane, val| {
+    drain_scheduled_outputs(kernel, sched, ra, &mut oc, None, |ty, breg, lane, val| {
         let vreg = x86_val_into(e, kernel, ra, val, 0)?;
-        e.mem_disp(0x89, vreg, breg, i32::from(lane) * 8);
+        e.store_lane(ty, vreg, breg, lane);
         Ok(())
     })
 }
@@ -518,7 +585,7 @@ fn emit_x86_module(kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms:
         e.code.extend_from_slice(&0i32.to_le_bytes()); e.insns += 1;
         relocs.push(ElfReloc { offset: rel_off, sym_idx: 0, r_type: R_X86_64_PLT32, addend: -4 });
         for (&bs, b) in bsaved.iter().zip(kernel.bufs.iter()) {
-            if !matches!(b.access, BufAccess::LookupTable(_)) { e.op_imm8(0x83, 0, bs, 64, false); }
+            if !matches!(b.access, BufAccess::LookupTable(_)) { e.op_imm8(0x83, 0, bs, b.block_bytes() as u8, false); }
         }
         e.op_imm8(0x83, 0, c_hold, 0xFF, false);
         let back = (loop_top as isize) - ((e.code.len() + 6) as isize);
@@ -542,7 +609,7 @@ fn emit_x86_module(kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms:
             emit_x86_body(&mut e, kernel, sched, ra, doms)?;
         }
         for (&br, b) in ra.buf_reg.iter().zip(kernel.bufs.iter()) {
-            if !matches!(b.access, BufAccess::LookupTable(_)) { e.op_imm8(0x83, 0, br, 64, false); }
+            if !matches!(b.access, BufAccess::LookupTable(_)) { e.op_imm8(0x83, 0, br, b.block_bytes() as u8, false); }
         }
         e.op_imm8(0x83, 0, cnt_reg, 0xFF, false);
         let back = (loop_top as isize) - ((e.code.len() + 6) as isize);
@@ -567,17 +634,40 @@ impl ArmEmit {
     fn new() -> Self { Self { code: Vec::with_capacity(512), insns: 0 } }
     fn put(&mut self, w: u32) { self.code.extend_from_slice(&w.to_le_bytes()); self.insns += 1; }
     fn mov_rr(&mut self, dst: u8, src: u8) { if dst != src { self.put(arm64_rrr(0xAA00_0000, src, 0, 31, dst)); } }
-    fn mov_imm(&mut self, dst: u8, v: i64) {
-        let u = v as u64;
+    fn mov_imm_u64(&mut self, dst: u8, u: u64, fixed: bool) {
         self.put(0xD280_0000 | (((u & 0xFFFF) as u32) << 5) | (dst as u32 & 31));
         for hw in 1..4u32 {
             let part = (u >> (hw * 16)) & 0xFFFF;
-            if part != 0 { self.put(0xF280_0000 | (hw << 21) | ((part as u32) << 5) | (dst as u32 & 31)); }
+            if fixed || part != 0 { self.put(0xF280_0000 | (hw << 21) | ((part as u32) << 5) | (dst as u32 & 31)); }
         }
     }
-    fn ldr_lane(&mut self, dst: u8, base: u8, lane: u8) { self.put(arm64_imm12(0xF940_0000, u16::from(lane), base, dst)); }
-    fn str_lane(&mut self, src: u8, base: u8, lane: u8) { self.put(arm64_imm12(0xF900_0000, u16::from(lane), base, src)); }
-    fn ldr_lut(&mut self, dst: u8, base: u8, idx: u8) { self.put(arm64_rrr(0xF860_0000, idx, 0x7800, base, dst)); }
+    fn mov_imm(&mut self, dst: u8, v: i64) { self.mov_imm_u64(dst, v as u64, false); }
+    fn mov_imm64_fixed(&mut self, dst: u8, u: u64) { self.mov_imm_u64(dst, u, true); }
+    fn ldst_lane(&mut self, ty: ElemTy, reg: u8, base: u8, lane: u8, store: bool) {
+        let op_hi = match (store, ty) {
+            (false, ElemTy::I64) => 0xF940_0000,
+            (false, ElemTy::I32) => 0xB980_0000,
+            (false, ElemTy::I16) => 0x7980_0000,
+            (false, ElemTy::U32) => 0xB940_0000,
+            (false, ElemTy::U16) => 0x7940_0000,
+            (false, ElemTy::U8) => 0x3940_0000,
+            (true, ElemTy::I64) => 0xF900_0000,
+            (true, ElemTy::I32 | ElemTy::U32) => 0xB900_0000,
+            (true, ElemTy::I16 | ElemTy::U16) => 0x7900_0000,
+            (true, ElemTy::U8) => 0x3900_0000,
+        };
+        self.put(arm64_imm12(op_hi, u16::from(lane), base, reg));
+    }
+    fn ldr_lane(&mut self, ty: ElemTy, dst: u8, base: u8, lane: u8) { self.ldst_lane(ty, dst, base, lane, false); }
+    fn str_lane(&mut self, ty: ElemTy, src: u8, base: u8, lane: u8) { self.ldst_lane(ty, src, base, lane, true); }
+    fn ldr_lut(&mut self, ty: ElemTy, dst: u8, base: u8, idx: u8) {
+        let (op_hi, mid) = match ty {
+            ElemTy::I64 => (0xF860_0000, 0x7800), ElemTy::I32 => (0xB8A0_0000, 0x7800),
+            ElemTy::I16 => (0x78A0_0000, 0x7800), ElemTy::U32 => (0xB860_0000, 0x7800),
+            ElemTy::U16 => (0x7860_0000, 0x7800), ElemTy::U8 => (0x3860_0000, 0x6800),
+        };
+        self.put(arm64_rrr(op_hi, idx, mid, base, dst));
+    }
 }
 
 fn arm_val(e: &mut ArmEmit, kernel: &Kernel, ra: &RegAlloc, id: NodeId, scratch: u8) -> Result<u8, CompileError> {
@@ -587,33 +677,35 @@ fn arm_val(e: &mut ArmEmit, kernel: &Kernel, ra: &RegAlloc, id: NodeId, scratch:
 fn emit_arm_body(e: &mut ArmEmit, kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms: &[Domain]) -> Result<(), CompileError> {
     let mut oc = 0usize;
     for (step, &id) in sched.order.iter().enumerate() {
-        drain_scheduled_outputs(kernel, sched, ra, &mut oc, Some(step), |breg, lane, val| {
+        drain_scheduled_outputs(kernel, sched, ra, &mut oc, Some(step), |ty, breg, lane, val| {
             let vreg = arm_val(e, kernel, ra, val, 16)?;
-            e.str_lane(vreg, breg, lane);
+            e.str_lane(ty, vreg, breg, lane);
             Ok(())
         })?;
         let op = kernel.nodes.get(id).copied().ok_or(CompileError::InvalidNode(id))?;
         if let Op::Store { buf, lane, val, .. } = op {
             let breg = *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
             let vreg = arm_val(e, kernel, ra, val, 16)?;
-            e.str_lane(vreg, breg, lane);
+            e.str_lane(buf_elem_ty(kernel, buf)?, vreg, breg, lane);
             continue;
         }
         if matches!(op, Op::MemInit | Op::Const(_)) { continue; }
         let dst = ra.node_reg.get(id).and_then(|&r| r).ok_or(CompileError::InvalidNode(id))?;
         match op {
-            Op::Load { buf, lane, .. } => e.ldr_lane(dst, *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?, lane),
+            Op::Load { buf, lane, .. } => {
+                let breg = *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
+                e.ldr_lane(buf_elem_ty(kernel, buf)?, dst, breg, lane);
+            }
             Op::LoadLut { buf, idx } => {
                 let (breg, ireg) = (*ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?, arm_val(e, kernel, ra, idx, 16)?);
-                let Some(BufAccess::LookupTable(len)) = kernel.bufs.get(buf as usize).map(|b| b.access) else {
-                    return Err(CompileError::InvalidBuffer(buf));
-                };
+                let b = kernel.bufs.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
+                let BufAccess::LookupTable(len) = b.access else { return Err(CompileError::InvalidBuffer(buf)); };
                 let d = doms.get(idx).copied().unwrap_or_else(Domain::top);
                 if d.is_empty() || d.lo < 0 || d.hi >= len as i64 {
                     e.mov_imm(17, len as i64); e.put(arm64_rrr(0xEB00_0000, 17, 0, ireg, 31));
                     e.put(0x5400_0043); e.put(0xD420_0000);
                 }
-                e.ldr_lut(dst, breg, ireg);
+                e.ldr_lut(b.elem_ty, dst, breg, ireg);
             }
             Op::BoundsCheck { idx, limit } => {
                 let ireg = arm_val(e, kernel, ra, idx, 16)?;
@@ -678,9 +770,9 @@ fn emit_arm_body(e: &mut ArmEmit, kernel: &Kernel, sched: &ScheduleReport, ra: &
             Op::MemInit | Op::Const(_) | Op::Store { .. } => {}
         }
     }
-    drain_scheduled_outputs(kernel, sched, ra, &mut oc, None, |breg, lane, val| {
+    drain_scheduled_outputs(kernel, sched, ra, &mut oc, None, |ty, breg, lane, val| {
         let vreg = arm_val(e, kernel, ra, val, 16)?;
-        e.str_lane(vreg, breg, lane);
+        e.str_lane(ty, vreg, breg, lane);
         Ok(())
     })
 }
@@ -727,7 +819,7 @@ fn emit_arm_module(kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms:
         e.put(0x9400_0000);
         relocs.push(ElfReloc { offset: bl_off, sym_idx: 0, r_type: R_AARCH64_CALL26, addend: 0 });
         for (i, b) in kernel.bufs.iter().enumerate() {
-            if !matches!(b.access, BufAccess::LookupTable(_)) { e.put(arm64_imm12(0x9100_0000, 64, 19 + i as u8, 19 + i as u8)); }
+            if !matches!(b.access, BufAccess::LookupTable(_)) { e.put(arm64_imm12(0x9100_0000, b.block_bytes() as u16, 19 + i as u8, 19 + i as u8)); }
         }
         e.put(arm64_imm12(0xF100_0000, 1, c_hold, c_hold));
         let back_words = ((loop_top as isize) - (e.code.len() as isize)) / 4;
@@ -744,7 +836,7 @@ fn emit_arm_module(kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms:
         let loop_top = e.code.len();
         emit_arm_body(&mut e, kernel, sched, ra, doms)?;
         for (i, b) in kernel.bufs.iter().enumerate() {
-            if !matches!(b.access, BufAccess::LookupTable(_)) { e.put(arm64_imm12(0x9100_0000, 64, i as u8, i as u8)); }
+            if !matches!(b.access, BufAccess::LookupTable(_)) { e.put(arm64_imm12(0x9100_0000, b.block_bytes() as u16, i as u8, i as u8)); }
         }
         e.put(arm64_imm12(0xF100_0000, 1, cnt_reg, cnt_reg));
         let back_words = ((loop_top as isize) - (e.code.len() as isize)) / 4;
@@ -766,21 +858,22 @@ fn emit_arm_module(kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms:
 fn emit_ffi_shim(kernel: &Kernel, ksym: &str, bsym: &str) -> (String, usize) {
     let (mut c_args, mut k_params, mut k_call, mut b_params, mut b_call, mut lbufs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for b in &kernel.bufs {
+        let (ty, n) = (b.elem_ty.rust_name(), b.lanes);
         match b.access {
             BufAccess::ReadOnly => {
-                c_args.push(format!("{}: *const [i64; {LANES}]", b.name));
-                k_params.push(format!("{}: &[i64; {LANES}]", b.name)); k_call.push(format!("{}.as_ptr().cast()", b.name));
-                b_params.push(format!("{}: &[[i64; {LANES}]]", b.name)); b_call.push(format!("{}.as_ptr()", b.name)); lbufs.push(b.name.as_str());
+                c_args.push(format!("{}: *const [{ty}; {n}]", b.name));
+                k_params.push(format!("{}: &[{ty}; {n}]", b.name)); k_call.push(format!("{}.as_ptr().cast()", b.name));
+                b_params.push(format!("{}: &[[{ty}; {n}]]", b.name)); b_call.push(format!("{}.as_ptr()", b.name)); lbufs.push(b.name.as_str());
             }
             BufAccess::MutNoAlias => {
-                c_args.push(format!("{}: *mut [i64; {LANES}]", b.name));
-                k_params.push(format!("{}: &mut [i64; {LANES}]", b.name)); k_call.push(format!("{}.as_mut_ptr().cast()", b.name));
-                b_params.push(format!("{}: &mut [[i64; {LANES}]]", b.name)); b_call.push(format!("{}.as_mut_ptr()", b.name)); lbufs.push(b.name.as_str());
+                c_args.push(format!("{}: *mut [{ty}; {n}]", b.name));
+                k_params.push(format!("{}: &mut [{ty}; {n}]", b.name)); k_call.push(format!("{}.as_mut_ptr().cast()", b.name));
+                b_params.push(format!("{}: &mut [[{ty}; {n}]]", b.name)); b_call.push(format!("{}.as_mut_ptr()", b.name)); lbufs.push(b.name.as_str());
             }
             BufAccess::LookupTable(len) => {
-                c_args.push(format!("{}: *const i64", b.name));
-                k_params.push(format!("{}: &[i64; {len}]", b.name)); k_call.push(format!("{}.as_ptr()", b.name));
-                b_params.push(format!("{}: &[i64; {len}]", b.name)); b_call.push(format!("{}.as_ptr()", b.name));
+                c_args.push(format!("{}: *const {ty}", b.name));
+                k_params.push(format!("{}: &[{ty}; {len}]", b.name)); k_call.push(format!("{}.as_ptr()", b.name));
+                b_params.push(format!("{}: &[{ty}; {len}]", b.name)); b_call.push(format!("{}.as_ptr()", b.name));
             }
         }
     }
@@ -795,17 +888,145 @@ fn emit_ffi_shim(kernel: &Kernel, ksym: &str, bsym: &str) -> (String, usize) {
     (s, glue_insns)
 }
 
-/// Lower an already-validated `Kernel` (with optional E-Graph pass) directly into a standalone `ELF64` `.o`.
-pub fn emit_kernel_elf(kernel: &Kernel, budget: RegBudget, isa: TargetIsa, optimize: bool, call_batch: bool) -> Result<CompiledObject, CompileError> {
+type PackedExecData = (Vec<u8>, Vec<u64>, usize, Option<(u64, usize)>);
+
+fn pack_exec_data(kernel: &Kernel, inputs: &[&[i64]]) -> Result<PackedExecData, CompileError> {
+    let blocks = if inputs.is_empty() {
+        1usize
+    } else {
+        if inputs.len() != kernel.bufs.len() { return Err(CompileError::InvalidBuffer(inputs.len() as u8)); }
+        let mut blk_opt: Option<usize> = None;
+        for (b, slice) in kernel.bufs.iter().zip(inputs.iter()) {
+            match b.access {
+                BufAccess::LookupTable(len) => {
+                    if slice.len() < len { return Err(CompileError::OutOfBounds { idx: slice.len() as i64, limit: len as i64 }); }
+                }
+                _ => {
+                    let lanes = usize::from(b.lanes);
+                    if lanes == 0 || slice.len() % lanes != 0 { return Err(berr("standalone input length not multiple of lanes")); }
+                    let nb = slice.len() / lanes;
+                    if let Some(prev) = blk_opt {
+                        if prev != nb { return Err(berr("standalone inputs have mismatched block counts")); }
+                    } else {
+                        blk_opt = Some(nb);
+                    }
+                }
+            }
+        }
+        blk_opt.unwrap_or(1)
+    };
+    let (mut data, mut buf_offs, mut primary_out) = (Vec::new(), Vec::with_capacity(kernel.bufs.len()), None);
+    for (idx, b) in kernel.bufs.iter().enumerate() {
+        while data.len() % 64 != 0 { data.push(0); }
+        let off = data.len() as u64;
+        buf_offs.push(off);
+        let elem_count = match b.access {
+            BufAccess::LookupTable(len) => len,
+            _ => blocks.saturating_mul(usize::from(b.lanes)),
+        };
+        if inputs.is_empty() {
+            for _ in 0..elem_count { b.elem_ty.push_le_elem(&mut data, 0); }
+        } else if let Some(slice) = inputs.get(idx) {
+            for &v in slice.iter().take(elem_count) { b.elem_ty.push_le_elem(&mut data, v); }
+        }
+        if b.access == BufAccess::MutNoAlias && primary_out.is_none() {
+            primary_out = Some((off, blocks.saturating_mul(b.block_bytes())));
+        }
+    }
+    Ok((data, buf_offs, blocks, primary_out))
+}
+
+fn emit_x86_start(start_off: usize, b_off: u64, data_vaddr: u64, buf_offs: &[u64], blocks: usize, primary_out: Option<(u64, usize)>) -> Result<(Vec<u8>, usize), CompileError> {
+    let mut e = X86Emit::new();
+    e.code.extend_from_slice(&[0x48, 0x83, 0xE4, 0xF0]); e.insns += 1;
+    for (i, &boff) in buf_offs.iter().enumerate() {
+        let arg = *X86_ARGS.get(i).ok_or_else(|| berr("x86_64 _start arg overflow"))?;
+        e.movabs_imm64(arg, data_vaddr.saturating_add(boff));
+    }
+    let cnt_reg = *X86_ARGS.get(buf_offs.len()).ok_or_else(|| berr("x86_64 _start count reg overflow"))?;
+    e.movabs_imm64(cnt_reg, blocks as u64);
+    let call_end = start_off + e.code.len() + 5;
+    let rel = (b_off as isize) - (call_end as isize);
+    e.code.push(0xE8); e.code.extend_from_slice(&(rel as i32).to_le_bytes()); e.insns += 1;
+
+    if let Some((out_off, out_bytes)) = primary_out.filter(|&(_, n)| n > 0) {
+        e.movabs_imm64(6, data_vaddr.saturating_add(out_off));
+        e.movabs_imm64(2, out_bytes as u64);
+        e.code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); e.insns += 1;
+        e.code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]); e.insns += 1;
+        e.code.extend_from_slice(&[0x0F, 0x05]); e.insns += 1;
+        e.code.extend_from_slice(&[0x31, 0xFF]); e.insns += 1;
+        e.code.extend_from_slice(&[0x31, 0xC9]); e.insns += 1;
+        let loop_top = e.code.len();
+        e.code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x0E]); e.insns += 1;
+        e.code.extend_from_slice(&[0x01, 0xC7]); e.insns += 1;
+        e.code.extend_from_slice(&[0x48, 0xFF, 0xC1]); e.insns += 1;
+        e.code.extend_from_slice(&[0x48, 0x39, 0xD1]); e.insns += 1;
+        let rel8 = (loop_top as isize) - ((e.code.len() + 2) as isize);
+        e.code.extend_from_slice(&[0x72, rel8 as u8]); e.insns += 1;
+        e.code.extend_from_slice(&[0x83, 0xE7, 0x7F]); e.insns += 1;
+    } else {
+        e.code.extend_from_slice(&[0x31, 0xFF]); e.insns += 1;
+    }
+    e.code.extend_from_slice(&[0xB8, 0x3C, 0x00, 0x00, 0x00]); e.insns += 1;
+    e.code.extend_from_slice(&[0x0F, 0x05]); e.insns += 1;
+    e.ud2();
+    Ok((e.code, e.insns))
+}
+
+fn emit_arm_start(start_off: usize, b_off: u64, data_vaddr: u64, buf_offs: &[u64], blocks: usize, primary_out: Option<(u64, usize)>) -> Result<(Vec<u8>, usize), CompileError> {
+    if buf_offs.len() > 7 { return Err(berr("aarch64 _start arg overflow")); }
+    let mut e = ArmEmit::new();
+    for (i, &boff) in buf_offs.iter().enumerate() {
+        e.mov_imm64_fixed(i as u8, data_vaddr.saturating_add(boff));
+    }
+    e.mov_imm64_fixed(buf_offs.len() as u8, blocks as u64);
+    let bl_words = ((b_off as isize) - ((start_off + e.code.len()) as isize)) / 4;
+    e.put(0x9400_0000 | ((bl_words as u32) & 0x03FF_FFFF));
+
+    if let Some((out_off, out_bytes)) = primary_out.filter(|&(_, n)| n > 0) {
+        e.mov_imm64_fixed(19, data_vaddr.saturating_add(out_off));
+        e.mov_imm64_fixed(20, out_bytes as u64);
+        e.put(0xD280_0020);
+        e.mov_rr(1, 19);
+        e.mov_rr(2, 20);
+        e.put(0xD280_0808);
+        e.put(0xD400_0001);
+        e.put(0xD280_0000);
+        e.put(0xD280_0001);
+        let loop_top = e.code.len();
+        e.put(arm64_rrr(0x3860_0000, 1, 0x6800, 19, 2));
+        e.put(arm64_rrr(0x8B00_0000, 2, 0, 0, 0));
+        e.put(arm64_imm12(0x9100_0000, 1, 1, 1));
+        e.put(arm64_rrr(0xEB00_0000, 20, 0, 1, 31));
+        let back_words = ((loop_top as isize) - (e.code.len() as isize)) / 4;
+        e.put(0x5400_0003 | (((back_words as u32) & 0x7_FFFF) << 5));
+        e.put(0x9240_1800);
+    } else {
+        e.put(0xD280_0000);
+    }
+    e.put(0xD280_0BA8);
+    e.put(0xD400_0001);
+    e.put(0xD420_0000);
+    Ok((e.code, e.insns))
+}
+
+fn lower_kernel_code(kernel: &Kernel, budget: RegBudget, isa: TargetIsa, optimize: bool, call_batch: bool) -> Result<(Kernel, RegAlloc, ModuleCode), CompileError> {
     kernel.validate()?;
     let lowered = if optimize { optimize_kernel(kernel)? } else { kernel.clone() };
     let sched = schedule_and_verify(&lowered, budget)?;
     let ra = allocate_registers(&lowered, &sched, isa, budget)?;
     let doms = lowered.infer_domains();
-    let (code_bytes, syms, relocs, direct_insns) = match isa {
+    let module = match isa {
         TargetIsa::X86_64 => emit_x86_module(&lowered, &sched, &ra, &doms, budget.max_vecs, call_batch)?,
         TargetIsa::Aarch64 => emit_arm_module(&lowered, &sched, &ra, &doms, call_batch)?,
     };
+    Ok((lowered, ra, module))
+}
+
+/// Lower an already-validated `Kernel` (with optional E-Graph pass) directly into a standalone `ELF64` `.o`.
+pub fn emit_kernel_elf(kernel: &Kernel, budget: RegBudget, isa: TargetIsa, optimize: bool, call_batch: bool) -> Result<CompiledObject, CompileError> {
+    let (lowered, ra, (code_bytes, syms, relocs, direct_insns)) = lower_kernel_code(kernel, budget, isa, optimize, call_batch)?;
     let elf_bytes = emit_elf64_object(isa, &code_bytes, &syms, &relocs)?;
     let summary = verify_elf64_object(&elf_bytes)?;
     if summary.machine != isa.e_machine() || !summary.has_nonexec_gnu_stack || summary.symbols.len() != 2 {
@@ -826,4 +1047,48 @@ pub fn compile_kernel_direct(kernel: &Kernel, budget: RegBudget, isa: TargetIsa)
 /// Compile raw safe-Rust `.rs` kernel source directly to a standalone `ELF64` `.o` object.
 pub fn compile_rust_to_elf(src: &str, budget: RegBudget, isa: TargetIsa) -> Result<CompiledObject, CompileError> {
     compile_kernel_direct(&parse_rust_kernel(src)?, budget, isa)
+}
+
+/// Compile a `Kernel` directly to a `100.0%` LLVM-free, static Linux `ELF64` `ET_EXEC` binary
+/// (`_start` -> `zero_cc_<name>_batch` -> `sys_write` primary output -> `sys_exit(byte_sum & 0x7F)`).
+pub fn compile_standalone_elf_exec(kernel: &Kernel, budget: RegBudget, isa: TargetIsa, inputs: &[&[i64]]) -> Result<StandaloneExec, CompileError> {
+    let (lowered, ra, (mut code_bytes, mut syms, _, mut direct_insns)) = lower_kernel_code(kernel, budget, isa, true, false)?;
+    let (data, buf_offs, blocks, primary_out) = pack_exec_data(&lowered, inputs)?;
+    match isa {
+        TargetIsa::X86_64 => while code_bytes.len() % 16 != 0 { code_bytes.push(0x90); },
+        TargetIsa::Aarch64 => while code_bytes.len() % 16 != 0 { code_bytes.extend_from_slice(&0xD503_201Fu32.to_le_bytes()); },
+    }
+    let b_off = syms.get(1).ok_or_else(|| berr("missing batch symbol"))?.offset;
+    let start_off = code_bytes.len();
+    let emit_start = |vaddr: u64| match isa {
+        TargetIsa::X86_64 => emit_x86_start(start_off, b_off, vaddr, &buf_offs, blocks, primary_out),
+        TargetIsa::Aarch64 => emit_arm_start(start_off, b_off, vaddr, &buf_offs, blocks, primary_out),
+    };
+    let (pass1, _) = emit_start(0)?;
+    let data_vaddr = elf64_exec_data_vaddr(start_off + pass1.len());
+    let (start_bytes, start_insns) = emit_start(data_vaddr)?;
+    if start_bytes.len() != pass1.len() { return Err(berr("standalone _start length invariance violated")); }
+    code_bytes.extend_from_slice(&start_bytes);
+    direct_insns += start_insns;
+    syms.push(ElfSymbol { name: String::from("_start"), offset: start_off as u64, size: start_bytes.len() as u64 });
+
+    let elf_bytes = emit_elf64_executable(isa, &code_bytes, start_off as u64, &data, 0, &syms)?;
+    let summary = verify_elf64_executable(&elf_bytes)?;
+    let entry_vaddr = ELF_EXEC_TEXT_VADDR + start_off as u64;
+    if summary.machine != isa.e_machine() || !summary.has_nonexec_gnu_stack || summary.symbols.len() != 3
+        || summary.entry_vaddr != entry_vaddr || summary.data_vaddr != data_vaddr
+    {
+        return Err(berr("elf64 exec airlock verification mismatch"));
+    }
+    let output_bytes = primary_out.map_or(0, |(_, n)| n);
+    Ok(StandaloneExec {
+        isa, kernel_sym: syms[0].name.clone(), batch_sym: syms[1].name.clone(), entry_sym: String::from("_start"),
+        entry_vaddr, data_vaddr, code_bytes, elf_bytes, direct_insns, shim_glue_insns: 0, direct_share_pct: 100,
+        zero_spills: ra.spills == 0, blocks, output_bytes,
+    })
+}
+
+/// Compile raw safe-Rust `.rs` kernel source directly into a `100.0%` LLVM-free static Linux `ELF64` `ET_EXEC` binary.
+pub fn compile_rust_to_elf_exec(src: &str, budget: RegBudget, isa: TargetIsa, inputs: &[&[i64]]) -> Result<StandaloneExec, CompileError> {
+    compile_standalone_elf_exec(&parse_rust_kernel(src)?, budget, isa, inputs)
 }
