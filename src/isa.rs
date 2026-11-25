@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use crate::codegen::{schedule_and_verify, RegBudget, ScheduleReport};
+use crate::codegen::{remat_readonly_loads, schedule_and_verify, RegBudget, ScheduleReport};
 use crate::elf64::{
     elf64_exec_data_vaddr, emit_elf64_executable, emit_elf64_object, verify_elf64_executable,
     verify_elf64_object, ElfReloc, ElfSymbol, TargetIsa, ELF_EXEC_TEXT_VADDR, R_AARCH64_CALL26,
@@ -107,7 +107,8 @@ pub fn allocate_registers(kernel: &Kernel, sched: &ScheduleReport, isa: TargetIs
     }
     for &(ostep, oi) in &sched.output_order {
         if let Some(o) = kernel.outputs.get(oi) {
-            if let Some(ls) = last_step.get_mut(o.val) { *ls = (*ls).max(ostep.saturating_add(1)); }
+            let need = if isa == TargetIsa::X86_64 { ostep } else { ostep.saturating_add(1) };
+            if let Some(ls) = last_step.get_mut(o.val) { *ls = (*ls).max(need); }
         }
     }
 
@@ -115,6 +116,14 @@ pub fn allocate_registers(kernel: &Kernel, sched: &ScheduleReport, isa: TargetIs
     let (mut node_reg, mut active, mut used_callee) = (vec![None; n], Vec::<(NodeId, u8)>::new(), Vec::new());
     for (step, &id) in sched.order.iter().enumerate() {
         let op = kernel.nodes.get(id).copied().ok_or(CompileError::InvalidNode(id))?;
+        let reuse_dying = isa == TargetIsa::X86_64;
+        if reuse_dying {
+            let mut i = 0usize;
+            while i < active.len() {
+                let (aid, areg) = active[i];
+                if last_step.get(aid).copied().unwrap_or(0) <= step { active.swap_remove(i); free.push(areg); } else { i += 1; }
+            }
+        }
         if !is_inline(op) {
             let Some(reg) = free.pop() else {
                 return Err(CompileError::RegisterSpill { peak_gprs: nb + active.len() + 1, max_gprs: budget.max_gprs, peak_vecs: sched.peak_vecs, max_vecs: budget.max_vecs });
@@ -124,10 +133,12 @@ pub fn allocate_registers(kernel: &Kernel, sched: &ScheduleReport, isa: TargetIs
             if let Some(slot) = node_reg.get_mut(id) { *slot = Some(reg); }
             if last_step.get(id).copied().unwrap_or(0) > step { active.push((id, reg)); } else { free.push(reg); }
         }
-        let mut i = 0usize;
-        while i < active.len() {
-            let (aid, areg) = active[i];
-            if last_step.get(aid).copied().unwrap_or(0) <= step { active.swap_remove(i); free.push(areg); } else { i += 1; }
+        if !reuse_dying {
+            let mut i = 0usize;
+            while i < active.len() {
+                let (aid, areg) = active[i];
+                if last_step.get(aid).copied().unwrap_or(0) <= step { active.swap_remove(i); free.push(areg); } else { i += 1; }
+            }
         }
         for &(ostep, _) in sched.output_order.iter().filter(|&&(os, _)| os == step + 1) {
             let mut j = 0usize;
@@ -1451,11 +1462,30 @@ fn emit_x86_body(e: &mut X86Emit, kernel: &Kernel, sched: &ScheduleReport, ra: &
     })
 }
 
-fn emit_x86_module(kernel: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms: &[Domain], max_vecs: usize, call_batch: bool) -> Result<ModuleCode, CompileError> {
+fn emit_x86_module(kernel: &Kernel, base: &Kernel, sched: &ScheduleReport, ra: &RegAlloc, doms: &[Domain], max_vecs: usize, call_batch: bool) -> Result<ModuleCode, CompileError> {
     let mut e = X86Emit::new();
     let avx_plan = try_plan_avx2(kernel, sched, doms, max_vecs);
     let w32_plan = if avx_plan.is_none() { try_plan_avx2_w32(kernel, sched, doms, max_vecs) } else { None };
-    let b8_plan = if avx_plan.is_none() && w32_plan.is_none() { crate::batch8::try_plan_avx2_batch8(kernel, sched, doms, max_vecs) } else { None };
+    let b8_plan = if avx_plan.is_none() && w32_plan.is_none() {
+        let mut base_b8 = None;
+        if base.nodes.len() < kernel.nodes.len() {
+            let b_budget = RegBudget { max_gprs: 64, max_vecs };
+            for remat_n in [0u8, 1u8, 3u8, 6u8, 12u8] {
+                let cand = if remat_n == 0 { base.clone() } else { remat_readonly_loads(base, remat_n) };
+                if cand.nodes.len() >= kernel.nodes.len() { break; }
+                if let Ok(bs) = schedule_and_verify(&cand, b_budget) {
+                    let b_doms = cand.infer_domains();
+                    if let Some(plan) = crate::batch8::try_plan_avx2_batch8(&cand, &bs, &b_doms, max_vecs) {
+                        base_b8 = Some(plan);
+                        break;
+                    }
+                }
+            }
+        }
+        base_b8.or_else(|| crate::batch8::try_plan_avx2_batch8(kernel, sched, doms, max_vecs))
+    } else {
+        None
+    };
     let b4_plan = if avx_plan.is_none() && w32_plan.is_none() && b8_plan.is_none() { try_plan_avx2_batch4(kernel, sched, doms, max_vecs) } else { None };
     let single_vec = avx_plan.is_some() || w32_plan.is_some();
     let mut saved: Vec<u8> = if single_vec { Vec::new() } else { ra.callee_saved.clone() };
@@ -2098,12 +2128,35 @@ fn emit_arm_start(start_off: usize, b_off: u64, data_vaddr: u64, buf_offs: &[u64
 
 fn lower_kernel_code(kernel: &Kernel, budget: RegBudget, isa: TargetIsa, optimize: bool, call_batch: bool) -> Result<(Kernel, RegAlloc, ModuleCode), CompileError> {
     kernel.validate()?;
-    let lowered = if optimize { optimize_kernel(kernel)? } else { kernel.clone() };
-    let sched = schedule_and_verify(&lowered, budget)?;
-    let ra = allocate_registers(&lowered, &sched, isa, budget)?;
+    let base = if optimize { optimize_kernel(kernel)? } else { kernel.clone() };
+    let mut lowered = base.clone();
+    let (sched, ra) = match schedule_and_verify(&lowered, budget).and_then(|s| allocate_registers(&lowered, &s, isa, budget).map(|r| (s, r))) {
+        Ok(pair) => pair,
+        Err(CompileError::RegisterSpill { .. }) => {
+            let mut found = None;
+            for max_nodes in [1u8, 3u8, 6u8, 12u8, 24u8, 48u8] {
+                let cand = remat_readonly_loads(&base, max_nodes);
+                if let Ok(s) = schedule_and_verify(&cand, budget) {
+                    if let Ok(r) = allocate_registers(&cand, &s, isa, budget) {
+                        lowered = cand;
+                        found = Some((s, r));
+                        break;
+                    }
+                }
+            }
+            if let Some(pair) = found {
+                pair
+            } else {
+                let s = schedule_and_verify(&base, budget)?;
+                let r = allocate_registers(&base, &s, isa, budget)?;
+                (s, r)
+            }
+        }
+        Err(e) => return Err(e),
+    };
     let doms = lowered.infer_domains();
     let module = match isa {
-        TargetIsa::X86_64 => emit_x86_module(&lowered, &sched, &ra, &doms, budget.max_vecs, call_batch)?,
+        TargetIsa::X86_64 => emit_x86_module(&lowered, &base, &sched, &ra, &doms, budget.max_vecs, call_batch)?,
         TargetIsa::Aarch64 => emit_arm_module(&lowered, &sched, &ra, &doms, call_batch)?,
     };
     Ok((lowered, ra, module))

@@ -207,7 +207,27 @@ fn run_wasm_crate_scan(cfg: &CliArgs, budget: RegBudget, t0: Instant) -> Result<
     if let Some(out_p) = &cfg.emit_wasm {
         let is_bundle = out_p.extension().and_then(|s| s.to_str()) == Some("wasm");
         if is_bundle {
-            let ks: Vec<zero_cc::Kernel> = compiled_list.iter().map(|(ek, _, _, _)| ek.kernel.clone()).collect();
+            let mut seen = std::collections::BTreeSet::new();
+            let ks: Vec<zero_cc::Kernel> = compiled_list
+                .iter()
+                .map(|(ek, _, _, _)| {
+                    let mut k = ek.kernel.clone();
+                    if !seen.insert(k.name.clone()) {
+                        let stem = Path::new(&ek.file)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("dup");
+                        let mut cand = format!("{stem}_{}", k.name);
+                        let mut n = 2usize;
+                        while !seen.insert(cand.clone()) {
+                            cand = format!("{stem}_{}_{n}", k.name);
+                            n += 1;
+                        }
+                        k.name = cand;
+                    }
+                    k
+                })
+                .collect();
             let max_b = ks.iter().fold(budget, |acc, k| {
                 let kb = kernel_reg_budget(k, budget);
                 RegBudget { max_gprs: acc.max_gprs.max(kb.max_gprs), max_vecs: acc.max_vecs.max(kb.max_vecs) }

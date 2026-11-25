@@ -290,3 +290,243 @@ int main(int argc, char **argv) {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+const SPLIT64_SHRVAR_CMP_SRC: &str = r#"
+pub fn split64_shrvar_cmp(
+    in_a: &[u64; 1],
+    in_b: &[u64; 1],
+    in_s: &[u64; 1],
+    out_res: &mut [u64; 2],
+) {
+    let a = in_a[0];
+    let b = in_b[0];
+    let s = in_s[0] & 63;
+    let shifted = a >> s;
+    let lo_b = b & 0xFFFF_FFFF;
+    let c_eq = if a == b { 1 } else { 0 };
+    let c_ne = if a != b { 2 } else { 0 };
+    let c_lt = if a < b { 4 } else { 0 };
+    let c_le = if a <= b { 8 } else { 0 };
+    let c_gt = if a > b { 16 } else { 0 };
+    let c_ge = if a >= b { 32 } else { 0 };
+    let c_lo = if a <= lo_b { 64 } else { 0 };
+    out_res[0] = shifted;
+    out_res[1] = c_eq | c_ne | c_lt | c_le | c_gt | c_ge | c_lo;
+}
+"#;
+
+#[test]
+fn split64_shrvar_and_cmp_batch8_live_parity() {
+    let budget = RegBudget { max_gprs: 14, max_vecs: 32 };
+    let k = parse_rust_pipeline(SPLIT64_SHRVAR_CMP_SRC, "split64_shrvar_cmp").expect("parse");
+    let obj = compile_kernel_direct(&k, budget, TargetIsa::X86_64).expect("compile");
+    verify_elf64_object(&obj.elf_bytes).expect("verify elf");
+    assert!(obj.zero_spills, "split64_shrvar_cmp must have 0 spills");
+
+    let dir = std::env::temp_dir().join(format!("zero_cc_split64_cmp_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("mkdir");
+    let obj_path = dir.join("k.o");
+    fs::write(&obj_path, &obj.elf_bytes).expect("write k.o");
+
+    if cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        && std::arch::is_x86_feature_detected!("avx2")
+    {
+        if let Ok(od) = Command::new("objdump").args(["-d", "-M", "intel"]).arg(&obj_path).output() {
+            let dis = String::from_utf8_lossy(&od.stdout);
+            assert!(dis.contains("vpsrlvd") && dis.contains("vpsllvd"), "expected AVX2 Batch8 vpsrlvd/vpsllvd:\n{dis}");
+            assert!(!dis.contains("[rsp") && !dis.contains("[rbp"), "unexpected stack spill:\n{dis}");
+            assert!(!dis.contains("\tdiv ") && !dis.contains("\tidiv "), "unexpected div:\n{dis}");
+        }
+
+        let mut rng = SplitMix64(0x91A2_B3C4_D5E6_F708);
+        let n = 512usize;
+        let mut a_in = Vec::with_capacity(n);
+        let mut b_in = Vec::with_capacity(n);
+        let mut s_in = Vec::with_capacity(n);
+        let edge_vals = [
+            0u64, 1, 0xFFFF_FFFF, 0x1_0000_0000, 0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000, u64::MAX, 0xDEAD_BEEF_CAFE_BABE,
+        ];
+        for i in 0..n {
+            let a = if i < 64 { edge_vals[i % edge_vals.len()] } else { rng.next_u64() };
+            let b = if i < 64 {
+                edge_vals[(i / edge_vals.len()) % edge_vals.len()]
+            } else if i % 5 == 0 {
+                a
+            } else if i % 5 == 1 {
+                a ^ 1
+            } else if i % 5 == 2 {
+                a ^ (1u64 << 32)
+            } else {
+                rng.next_u64()
+            };
+            let s = (i as u64) % 64;
+            a_in.push(a);
+            b_in.push(b);
+            s_in.push(s);
+        }
+        let to_bytes = |v: &[u64]| -> Vec<u8> {
+            let mut b = Vec::with_capacity(v.len() * 8);
+            for &x in v { b.extend_from_slice(&x.to_le_bytes()); }
+            b
+        };
+        fs::write(dir.join("a.bin"), to_bytes(&a_in)).expect("write a");
+        fs::write(dir.join("b.bin"), to_bytes(&b_in)).expect("write b");
+        fs::write(dir.join("s.bin"), to_bytes(&s_in)).expect("write s");
+
+        let c_src = r#"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+extern void zero_cc_split64_shrvar_cmp_batch(const uint64_t*, const uint64_t*, const uint64_t*, uint64_t*, uint64_t);
+static void load_bin(const char *p, void *dst, size_t n) {
+    FILE *f = fopen(p, "rb");
+    if (!f || fread(dst, 1, n, f) != n) exit(2);
+    fclose(f);
+}
+int main(int argc, char **argv) {
+    enum { N = 512 };
+    uint64_t a[N], b[N], s[N], out[N * 2];
+    char p[512];
+    snprintf(p, sizeof(p), "%s/a.bin", argv[1]); load_bin(p, a, sizeof(a));
+    snprintf(p, sizeof(p), "%s/b.bin", argv[1]); load_bin(p, b, sizeof(b));
+    snprintf(p, sizeof(p), "%s/s.bin", argv[1]); load_bin(p, s, sizeof(s));
+    zero_cc_split64_shrvar_cmp_batch(a, b, s, out, N);
+    for (size_t i = 0; i < N; i++) {
+        uint64_t sh = s[i] & 63ULL;
+        uint64_t e0 = a[i] >> sh;
+        uint64_t lo_b = b[i] & 0xFFFFFFFFULL;
+        uint64_t e1 = (a[i] == b[i] ? 1ULL : 0ULL)
+            | (a[i] != b[i] ? 2ULL : 0ULL)
+            | (a[i] < b[i] ? 4ULL : 0ULL)
+            | (a[i] <= b[i] ? 8ULL : 0ULL)
+            | (a[i] > b[i] ? 16ULL : 0ULL)
+            | (a[i] >= b[i] ? 32ULL : 0ULL)
+            | (a[i] <= lo_b ? 64ULL : 0ULL);
+        if (out[2 * i] != e0 || out[2 * i + 1] != e1) {
+            fprintf(stderr, "mismatch i=%zu a=0x%016llx b=0x%016llx s=%llu got=(0x%llx,0x%llx) exp=(0x%llx,0x%llx)\n",
+                i, (unsigned long long)a[i], (unsigned long long)b[i], (unsigned long long)sh,
+                (unsigned long long)out[2 * i], (unsigned long long)out[2 * i + 1],
+                (unsigned long long)e0, (unsigned long long)e1);
+            return 3;
+        }
+    }
+    return 0;
+}
+"#;
+        let c_path = dir.join("h.c");
+        let bin_path = dir.join("h");
+        fs::write(&c_path, c_src).expect("write h.c");
+        let cc = Command::new("cc").args(["-O2", "-o"]).arg(&bin_path).arg(&c_path).arg(&obj_path).output().expect("cc");
+        assert!(cc.status.success(), "cc failed:\n{}", String::from_utf8_lossy(&cc.stderr));
+        let run = Command::new(&bin_path).arg(&dir).output().expect("run");
+        assert!(run.status.success(), "harness failed:\n{}", String::from_utf8_lossy(&run.stderr));
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_batch8_split64_shl_imm_1_to_31_parity() {
+    let src = r#"
+pub fn split64_shl_imm(a: &[u64; 1], b: &[u64; 1], out: &mut [u64; 2]) {
+    let x = a[0];
+    let y = b[0];
+    let s1 = x << 1;
+    let s7 = y << 7;
+    let s16 = x << 16;
+    let s20 = y << 20;
+    let s31 = x << 31;
+    out[0] = (s1 ^ s16) + s31;
+    out[1] = (s7 ^ s20) + (y << 13);
+}
+"#;
+    let budget = RegBudget { max_gprs: 14, max_vecs: 32 };
+    let k = parse_rust_pipeline(src, "split64_shl_imm").expect("parse split64_shl_imm");
+    let obj = compile_kernel_direct(&k, budget, TargetIsa::X86_64).expect("compile split64_shl_imm");
+    verify_elf64_object(&obj.elf_bytes).expect("verify elf");
+    assert!(obj.zero_spills, "split64_shl_imm must have 0 spills");
+
+    let dir = std::env::temp_dir().join(format!("zero_cc_shl_imm_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("mkdir");
+    let obj_path = dir.join("kshl.o");
+    fs::write(&obj_path, &obj.elf_bytes).expect("write kshl.o");
+
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) && std::arch::is_x86_feature_detected!("avx2") {
+        if let Ok(od) = Command::new("objdump").args(["-d", "-M", "intel"]).arg(&obj_path).output() {
+            let dis = String::from_utf8_lossy(&od.stdout);
+            assert!(dis.contains("vpslld") && dis.contains("vpsrld"), "expected AVX2 Batch8 vpslld/vpsrld:\n{dis}");
+            assert!(!dis.contains("[rsp") && !dis.contains("[rbp"), "unexpected stack spill:\n{dis}");
+            assert!(!dis.contains("\tdiv ") && !dis.contains("\tidiv "), "unexpected div:\n{dis}");
+        }
+        let mut rng = SplitMix64(0x511F_7640_A1B2_C3D4);
+        let n = 521usize;
+        let mut a_in = Vec::with_capacity(n);
+        let mut b_in = Vec::with_capacity(n);
+        let edges: [u64; 8] = [
+            0,
+            1,
+            u32::MAX as u64,
+            1u64 << 31,
+            1u64 << 32,
+            0x8000_0000_8000_0001,
+            0xFFFF_FFFF_0000_0001,
+            u64::MAX,
+        ];
+        for i in 0..n {
+            let a = if i < 64 { edges[i & 7] } else { rng.next_u64() };
+            let b = if i < 64 { edges[(i >> 3) & 7] } else { rng.next_u64() };
+            a_in.push(a);
+            b_in.push(b);
+        }
+        let to_bytes = |v: &[u64]| -> Vec<u8> {
+            let mut buf = Vec::with_capacity(v.len() * 8);
+            for &x in v { buf.extend_from_slice(&x.to_le_bytes()); }
+            buf
+        };
+        fs::write(dir.join("a.bin"), to_bytes(&a_in)).expect("write a");
+        fs::write(dir.join("b.bin"), to_bytes(&b_in)).expect("write b");
+
+        let c_src = r#"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+extern void zero_cc_split64_shl_imm_batch(const uint64_t*, const uint64_t*, uint64_t*, uint64_t);
+static void load_bin(const char *p, void *dst, size_t n) {
+    FILE *f = fopen(p, "rb");
+    if (!f || fread(dst, 1, n, f) != n) exit(2);
+    fclose(f);
+}
+int main(int argc, char **argv) {
+    enum { N = 521 };
+    uint64_t a[N], b[N], out[N * 2];
+    char p[512];
+    snprintf(p, sizeof(p), "%s/a.bin", argv[1]); load_bin(p, a, sizeof(a));
+    snprintf(p, sizeof(p), "%s/b.bin", argv[1]); load_bin(p, b, sizeof(b));
+    zero_cc_split64_shl_imm_batch(a, b, out, N);
+    for (size_t i = 0; i < N; i++) {
+        uint64_t x = a[i], y = b[i];
+        uint64_t e0 = ((x << 1) ^ (x << 16)) + (x << 31);
+        uint64_t e1 = ((y << 7) ^ (y << 20)) + (y << 13);
+        if (out[2 * i] != e0 || out[2 * i + 1] != e1) {
+            fprintf(stderr, "shl mismatch i=%zu x=0x%016llx y=0x%016llx got=(0x%llx,0x%llx) exp=(0x%llx,0x%llx)\n",
+                i, (unsigned long long)x, (unsigned long long)y,
+                (unsigned long long)out[2 * i], (unsigned long long)out[2 * i + 1],
+                (unsigned long long)e0, (unsigned long long)e1);
+            return 3;
+        }
+    }
+    return 0;
+}
+"#;
+        let c_path = dir.join("h_shl.c");
+        let bin_path = dir.join("h_shl");
+        fs::write(&c_path, c_src).expect("write h_shl.c");
+        let cc = Command::new("cc").args(["-O2", "-o"]).arg(&bin_path).arg(&c_path).arg(&obj_path).output().expect("cc");
+        assert!(cc.status.success(), "cc failed:\n{}", String::from_utf8_lossy(&cc.stderr));
+        let run = Command::new(&bin_path).arg(&dir).output().expect("run");
+        assert!(run.status.success(), "shl harness failed:\n{}", String::from_utf8_lossy(&run.stderr));
+    }
+    let _ = fs::remove_dir_all(&dir);
+}

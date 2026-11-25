@@ -500,6 +500,45 @@ impl<'a> B8Builder<'a> {
         }
     }
 
+    fn cmp_split64_u(&mut self, kind: CmpKind, va: B8Val, vb: B8Val) -> Option<usize> {
+        let (la, lb) = (self.val_lo32(va), self.val_lo32(vb));
+        let (ha, hb) = (self.val_hi32(va), self.val_hi32(vb));
+        match kind {
+            CmpKind::Eq => {
+                let m1 = self.cmp_u32(CmpKind::Eq, ha, hb);
+                let m2 = self.cmp_u32(CmpKind::Eq, la, lb);
+                let d = self.alloc_v();
+                self.emit(B8Step::And32 { dst: d, a: m1, b: m2 });
+                Some(d)
+            }
+            CmpKind::Ne => {
+                let eq = self.cmp_split64_u(CmpKind::Eq, va, vb)?;
+                Some(self.invert_mask(eq))
+            }
+            CmpKind::Ult | CmpKind::Ule => {
+                let hlt = self.cmp_u32(CmpKind::Ult, ha, hb);
+                let heq = self.cmp_u32(CmpKind::Eq, ha, hb);
+                let lok = self.cmp_u32(kind, la, lb);
+                let eq_ok = self.alloc_v();
+                self.emit(B8Step::And32 { dst: eq_ok, a: heq, b: lok });
+                let d = self.alloc_v();
+                self.emit(B8Step::Or32 { dst: d, a: hlt, b: eq_ok });
+                Some(d)
+            }
+            CmpKind::Ugt | CmpKind::Uge => {
+                let hgt = self.cmp_u32(CmpKind::Ugt, ha, hb);
+                let heq = self.cmp_u32(CmpKind::Eq, ha, hb);
+                let lok = self.cmp_u32(kind, la, lb);
+                let eq_ok = self.alloc_v();
+                self.emit(B8Step::And32 { dst: eq_ok, a: heq, b: lok });
+                let d = self.alloc_v();
+                self.emit(B8Step::Or32 { dst: d, a: hgt, b: eq_ok });
+                Some(d)
+            }
+            _ => None,
+        }
+    }
+
     fn lower_add(&mut self, id: NodeId, a: NodeId, b: NodeId) -> Option<B8Val> {
         let (va, vb) = (self.vals.get(a).copied().flatten()?, self.vals.get(b).copied().flatten()?);
         if (self.doms[id].fits_u32() || self.demanded_lo32[id]) && self.is_zero_hi(va) && self.is_zero_hi(vb) {
@@ -735,11 +774,25 @@ impl<'a> B8Builder<'a> {
                     self.cmp_u32(eff_kind, la, lb)
                 }
             }
-        } else if kind.is_unsigned() || matches!(kind, CmpKind::Eq | CmpKind::Ne) {
+        } else {
+            let eff_kind = if self.doms[a].is_nonneg() && self.doms[b].is_nonneg() {
+                match kind {
+                    CmpKind::Lt => CmpKind::Ult,
+                    CmpKind::Le => CmpKind::Ule,
+                    CmpKind::Gt => CmpKind::Ugt,
+                    CmpKind::Ge => CmpKind::Uge,
+                    other => other,
+                }
+            } else {
+                kind
+            };
+            if !(eff_kind.is_unsigned() || matches!(eff_kind, CmpKind::Eq | CmpKind::Ne)) {
+                return None;
+            }
             match (va, vb) {
-                (B8Val::Split64(lo, hi), B8Val::Const(c)) => self.cmp_split64_u_const(kind, lo, hi, c),
+                (B8Val::Split64(lo, hi), B8Val::Const(c)) => self.cmp_split64_u_const(eff_kind, lo, hi, c),
                 (B8Val::Const(c), B8Val::Split64(lo, hi)) => {
-                    let flipped = match kind {
+                    let flipped = match eff_kind {
                         CmpKind::Eq => CmpKind::Eq, CmpKind::Ne => CmpKind::Ne,
                         CmpKind::Ult => CmpKind::Ugt, CmpKind::Ule => CmpKind::Uge,
                         CmpKind::Ugt => CmpKind::Ult, CmpKind::Uge => CmpKind::Ule,
@@ -747,10 +800,8 @@ impl<'a> B8Builder<'a> {
                     };
                     self.cmp_split64_u_const(flipped, lo, hi, c)
                 }
-                _ => return None,
+                _ => self.cmp_split64_u(eff_kind, va, vb)?,
             }
-        } else {
-            return None;
         };
         if self.is_mask[id] {
             Some(B8Val::Mask32(mask))
@@ -920,7 +971,22 @@ impl<'a> B8Builder<'a> {
                     self.emit(B8Step::ShlImm32 { dst: d, src: la, s });
                     B8Val::Lo32(d)
                 } else {
-                    return None;
+                    let la = self.val_lo32(va);
+                    let lo = self.alloc_v();
+                    let carry = self.alloc_v();
+                    self.emit(B8Step::ShlImm32 { dst: lo, src: la, s });
+                    self.emit(B8Step::ShrImm32 { dst: carry, src: la, s: 32 - s });
+                    let hi = if self.is_zero_hi(va) {
+                        carry
+                    } else {
+                        let ha = self.val_hi32(va);
+                        let h_part = self.alloc_v();
+                        let h_out = self.alloc_v();
+                        self.emit(B8Step::ShlImm32 { dst: h_part, src: ha, s });
+                        self.emit(B8Step::Or32 { dst: h_out, a: h_part, b: carry });
+                        h_out
+                    };
+                    B8Val::Split64(lo, hi)
                 }
             }
             Op::Ushr(a, s) | Op::Shr(a, s) => {
@@ -976,9 +1042,9 @@ impl<'a> B8Builder<'a> {
                 }
             }
             Op::ShlVar(a, b) | Op::ShrVarU(a, b) => {
-                if !self.demanded_lo32[id] && !self.doms[id].fits_u32() { return None; }
+                let want_lo32 = self.demanded_lo32[id] || self.doms[id].fits_u32();
+                if matches!(op, Op::ShlVar(_, _)) && !want_lo32 { return None; }
                 let (va, vb) = (self.vals[a]?, self.vals[b]?);
-                if matches!(op, Op::ShrVarU(_, _)) && !self.is_zero_hi(va) { return None; }
                 let la = self.val_lo32(va);
                 let lb = self.val_lo32(vb);
                 let sh = if self.doms[b].is_nonneg() && self.doms[b].hi < 64 {
@@ -989,14 +1055,47 @@ impl<'a> B8Builder<'a> {
                     self.emit(B8Step::And32 { dst: d, a: lb, b: m63 });
                     d
                 };
-                let d = self.alloc_v();
-                let step = if matches!(op, Op::ShlVar(_, _)) {
-                    B8Step::ShlVar32 { dst: d, a: la, b: sh }
+                if matches!(op, Op::ShrVarU(_, _)) && !self.is_zero_hi(va) {
+                    // Exact branchless 64-bit unsigned shift via AVX2 zero-saturating vpsrlvd/vpsllvd:
+                    // lo_out = (lo >> s) | (hi << (32 - s)) | (hi >> (s - 32)), hi_out = hi >> s (all s in 0..64).
+                    let ha = self.val_hi32(va);
+                    let c32 = self.const32(32);
+                    let sh_inv = self.alloc_v();
+                    self.emit(B8Step::Sub32 { dst: sh_inv, a: c32, b: sh });
+                    let hi_l = self.alloc_v();
+                    self.emit(B8Step::ShlVar32 { dst: hi_l, a: ha, b: sh_inv });
+                    let sh_hi = self.alloc_v();
+                    self.emit(B8Step::Sub32 { dst: sh_hi, a: sh, b: c32 });
+                    let hi_r = self.alloc_v();
+                    self.emit(B8Step::ShrVar32 { dst: hi_r, a: ha, b: sh_hi });
+                    let hi_part = self.alloc_v();
+                    self.emit(B8Step::Or32 { dst: hi_part, a: hi_l, b: hi_r });
+                    let lo_out = if self.is_zero_lo(va) {
+                        hi_part
+                    } else {
+                        let lo_p = self.alloc_v();
+                        self.emit(B8Step::ShrVar32 { dst: lo_p, a: la, b: sh });
+                        let d = self.alloc_v();
+                        self.emit(B8Step::Or32 { dst: d, a: lo_p, b: hi_part });
+                        d
+                    };
+                    if want_lo32 {
+                        B8Val::Lo32(lo_out)
+                    } else {
+                        let hi_out = self.alloc_v();
+                        self.emit(B8Step::ShrVar32 { dst: hi_out, a: ha, b: sh });
+                        B8Val::Split64(lo_out, hi_out)
+                    }
                 } else {
-                    B8Step::ShrVar32 { dst: d, a: la, b: sh }
-                };
-                self.emit(step);
-                B8Val::Lo32(d)
+                    let d = self.alloc_v();
+                    let step = if matches!(op, Op::ShlVar(_, _)) {
+                        B8Step::ShlVar32 { dst: d, a: la, b: sh }
+                    } else {
+                        B8Step::ShrVar32 { dst: d, a: la, b: sh }
+                    };
+                    self.emit(step);
+                    B8Val::Lo32(d)
+                }
             }
             Op::Cmp(kind, a, b) => self.lower_cmp(id, kind, a, b)?,
             Op::Select { cond, t_val, f_val } => self.lower_select(id, cond, t_val, f_val)?,
@@ -1054,6 +1153,14 @@ fn alloc_b8_regs(steps: &[B8Step], consts: &[(usize, u32)], next_v: usize, max_v
     let mut active: Vec<(usize, u8)> = Vec::new();
     let mut used_mask = 0u16;
     for (i, st) in steps.iter().enumerate() {
+        let reuse_dying = !matches!(st, B8Step::MulHiShr { .. } | B8Step::Popcnt64 { .. });
+        if reuse_dying {
+            let mut j = 0usize;
+            while j < active.len() {
+                let (av, ar) = active[j];
+                if last_use[av] <= i { active.swap_remove(j); free.push(ar); } else { j += 1; }
+            }
+        }
         let (defs, nd) = st.defs();
         for &d in &defs[..nd] {
             let r = free.pop()?;
@@ -1061,10 +1168,12 @@ fn alloc_b8_regs(steps: &[B8Step], consts: &[(usize, u32)], next_v: usize, max_v
             phys[d] = Some(r);
             if last_use[d] > i { active.push((d, r)); } else { free.push(r); }
         }
-        let mut j = 0usize;
-        while j < active.len() {
-            let (av, ar) = active[j];
-            if last_use[av] <= i { active.swap_remove(j); free.push(ar); } else { j += 1; }
+        if !reuse_dying {
+            let mut j = 0usize;
+            while j < active.len() {
+                let (av, ar) = active[j];
+                if last_use[av] <= i { active.swap_remove(j); free.push(ar); } else { j += 1; }
+            }
         }
     }
     let mut ranked: Vec<(usize, u32, usize)> = consts.iter()
@@ -1082,6 +1191,136 @@ fn alloc_b8_regs(steps: &[B8Step], consts: &[(usize, u32)], next_v: usize, max_v
         }
     }
     Some((phys, hoisted))
+}
+
+fn schedule_b8_steps(steps: &[B8Step], consts: &[(usize, u32)], next_v: usize) -> Vec<B8Step> {
+    let ns = steps.len();
+    if ns <= 2 { return steps.to_vec(); }
+    let mut is_const = vec![false; next_v];
+    for &(v, _) in consts {
+        if let Some(slot) = is_const.get_mut(v) { *slot = true; }
+    }
+    let defs = b8_def_map(steps, next_v);
+    let mut reach = vec![false; ns];
+    let mut stack = Vec::new();
+    for (i, st) in steps.iter().enumerate() {
+        if matches!(st, B8Step::Store1 { .. } | B8Step::Store2U64 { .. }) {
+            if let Some(r) = reach.get_mut(i) { *r = true; }
+            stack.push(i);
+        }
+    }
+    while let Some(u) = stack.pop() {
+        if let Some(st) = steps.get(u) {
+            st.for_each_use(|v| {
+                if !is_const.get(v).copied().unwrap_or(false) {
+                    if let Some(&Some(ds)) = defs.get(v) {
+                        if !reach.get(ds).copied().unwrap_or(true) {
+                            if let Some(r) = reach.get_mut(ds) { *r = true; }
+                            stack.push(ds);
+                        }
+                    }
+                }
+            });
+        }
+    }
+    let mut deps = vec![Vec::<usize>::new(); ns];
+    let mut consumers = vec![Vec::<usize>::new(); ns];
+    let mut uniq_uses = vec![Vec::<usize>::new(); ns];
+    let mut base_vuses = vec![0usize; next_v];
+    let mut su = vec![1usize; ns];
+    for i in 0..ns {
+        if !reach.get(i).copied().unwrap_or(false) { continue; }
+        let mut uv = Vec::new();
+        let mut ud = Vec::new();
+        if let Some(st) = steps.get(i) {
+            st.for_each_use(|v| {
+                if !is_const.get(v).copied().unwrap_or(false) && !uv.contains(&v) {
+                    uv.push(v);
+                    if let Some(&Some(ds)) = defs.get(v) {
+                        if !ud.contains(&ds) { ud.push(ds); }
+                    }
+                }
+            });
+        }
+        let mut w: Vec<usize> = ud.iter().map(|&d| su.get(d).copied().unwrap_or(1)).collect();
+        w.sort_unstable_by(|a, b| b.cmp(a));
+        let sv = w.iter().enumerate().fold(1usize, |acc, (j, &s)| acc.max(s + j));
+        if let Some(slot) = su.get_mut(i) { *slot = sv; }
+        for &v in &uv {
+            if let Some(cnt) = base_vuses.get_mut(v) { *cnt += 1; }
+        }
+        for &d in &ud {
+            if let Some(cs) = consumers.get_mut(d) { cs.push(i); }
+        }
+        if let Some(slot) = deps.get_mut(i) { *slot = ud; }
+        if let Some(slot) = uniq_uses.get_mut(i) { *slot = uv; }
+    }
+    let mut best_order: Vec<usize> = Vec::new();
+    let mut best_peak = usize::MAX;
+    for mode in 0..4u8 {
+        let mut rem_deps: Vec<usize> = deps.iter().map(Vec::len).collect();
+        let mut rem_vuses = base_vuses.clone();
+        let mut ready: Vec<usize> = (0..ns)
+            .filter(|&i| reach.get(i).copied().unwrap_or(false) && rem_deps.get(i).copied().unwrap_or(1) == 0)
+            .collect();
+        let mut order = Vec::with_capacity(ns);
+        let mut live = 0usize;
+        let mut peak = 0usize;
+        while !ready.is_empty() {
+            let mut best = (0usize, (isize::MAX, usize::MAX, usize::MAX, usize::MAX));
+            for (pos, &u) in ready.iter().enumerate() {
+                let st = steps.get(u).copied().unwrap_or(B8Step::Mov { dst: 0, src: 0 });
+                let (ds, nd) = st.defs();
+                let new_live = ds[..nd].iter().filter(|&&d| rem_vuses.get(d).copied().unwrap_or(0) > 0).count();
+                let killed = uniq_uses.get(u).map_or(0, |uv| {
+                    uv.iter().filter(|&&v| rem_vuses.get(v).copied().unwrap_or(0) == 1).count()
+                });
+                let delta = new_live as isize - killed as isize;
+                let is_load = usize::from(matches!(st, B8Step::LoadNarrow { .. } | B8Step::LoadSplit64 { .. }));
+                let sv = su.get(u).copied().unwrap_or(1);
+                let key = match mode {
+                    0 => (delta, is_load, usize::MAX - sv, u),
+                    1 => (delta, is_load, sv, u),
+                    2 => (delta, usize::MAX - sv, is_load, u),
+                    _ => (delta, is_load, usize::MAX - sv, usize::MAX - u),
+                };
+                if key < best.1 { best = (pos, key); }
+            }
+            let u = ready.swap_remove(best.0);
+            order.push(u);
+            let st = steps.get(u).copied().unwrap_or(B8Step::Mov { dst: 0, src: 0 });
+            let (ds, nd) = st.defs();
+            let reuse_dying = !matches!(st, B8Step::MulHiShr { .. } | B8Step::Popcnt64 { .. });
+            let killed = uniq_uses.get(u).map_or(0, |uv| {
+                uv.iter().filter(|&&v| rem_vuses.get(v).copied().unwrap_or(0) == 1).count()
+            });
+            peak = peak.max(if reuse_dying { live.saturating_sub(killed) + nd } else { live + nd });
+            for &d in &ds[..nd] {
+                if rem_vuses.get(d).copied().unwrap_or(0) > 0 { live += 1; }
+            }
+            if let Some(uv) = uniq_uses.get(u) {
+                for &v in uv {
+                    if let Some(ru) = rem_vuses.get_mut(v) {
+                        *ru = ru.saturating_sub(1);
+                        if *ru == 0 { live = live.saturating_sub(1); }
+                    }
+                }
+            }
+            if let Some(cs) = consumers.get(u) {
+                for &c in cs {
+                    if let Some(rd) = rem_deps.get_mut(c) {
+                        *rd = rd.saturating_sub(1);
+                        if *rd == 0 { ready.push(c); }
+                    }
+                }
+            }
+        }
+        if peak < best_peak {
+            best_peak = peak;
+            best_order = order;
+        }
+    }
+    best_order.into_iter().filter_map(|i| steps.get(i).copied()).collect()
 }
 
 fn b8_const_val(consts: &[(usize, u32)], next_v: usize) -> Vec<Option<u32>> {
@@ -1852,9 +2091,20 @@ pub(crate) fn try_plan_avx2_batch8(k: &Kernel, sched: &ScheduleReport, doms: &[D
     }
 
     peephole_b8_steps(&mut b.steps, &mut b.consts, &mut b.next_v);
-    let (vreg_phys, hoisted) = alloc_b8_regs(&b.steps, &b.consts, b.next_v, max_vecs)?;
+    let sched_steps = schedule_b8_steps(&b.steps, &b.consts, b.next_v);
+    let (chosen_steps, (vreg_phys, hoisted)) = match (
+        alloc_b8_regs(&sched_steps, &b.consts, b.next_v, max_vecs),
+        alloc_b8_regs(&b.steps, &b.consts, b.next_v, max_vecs),
+    ) {
+        (Some(sa), Some(ba)) => {
+            if sa.1.len() >= ba.1.len() { (sched_steps, sa) } else { (b.steps, ba) }
+        }
+        (Some(sa), None) => (sched_steps, sa),
+        (None, Some(ba)) => (b.steps, ba),
+        (None, None) => return None,
+    };
     let fastpath = fp_lanes.and_then(|(obuf, lanes)| try_plan_fastpath_superblock(k, sched, obuf, lanes));
-    Some(Batch8Plan { consts_v: b.consts, hoisted, vreg_phys, steps: b.steps, fastpath })
+    Some(Batch8Plan { consts_v: b.consts, hoisted, vreg_phys, steps: chosen_steps, fastpath })
 }
 
 fn b8_reg(e: &mut X86Emit, plan: &Batch8Plan, v: usize, scratch: u8) -> Result<u8, CompileError> {

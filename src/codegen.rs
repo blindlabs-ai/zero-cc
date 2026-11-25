@@ -73,13 +73,13 @@ fn build_sched_graph(kernel: &Kernel) -> SchedGraph {
     SchedGraph { reach, su, deps, consumers, rem_uses, pending_mem_ops }
 }
 
-fn run_greedy_sched(kernel: &Kernel, base: &SchedGraph, mode: u8) -> (ScheduleReport, usize) {
+fn run_greedy_sched(kernel: &Kernel, base: &SchedGraph, mode: u8) -> (ScheduleReport, usize, usize) {
     let n = kernel.nodes.len();
     let (mut rem_uses, mut pending_mem_ops) = (base.rem_uses.clone(), base.pending_mem_ops.clone());
     let mut rem_deps: Vec<usize> = base.deps.iter().map(Vec::len).collect();
     let mut ready: Vec<NodeId> = (0..n).filter(|&i| base.reach.get(i).copied().unwrap_or(false) && kernel.nodes.get(i).is_some_and(|&op| !is_inline(op)) && rem_deps.get(i).copied().unwrap_or(1) == 0).collect();
     let (mut sched, mut out_done) = (vec![false; n], vec![false; kernel.outputs.len()]);
-    let (mut live, mut order, mut output_order, mut peak_ssa) = (BTreeSet::new(), Vec::new(), Vec::new(), 0usize);
+    let (mut live, mut order, mut output_order, mut peak_ssa, mut peak_reuse) = (BTreeSet::new(), Vec::new(), Vec::new(), 0usize, 0usize);
     while !ready.is_empty() {
         let mut best = (0usize, (isize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX));
         for (pos, &u) in ready.iter().enumerate() {
@@ -112,7 +112,9 @@ fn run_greedy_sched(kernel: &Kernel, base: &SchedGraph, mode: u8) -> (ScheduleRe
             if let Some(cnt) = pending_mem_ops.get_mut(&(buf, lane)) { *cnt = cnt.saturating_sub(1); }
         }
         let holds_reg = !matches!(op_u, Op::Store { .. }) && rem_uses.get(u).copied().unwrap_or(0) > 0;
+        let dying = count_dying(base, &rem_uses, &live, u);
         peak_ssa = peak_ssa.max(live.len() + usize::from(holds_reg));
+        peak_reuse = peak_reuse.max(live.len().saturating_sub(dying) + usize::from(holds_reg));
         if holds_reg { live.insert(u); }
         if let Some(ds) = base.deps.get(u) {
             for &d in ds {
@@ -138,18 +140,119 @@ fn run_greedy_sched(kernel: &Kernel, base: &SchedGraph, mode: u8) -> (ScheduleRe
     }
     for (oi, _) in kernel.outputs.iter().enumerate() { if !out_done.get(oi).copied().unwrap_or(true) { output_order.push((order.len(), oi)); } }
     let (peak_gprs, peak_vecs) = (kernel.bufs.len() + peak_ssa, peak_ssa.saturating_mul(2));
-    (ScheduleReport { order, output_order, peak_gprs, peak_vecs, live_nodes: sched.iter().filter(|&&s| s).count() }, peak_ssa)
+    (ScheduleReport { order, output_order, peak_gprs, peak_vecs, live_nodes: sched.iter().filter(|&&s| s).count() }, peak_ssa, peak_reuse)
+}
+
+fn dfs_su_visit(u: NodeId, base: &SchedGraph, visited: &mut [bool], order: &mut Vec<NodeId>, child_mode: u8) {
+    if visited.get(u).copied().unwrap_or(true) { return; }
+    if let Some(v) = visited.get_mut(u) { *v = true; }
+    if let Some(ds) = base.deps.get(u) {
+        let mut kids = ds.clone();
+        match child_mode {
+            0 => kids.sort_by(|&a, &b| base.su.get(b).cmp(&base.su.get(a)).then_with(|| a.cmp(&b))),
+            1 => kids.sort_by(|&a, &b| base.su.get(a).cmp(&base.su.get(b)).then_with(|| a.cmp(&b))),
+            2 => kids.sort_unstable(),
+            _ => kids.sort_by(|a, b| b.cmp(a)),
+        }
+        for k in kids { dfs_su_visit(k, base, visited, order, child_mode); }
+    }
+    order.push(u);
+}
+
+fn count_dying(base: &SchedGraph, rem_uses: &[usize], live: &BTreeSet<NodeId>, u: NodeId) -> usize {
+    let mut dying = 0usize;
+    if let Some(ds) = base.deps.get(u) {
+        for &d in ds {
+            if rem_uses.get(d).copied().unwrap_or(0) == 1 && live.contains(&d) {
+                dying += 1;
+            }
+        }
+    }
+    dying
+}
+
+fn eval_fixed_order(kernel: &Kernel, base: &SchedGraph, order: Vec<NodeId>) -> (ScheduleReport, usize, usize) {
+    let n = kernel.nodes.len();
+    let (mut rem_uses, mut pending_mem_ops) = (base.rem_uses.clone(), base.pending_mem_ops.clone());
+    let (mut sched, mut out_done) = (vec![false; n], vec![false; kernel.outputs.len()]);
+    let (mut live, mut output_order, mut peak_ssa, mut peak_reuse) = (BTreeSet::new(), Vec::new(), 0usize, 0usize);
+    for (step, &u) in order.iter().enumerate() {
+        if let Some(s) = sched.get_mut(u) { *s = true; }
+        let op_u = kernel.nodes.get(u).copied().unwrap_or(Op::MemInit);
+        if let Op::Load { buf, lane, .. } | Op::Store { buf, lane, .. } = op_u {
+            if let Some(cnt) = pending_mem_ops.get_mut(&(buf, lane)) { *cnt = cnt.saturating_sub(1); }
+        }
+        let holds_reg = !matches!(op_u, Op::Store { .. }) && rem_uses.get(u).copied().unwrap_or(0) > 0;
+        let dying = count_dying(base, &rem_uses, &live, u);
+        peak_ssa = peak_ssa.max(live.len() + usize::from(holds_reg));
+        peak_reuse = peak_reuse.max(live.len().saturating_sub(dying) + usize::from(holds_reg));
+        if holds_reg { live.insert(u); }
+        if let Some(ds) = base.deps.get(u) {
+            for &d in ds {
+                if let Some(ru) = rem_uses.get_mut(d) { *ru = ru.saturating_sub(1); if *ru == 0 { live.remove(&d); } }
+            }
+        }
+        for (oi, o) in kernel.outputs.iter().enumerate() {
+            let ov_inline = kernel.nodes.get(o.val).is_some_and(|&op| is_inline(op));
+            let ov_sched = sched.get(o.val).copied().unwrap_or(false);
+            if !out_done.get(oi).copied().unwrap_or(true) && (ov_inline || ov_sched) && pending_mem_ops.get(&(o.buf, o.lane)).copied().unwrap_or(0) == 0 {
+                if let Some(done) = out_done.get_mut(oi) { *done = true; }
+                output_order.push((step + 1, oi));
+                if !ov_inline {
+                    if let Some(ru) = rem_uses.get_mut(o.val) { *ru = ru.saturating_sub(1); if *ru == 0 { live.remove(&o.val); } }
+                }
+            }
+        }
+    }
+    for (oi, _) in kernel.outputs.iter().enumerate() { if !out_done.get(oi).copied().unwrap_or(true) { output_order.push((order.len(), oi)); } }
+    let (peak_gprs, peak_vecs) = (kernel.bufs.len() + peak_ssa, peak_ssa.saturating_mul(2));
+    (ScheduleReport { order, output_order, peak_gprs, peak_vecs, live_nodes: sched.iter().filter(|&&s| s).count() }, peak_ssa, peak_reuse)
+}
+
+fn run_su_dfs_sched(kernel: &Kernel, base: &SchedGraph, rev_outs: bool, child_mode: u8) -> (ScheduleReport, usize, usize) {
+    let n = kernel.nodes.len();
+    let mut visited = vec![false; n];
+    let mut order = Vec::new();
+    let mut out_idxs: Vec<usize> = (0..kernel.outputs.len()).collect();
+    if rev_outs { out_idxs.reverse(); }
+    for &oi in &out_idxs {
+        if let Some(o) = kernel.outputs.get(oi) {
+            if base.reach.get(o.val).copied().unwrap_or(false) && kernel.nodes.get(o.val).is_some_and(|&op| !is_inline(op)) {
+                dfs_su_visit(o.val, base, &mut visited, &mut order, child_mode);
+            }
+        }
+    }
+    for id in 0..n {
+        if base.reach.get(id).copied().unwrap_or(false) && kernel.nodes.get(id).is_some_and(|&op| !is_inline(op)) {
+            dfs_su_visit(id, base, &mut visited, &mut order, child_mode);
+        }
+    }
+    eval_fixed_order(kernel, base, order)
 }
 
 /// Minimum-live-register Sethi-Ullman DAG scheduler with hard zero-spill cliff guard.
 pub fn schedule_and_verify(kernel: &Kernel, budget: RegBudget) -> Result<ScheduleReport, CompileError> {
     kernel.validate()?;
     let g = build_sched_graph(kernel);
-    let (mut best_rep, mut best_ssa) = run_greedy_sched(kernel, &g, 0);
+    let (mut best_rep, mut best_key) = {
+        let (rep, ssa, rssa) = run_greedy_sched(kernel, &g, 0);
+        (rep, (rssa, ssa))
+    };
     for mode in 1..6u8 {
-        let (rep, ssa) = run_greedy_sched(kernel, &g, mode);
-        if ssa < best_ssa { best_rep = rep; best_ssa = ssa; }
+        let (rep, ssa, rssa) = run_greedy_sched(kernel, &g, mode);
+        if (rssa, ssa) < best_key { best_rep = rep; best_key = (rssa, ssa); }
     }
+    for rev in [false, true] {
+        for cm in 0..4u8 {
+            let (rep, ssa, rssa) = run_su_dfs_sched(kernel, &g, rev, cm);
+            if (rssa, ssa) < best_key { best_rep = rep; best_key = (rssa, ssa); }
+        }
+    }
+    let nat: Vec<NodeId> = (0..kernel.nodes.len())
+        .filter(|&id| g.reach.get(id).copied().unwrap_or(false) && kernel.nodes.get(id).is_some_and(|&op| !is_inline(op)))
+        .collect();
+    let (rep, ssa, rssa) = eval_fixed_order(kernel, &g, nat);
+    if (rssa, ssa) < best_key { best_rep = rep; }
     if best_rep.peak_gprs > budget.max_gprs || best_rep.peak_vecs > budget.max_vecs {
         return Err(CompileError::RegisterSpill {
             peak_gprs: best_rep.peak_gprs, max_gprs: budget.max_gprs,
@@ -157,6 +260,137 @@ pub fn schedule_and_verify(kernel: &Kernel, budget: RegBudget) -> Result<Schedul
         });
     }
     Ok(best_rep)
+}
+
+struct RematCtx<'a> {
+    src_nodes: &'a [Op<NodeId>],
+    src_doms: &'a [Domain],
+    map: &'a [NodeId],
+    tree_size: &'a [u8],
+}
+
+fn clone_ro_subgraph(
+    ctx: &RematCtx<'_>,
+    out_nodes: &mut Vec<Op<NodeId>>,
+    out_doms: &mut Vec<Domain>,
+    kid: NodeId,
+    max_nodes: u8,
+    memo: &mut Vec<(NodeId, NodeId)>,
+) -> NodeId {
+    if let Some(&(_, nid)) = memo.iter().find(|&&(k, _)| k == kid) {
+        return nid;
+    }
+    let sz = ctx.tree_size.get(kid).copied().unwrap_or(u8::MAX);
+    if sz == 0 || sz > max_nodes {
+        return ctx.map.get(kid).copied().unwrap_or(0);
+    }
+    let op = ctx.src_nodes.get(kid).copied().unwrap_or(Op::MemInit);
+    let dom = ctx.src_doms.get(kid).copied().unwrap_or(Domain::top());
+    let new_op = op.map_ids(|c| {
+        let csz = ctx.tree_size.get(c).copied().unwrap_or(u8::MAX);
+        if csz > 0 && csz < sz {
+            clone_ro_subgraph(ctx, out_nodes, out_doms, c, max_nodes, memo)
+        } else {
+            ctx.map.get(c).copied().unwrap_or(0)
+        }
+    });
+    let nid = out_nodes.len();
+    out_nodes.push(new_op);
+    out_doms.push(dom);
+    memo.push((kid, nid));
+    nid
+}
+
+/// Classical read-only `Op::Load` and bounded pure-subtree rematerialization to cut
+/// long live ranges across unrelated DAG subgraphs without emitting stack spills.
+pub fn remat_readonly_loads(kernel: &Kernel, max_nodes: u8) -> Kernel {
+    let n = kernel.nodes.len();
+    let mut uses = vec![0usize; n];
+    for &op in &kernel.nodes {
+        let (kids, cnt) = op.children();
+        for &k in &kids[..cnt] {
+            if let Some(u) = uses.get_mut(k) { *u += 1; }
+        }
+    }
+    for o in &kernel.outputs {
+        if let Some(u) = uses.get_mut(o.val) { *u += 1; }
+    }
+    let mut tree_size = vec![u8::MAX; n];
+    for id in 0..n {
+        let op = kernel.nodes.get(id).copied().unwrap_or(Op::MemInit);
+        let sz = match op {
+            Op::Const(_) => 0u8,
+            Op::Load { mem, buf, .. } => {
+                let mem_init = kernel.nodes.get(mem).copied() == Some(Op::MemInit);
+                let is_ro = kernel.bufs.get(usize::from(buf)).is_some_and(|b| matches!(b.access, BufAccess::ReadOnly));
+                if mem_init && is_ro { 1u8 } else { u8::MAX }
+            }
+            Op::MemInit | Op::Store { .. } | Op::LoadLut { .. } | Op::BoundsCheck { .. } => u8::MAX,
+            _ => {
+                let (kids, cnt) = op.children();
+                let mut sum = 1u16;
+                let mut ok = true;
+                for &k in &kids[..cnt] {
+                    let ks = tree_size.get(k).copied().unwrap_or(u8::MAX);
+                    if ks == u8::MAX { ok = false; break; }
+                    sum = sum.saturating_add(u16::from(ks));
+                }
+                if ok && sum < u16::from(u8::MAX) { sum as u8 } else { u8::MAX }
+            }
+        };
+        if let Some(slot) = tree_size.get_mut(id) { *slot = sz; }
+    }
+    let can_remat = |k: NodeId| {
+        let sz = tree_size.get(k).copied().unwrap_or(u8::MAX);
+        let min_u = if sz <= 2 { 2 } else { 3 };
+        uses.get(k).copied().unwrap_or(0) >= min_u && sz > 0 && sz <= max_nodes
+    };
+    let mut out_nodes = Vec::with_capacity(n.saturating_mul(2));
+    let mut out_doms = Vec::with_capacity(n.saturating_mul(2));
+    let mut map = vec![0usize; n];
+    let mut node_clones: Vec<Vec<(NodeId, NodeId)>> = vec![Vec::new(); n];
+    for id in 0..n {
+        let op = kernel.nodes.get(id).copied().unwrap_or(Op::MemInit);
+        let ctx = RematCtx {
+            src_nodes: &kernel.nodes,
+            src_doms: &kernel.proven_domains,
+            map: &map,
+            tree_size: &tree_size,
+        };
+        let mut memo = if let Op::Select { cond, .. } = op {
+            node_clones.get(cond).cloned().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mapped = op.map_ids(|k| {
+            if can_remat(k) {
+                clone_ro_subgraph(&ctx, &mut out_nodes, &mut out_doms, k, max_nodes, &mut memo)
+            } else {
+                map.get(k).copied().unwrap_or(0)
+            }
+        });
+        let nid = out_nodes.len();
+        out_nodes.push(mapped);
+        out_doms.push(kernel.proven_domains.get(id).copied().unwrap_or(Domain::top()));
+        if let Some(m) = map.get_mut(id) { *m = nid; }
+        if let Some(nc) = node_clones.get_mut(id) { *nc = memo; }
+    }
+    let ctx = RematCtx {
+        src_nodes: &kernel.nodes,
+        src_doms: &kernel.proven_domains,
+        map: &map,
+        tree_size: &tree_size,
+    };
+    let outputs = kernel.outputs.iter().map(|o| {
+        let mut memo = Vec::new();
+        let val = if can_remat(o.val) {
+            clone_ro_subgraph(&ctx, &mut out_nodes, &mut out_doms, o.val, max_nodes, &mut memo)
+        } else {
+            map.get(o.val).copied().unwrap_or(0)
+        };
+        crate::ir::OutputWrite { buf: o.buf, lane: o.lane, val }
+    }).collect();
+    Kernel { name: kernel.name.clone(), bufs: kernel.bufs.clone(), nodes: out_nodes, outputs, proven_domains: out_doms }
 }
 
 fn ref_expr(kernel: &Kernel, id: NodeId) -> String {
