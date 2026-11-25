@@ -163,9 +163,7 @@ fn count_dying(base: &SchedGraph, rem_uses: &[usize], live: &BTreeSet<NodeId>, u
     let mut dying = 0usize;
     if let Some(ds) = base.deps.get(u) {
         for &d in ds {
-            if rem_uses.get(d).copied().unwrap_or(0) == 1 && live.contains(&d) {
-                dying += 1;
-            }
+            if rem_uses.get(d).copied().unwrap_or(0) == 1 && live.contains(&d) { dying += 1; }
         }
     }
     dying
@@ -277,22 +275,16 @@ fn clone_ro_subgraph(
     max_nodes: u8,
     memo: &mut Vec<(NodeId, NodeId)>,
 ) -> NodeId {
-    if let Some(&(_, nid)) = memo.iter().find(|&&(k, _)| k == kid) {
-        return nid;
-    }
+    if let Some(&(_, nid)) = memo.iter().find(|&&(k, _)| k == kid) { return nid; }
     let sz = ctx.tree_size.get(kid).copied().unwrap_or(u8::MAX);
-    if sz == 0 || sz > max_nodes {
-        return ctx.map.get(kid).copied().unwrap_or(0);
-    }
+    if sz == 0 || sz > max_nodes { return ctx.map.get(kid).copied().unwrap_or(0); }
     let op = ctx.src_nodes.get(kid).copied().unwrap_or(Op::MemInit);
     let dom = ctx.src_doms.get(kid).copied().unwrap_or(Domain::top());
     let new_op = op.map_ids(|c| {
         let csz = ctx.tree_size.get(c).copied().unwrap_or(u8::MAX);
         if csz > 0 && csz < sz {
             clone_ro_subgraph(ctx, out_nodes, out_doms, c, max_nodes, memo)
-        } else {
-            ctx.map.get(c).copied().unwrap_or(0)
-        }
+        } else { ctx.map.get(c).copied().unwrap_or(0) }
     });
     let nid = out_nodes.len();
     out_nodes.push(new_op);
@@ -359,15 +351,11 @@ pub fn remat_readonly_loads(kernel: &Kernel, max_nodes: u8) -> Kernel {
         };
         let mut memo = if let Op::Select { cond, .. } = op {
             node_clones.get(cond).cloned().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        } else { Vec::new() };
         let mapped = op.map_ids(|k| {
             if can_remat(k) {
                 clone_ro_subgraph(&ctx, &mut out_nodes, &mut out_doms, k, max_nodes, &mut memo)
-            } else {
-                map.get(k).copied().unwrap_or(0)
-            }
+            } else { map.get(k).copied().unwrap_or(0) }
         });
         let nid = out_nodes.len();
         out_nodes.push(mapped);
@@ -385,9 +373,7 @@ pub fn remat_readonly_loads(kernel: &Kernel, max_nodes: u8) -> Kernel {
         let mut memo = Vec::new();
         let val = if can_remat(o.val) {
             clone_ro_subgraph(&ctx, &mut out_nodes, &mut out_doms, o.val, max_nodes, &mut memo)
-        } else {
-            map.get(o.val).copied().unwrap_or(0)
-        };
+        } else { map.get(o.val).copied().unwrap_or(0) };
         crate::ir::OutputWrite { buf: o.buf, lane: o.lane, val }
     }).collect();
     Kernel { name: kernel.name.clone(), bufs: kernel.bufs.clone(), nodes: out_nodes, outputs, proven_domains: out_doms }

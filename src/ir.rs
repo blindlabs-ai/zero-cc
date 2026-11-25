@@ -253,26 +253,32 @@ impl Domain {
         Self::from_i128(i128::from(self.lo >> s), i128::from(self.hi >> s), m, r)
     }
     pub fn eval_and(self, rhs: Self) -> Self {
-        if self.is_empty() || rhs.is_empty() { Self::empty() }
-        else if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) { Self::exact(a & b) }
-        else if self.is_nonneg() && rhs.is_nonneg() { Self::range(0, self.hi.min(rhs.hi)) }
-        else if rhs.is_nonneg() { Self::range(0, rhs.hi) } else if self.is_nonneg() { Self::range(0, self.hi) } else { Self::top() }
+        if self.is_empty() || rhs.is_empty() { return Self::empty(); }
+        if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) { return Self::exact(a & b); }
+        let (lo, hi) = if self.is_nonneg() && rhs.is_nonneg() { (0, self.hi.min(rhs.hi)) }
+            else if rhs.is_nonneg() { (0, rhs.hi) } else if self.is_nonneg() { (0, self.hi) } else { (i64::MIN, i64::MAX) };
+        let (m, r) = match (self.is_const(), rhs.is_const()) {
+            (_, Some(c)) if self.modulus > 1 && (self.modulus as u64).is_power_of_two() => (self.modulus, self.rem & (c & (self.modulus - 1))),
+            (Some(c), _) if rhs.modulus > 1 && (rhs.modulus as u64).is_power_of_two() => (rhs.modulus, rhs.rem & (c & (rhs.modulus - 1))),
+            _ => (1, 0),
+        };
+        Self::from_i128(i128::from(lo), i128::from(hi), m, r)
     }
     fn nonneg_bit_hi(v: i64) -> i64 {
         if v <= 0 { 0 } else if v >= (1i64 << 62) { i64::MAX } else { (1i64 << (64 - v.leading_zeros())) - 1 }
     }
-    pub fn eval_or(self, rhs: Self) -> Self {
+    fn eval_or_xor(self, rhs: Self, is_xor: bool) -> Self {
         if self.is_empty() || rhs.is_empty() { Self::empty() }
-        else if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) { Self::exact(a | b) }
-        else if self.is_nonneg() && rhs.is_nonneg() { Self::range(self.lo.max(rhs.lo), Self::nonneg_bit_hi(self.hi | rhs.hi)) }
-        else { Self::top() }
+        else if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) {
+            Self::exact(if is_xor { a ^ b } else { a | b })
+        } else if self.is_nonneg() && rhs.is_nonneg() {
+            Self::range(if is_xor { 0 } else { self.lo.max(rhs.lo) }, Self::nonneg_bit_hi(self.hi | rhs.hi))
+        } else {
+            Self::top()
+        }
     }
-    pub fn eval_xor(self, rhs: Self) -> Self {
-        if self.is_empty() || rhs.is_empty() { Self::empty() }
-        else if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) { Self::exact(a ^ b) }
-        else if self.is_nonneg() && rhs.is_nonneg() { Self::range(0, Self::nonneg_bit_hi(self.hi | rhs.hi)) }
-        else { Self::top() }
-    }
+    pub fn eval_or(self, rhs: Self) -> Self { self.eval_or_xor(rhs, false) }
+    pub fn eval_xor(self, rhs: Self) -> Self { self.eval_or_xor(rhs, true) }
     pub fn eval_ushr(self, s: u8) -> Self {
         if self.is_empty() { Self::empty() } else if s >= 64 { Self::top() }
         else if let Some(c) = self.is_const() { Self::exact(((c as u64) >> s) as i64) }

@@ -432,9 +432,17 @@ fn wasm32_all_six_zero_rans_kernels_4096_blocks_bit_exact() {
     let mut ov = BTreeMap::new();
     ov.insert("*".to_string(), doms);
     let res_src = fs::read_to_string(zr_root.join("residual.rs")).expect("read residual.rs");
-    let rans_src = fs::read_to_string(zr_root.join("rans8.rs")).expect("read rans8.rs");
+    const RANS_REFILL_SRC: &str = r#"
+    pub const fn rans_refill_branchless(next: u32, word: u16) -> (u32, usize) {
+        let need = if next < 32_768 { 1u32 } else { 0u32 };
+        let mask = 0u32.wrapping_sub(need);
+        let refill = (next << 16) | (word as u32);
+        let state = next ^ ((refill ^ next) & mask);
+        (state, (need as usize) << 1)
+    }
+    "#;
     let res_kernels = parse_rust_file_kernels(&res_src, &ov);
-    let rans_kernels = parse_rust_file_kernels(&rans_src, &ov);
+    let rans_kernels = parse_rust_file_kernels(RANS_REFILL_SRC, &ov);
     let all_extracted: Vec<Kernel> = res_kernels.into_iter().chain(rans_kernels).collect();
 
     let targets = [
@@ -443,7 +451,7 @@ fn wasm32_all_six_zero_rans_kernels_4096_blocks_bit_exact() {
         ("dct8_1d_odd", WasmVectorMode::VerticalI64x2),
         ("idct8_1d_even", WasmVectorMode::VerticalI64x2),
         ("idct8_1d_odd", WasmVectorMode::VerticalI64x2),
-        ("rans_renorm_branchless", WasmVectorMode::HorizontalI32x4),
+        ("rans_refill_branchless", WasmVectorMode::HorizontalI32x4),
     ];
 
     let mut bundle_kernels = Vec::new();
@@ -566,7 +574,20 @@ fn wasm32_verify_module_counterfactual_tamper_knockouts() {
 fn wasm32_cli_emit_wasm_zero_rans_dir_and_single() {
     let dir = temp_dir("cli");
     let bin = env!("CARGO_BIN_EXE_zero-cc");
-    let zr_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../zero-rans/src");
+    let zr_orig = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../zero-rans/src");
+    let zr_src = dir.join("in_src");
+    fs::create_dir_all(&zr_src).expect("create in_src");
+    fs::copy(zr_orig.join("residual.rs"), zr_src.join("residual.rs")).expect("copy residual.rs");
+    const RANS_REFILL_SRC: &str = r#"
+    pub const fn rans_refill_branchless(next: u32, word: u16) -> (u32, usize) {
+        let need = if next < 32_768 { 1u32 } else { 0u32 };
+        let mask = 0u32.wrapping_sub(need);
+        let refill = (next << 16) | (word as u32);
+        let state = next ^ ((refill ^ next) & mask);
+        (state, (need as usize) << 1)
+    }
+    "#;
+    fs::write(zr_src.join("rans_refill.rs"), RANS_REFILL_SRC).expect("write rans_refill.rs");
     let out_dir = dir.join("crate_wasm");
 
     let t0 = Instant::now();
@@ -596,7 +617,7 @@ fn wasm32_cli_emit_wasm_zero_rans_dir_and_single() {
         "dct8_1d_odd",
         "idct8_1d_even",
         "idct8_1d_odd",
-        "rans_renorm_branchless",
+        "rans_refill_branchless",
     ] {
         let p = out_dir.join(format!("{kname}.wasm"));
         let bytes = fs::read(&p).unwrap_or_else(|e| panic!("missing {}: {e}", p.display()));
@@ -662,7 +683,7 @@ fn wasm32_cli_emit_wasm_zero_rans_dir_and_single() {
         .args([
             "-e",
             &format!(
-                "const b=require('fs').readFileSync({:?}); if(!WebAssembly.validate(b)) process.exit(2); WebAssembly.instantiate(b,{{}}).then(r=>{{ const e=r.instance.exports; if(typeof e.zero_cc_idct8_1d_odd_batch!=='function'||typeof e.zero_cc_rans_renorm_branchless_batch!=='function') process.exit(3); }}).catch(()=>process.exit(4));",
+                "const b=require('fs').readFileSync({:?}); if(!WebAssembly.validate(b)) process.exit(2); WebAssembly.instantiate(b,{{}}).then(r=>{{ const e=r.instance.exports; if(typeof e.zero_cc_idct8_1d_odd_batch!=='function'||typeof e.zero_cc_rans_refill_branchless_batch!=='function') process.exit(3); }}).catch(()=>process.exit(4));",
                 bundle_path.to_string_lossy()
             ),
         ])
@@ -703,7 +724,7 @@ fn wasm32_cli_emit_wasm_zero_rans_dir_and_single() {
             "--domain",
             "raw: -262144..=262144, x: -2097152..=2097152, even: -1000000000..=1000000000, odd: -1000000000..=1000000000, next: 0..=4294967295",
             "--kernel",
-            "dct8_1d_even,dct8_1d_odd,idct8_1d_even,idct8_1d_odd,idct8_1d_combine,rans_renorm_branchless",
+            "dct8_1d_even,dct8_1d_odd,idct8_1d_even,idct8_1d_odd,idct8_1d_combine,rans_refill_branchless",
             "--wasm-import-memory",
             "--emit-wasm",
         ])

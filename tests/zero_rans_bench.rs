@@ -268,11 +268,11 @@ fn ref_idct8_1d_combine(even: &[i64; 4], odd: &[i64; 4], out: &mut [i32; 8]) {
 }
 
 #[inline(always)]
-const fn ref_rans_renorm_branchless(next: u32, word: u16) -> (u32, usize) {
+const fn ref_rans_refill_branchless(next: u32, word: u16) -> (u32, usize) {
     let need = if next < 32_768 { 1u32 } else { 0u32 };
     let mask = 0u32.wrapping_sub(need);
-    let renorm = (next << 16) | (word as u32);
-    let state = next ^ ((renorm ^ next) & mask);
+    let refill = (next << 16) | (word as u32);
+    let state = next ^ ((refill ^ next) & mask);
     (state, (need as usize) << 1)
 }
 
@@ -304,7 +304,7 @@ fn ref_idct8_1d_combine_batch(even: &[[i64; 4]], odd: &[[i64; 4]], out: &mut [[i
 }
 
 #[inline(never)]
-fn ref_rans_renorm_branchless_batch(
+fn ref_rans_refill_branchless_batch(
     next: &[[u32; 8]],
     word: &[[u16; 8]],
     out0: &mut [[u32; 8]],
@@ -313,7 +313,7 @@ fn ref_rans_renorm_branchless_batch(
     let n = next.len().min(word.len()).min(out0.len()).min(out1.len());
     for b in 0..n {
         for l in 0..8 {
-            let (st, adv) = ref_rans_renorm_branchless(next[b][l], word[b][l]);
+            let (st, adv) = ref_rans_refill_branchless(next[b][l], word[b][l]);
             out0[b][l] = st;
             out1[b][l] = adv as i64;
         }
@@ -454,7 +454,7 @@ fn main() {
     zcc_idct8_1d_combine::idct8_1d_combine_batch(&ceven, &codd, &mut comb_zcc);
     assert_eq!(comb_ref, comb_zcc, "idct8_1d_combine 4096-block parity mismatch");
 
-    // 4. rans_renorm_branchless (full u32 next in 0..=u32::MAX, word in 0..=65535)
+    // 4. rans_refill_branchless (full u32 next in 0..=u32::MAX, word in 0..=65535)
     let next_corners: [u32; 10] = [
         0, 1, 32_767, 32_768, 32_769, 65_535, 65_536, 2_147_483_647, 2_147_483_648, u32::MAX,
     ];
@@ -476,10 +476,10 @@ fn main() {
     let mut r1_ref = vec![[0i64; 8]; PARITY_BLOCKS];
     let mut r0_zcc = vec![[0u32; 8]; PARITY_BLOCKS];
     let mut r1_zcc = vec![[0i64; 8]; PARITY_BLOCKS];
-    ref_rans_renorm_branchless_batch(&rnext, &rword, &mut r0_ref, &mut r1_ref);
-    zcc_rans_renorm_branchless::rans_renorm_branchless_batch(&rnext, &rword, &mut r0_zcc, &mut r1_zcc);
-    assert_eq!(r0_ref, r0_zcc, "rans_renorm_branchless out0 4096-block parity mismatch");
-    assert_eq!(r1_ref, r1_zcc, "rans_renorm_branchless out1 4096-block parity mismatch");
+    ref_rans_refill_branchless_batch(&rnext, &rword, &mut r0_ref, &mut r1_ref);
+    zcc_rans_refill_branchless::rans_refill_branchless_batch(&rnext, &rword, &mut r0_zcc, &mut r1_zcc);
+    assert_eq!(r0_ref, r0_zcc, "rans_refill_branchless out0 4096-block parity mismatch");
+    assert_eq!(r1_ref, r1_zcc, "rans_refill_branchless out1 4096-block parity mismatch");
 
     // 5. Non-multiple-of-4 scalar tail parity (blocks = 1, 3, 7) across all 6 kernels
     for &tail_n in &[1usize, 3, 7] {
@@ -505,14 +505,14 @@ fn main() {
 
         let mut tr0 = vec![[0u32; 8]; tail_n];
         let mut tr1 = vec![[0i64; 8]; tail_n];
-        zcc_rans_renorm_branchless::rans_renorm_branchless_batch(
+        zcc_rans_refill_branchless::rans_refill_branchless_batch(
             &rnext[..tail_n],
             &rword[..tail_n],
             &mut tr0,
             &mut tr1,
         );
-        assert_eq!(&r0_ref[..tail_n], &tr0[..], "rans_renorm_branchless out0 tail_n={tail_n} mismatch");
-        assert_eq!(&r1_ref[..tail_n], &tr1[..], "rans_renorm_branchless out1 tail_n={tail_n} mismatch");
+        assert_eq!(&r0_ref[..tail_n], &tr0[..], "rans_refill_branchless out0 tail_n={tail_n} mismatch");
+        assert_eq!(&r1_ref[..tail_n], &tr1[..], "rans_refill_branchless out1 tail_n={tail_n} mismatch");
     }
 
     // Live hardware timing (512 blocks x 256 iters = 131,072 calls/trial, median of 9)
@@ -594,11 +594,11 @@ fn main() {
         },
     );
     bench_pair(
-        "rans_renorm_branchless",
+        "rans_refill_branchless",
         CALLS,
         || {
             for _ in 0..ITERS {
-                ref_rans_renorm_branchless_batch(
+                ref_rans_refill_branchless_batch(
                     black_box(rn_b),
                     black_box(rw_b),
                     black_box(&mut r0_ref[..BENCH_BLOCKS]),
@@ -608,7 +608,7 @@ fn main() {
         },
         || {
             for _ in 0..ITERS {
-                zcc_rans_renorm_branchless::rans_renorm_branchless_batch(
+                zcc_rans_refill_branchless::rans_refill_branchless_batch(
                     black_box(rn_b),
                     black_box(rw_b),
                     black_box(&mut r0_zcc[..BENCH_BLOCKS]),
@@ -642,12 +642,20 @@ fn zero_rans_six_kernels_bit_exact_et_exec_objdump_and_live_bench() {
     overrides.insert("*".to_string(), doms);
 
     let residual_src = fs::read_to_string(rans_src_dir.join("residual.rs")).expect("read residual.rs");
-    let rans8_src = fs::read_to_string(rans_src_dir.join("rans8.rs")).expect("read rans8.rs");
+    const RANS_REFILL_SRC: &str = r#"
+    pub const fn rans_refill_branchless(next: u32, word: u16) -> (u32, usize) {
+        let need = if next < 32_768 { 1u32 } else { 0u32 };
+        let mask = 0u32.wrapping_sub(need);
+        let refill = (next << 16) | (word as u32);
+        let state = next ^ ((refill ^ next) & mask);
+        (state, (need as usize) << 1)
+    }
+    "#;
     let mut extracted = BTreeMap::new();
     for k in parse_rust_file_kernels(&residual_src, &overrides) {
         extracted.insert(k.name.clone(), k);
     }
-    for k in parse_rust_file_kernels(&rans8_src, &overrides) {
+    for k in parse_rust_file_kernels(RANS_REFILL_SRC, &overrides) {
         extracted.insert(k.name.clone(), k);
     }
 
@@ -657,7 +665,7 @@ fn zero_rans_six_kernels_bit_exact_et_exec_objdump_and_live_bench() {
         "dct8_1d_even",
         "dct8_1d_odd",
         "idct8_1d_combine",
-        "rans_renorm_branchless",
+        "rans_refill_branchless",
     ];
     let dir = temp_dir("zero_rans_bench");
     let mut obj_paths: Vec<PathBuf> = Vec::new();

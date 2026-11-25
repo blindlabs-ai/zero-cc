@@ -321,9 +321,7 @@ pub fn verify_elf64_executable(bytes: &[u8]) -> Result<ElfExecSummary, CompileEr
             if (p_flags & PF_X) != 0 {
                 if (p_flags & PF_R) == 0 { return Err(berr("elf64 RX segment missing PF_R")); }
                 rx_seg = Some((p_vaddr, p_memsz));
-            } else if (p_flags & PF_W) != 0 {
-                rw_seg = Some((p_vaddr, p_filesz, p_memsz));
-            }
+            } else if (p_flags & PF_W) != 0 { rw_seg = Some((p_vaddr, p_filesz, p_memsz)); }
         } else if p_type == PT_GNU_STACK {
             if (p_flags & PF_X) != 0 { return Err(berr("elf64 executable PT_GNU_STACK")); }
             has_nonexec_gnu_stack = true;

@@ -35,7 +35,7 @@ Measured live on **AMD Ryzen 9 3900X** (`rustc 1.91.0 -C opt-level=3`, `512` blo
 | `idct8_1d_odd` | `93 -> 71` | `0` / `0` | `100.0%` (`451` insns, `96` `ymm`) | `6.41` | `3.30` | **`1.94x`** | Vertical 4-block `i64x4` AVX2 + signed Barrett `/ 289` + 4x4 transpose |
 | `idct8_1d_even` | `49 -> 37` | `0` / `0` | `100.0%` (`264` insns, `55` `ymm`) | `3.62` | `2.26` | **`1.60x`** | Vertical 4-block `i64x4` AVX2 + signed Barrett `/ 29` + 4x4 transpose |
 | `dct8_1d_even` | `69 -> 31` | `0` / `0` | `100.0%` (`241` insns, `34` `ymm`) | `4.21` | `2.75` | **`1.53x`** | Vertical 4-block `i64x4` AVX2; domain proves all clamps dead |
-| `rans_renorm_branchless` | `137 -> 58` | `0` / `0` | `100.0%` (`83` insns, `40` `ymm`) | `3.03` | `2.70` | **`1.12x`** | Horizontal 8-lane `u32x8` AVX2 (`0x80000000`-biased `vpcmpgtd` + `vpblendvb`) |
+| `rans_refill_branchless` | `137 -> 58` | `0` / `0` | `100.0%` (`83` insns, `40` `ymm`) | `3.03` | `2.70` | **`1.12x`** | Horizontal 8-lane `u32x8` AVX2 (`0x80000000`-biased `vpcmpgtd` + `vpblendvb`) |
 
 Full-crate scan (`./target/release/zero-cc ../zero-rans/src --domain "raw: -262144..=262144, x: -32768..=32767, even: -1000000000..=1000000000, odd: -1000000000..=1000000000, next: 0..=4294967295"`): `7` files, `152` functions, `26` kernels extracted, **`25/26` compiled to `100.0%` direct `ET_EXEC` + `ET_REL` with `0` spills in `23.22 ms`**, and **`26/26` compiled to standalone `0`-import `WASM32` (+`SIMD128`) in `21.36 ms`**.
 
@@ -47,7 +47,7 @@ Verified live in **Node v22** (`WebAssembly.validate` + `WebAssembly.instantiate
 | :--- | :--- | :---: | :---: | :---: | :---: |
 | `idct8_1d_combine` | `VerticalI64x2` | `736 B` | `268` / `40` | `0` | `4.39` |
 | `dct8_1d_even` | `VerticalI64x2` | `832 B` | `339` / `46` | `0` | `4.54` |
-| `rans_renorm_branchless` | `HorizontalI32x4` | `687 B` | `203` / `58` | `0` | `4.78` |
+| `rans_refill_branchless` | `HorizontalI32x4` | `687 B` | `203` / `58` | `0` | `4.78` |
 | `dct8_1d_odd` | `VerticalI64x2` | `1,182 B` | `515` / `68` | `0` | `5.46` |
 | `idct8_1d_even` | `VerticalI64x2` | `904 B` | `359` / `48` | `0` | `6.54` |
 | `idct8_1d_odd` | `VerticalI64x2` | `1,460 B` | `631` / `82` | `0` | `9.56` |

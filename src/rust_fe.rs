@@ -13,28 +13,30 @@ use crate::{compile_kernel, CompiledKernel};
 
 const MAX_UNROLL: i64 = 16;
 const MAX_INLINE_DEPTH: usize = 6;
+const MAX_PARSE_DEPTH: usize = 128;
 const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Tok { Ident(String), Int(i64), DocDomain(String), Sym(String) }
+enum Tok { Ident(String), Int(i64, Option<ValTy>), DocDomain(String), Sym(String) }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ValTy { I64, I32, I16, U64, U32, U16, U8, Usize }
+enum ValTy { Bool, I64, I32, I16, U64, U32, U16, U8, Usize }
 
 impl ValTy {
     const fn from_elem(e: ElemTy) -> Self {
         match e {
-            ElemTy::I64 => Self::I64,
-            ElemTy::U64 => Self::U64,
-            ElemTy::I32 => Self::I32,
-            ElemTy::I16 => Self::I16,
-            ElemTy::U32 => Self::U32,
-            ElemTy::U16 => Self::U16,
-            ElemTy::U8 => Self::U8,
+            ElemTy::I64 => Self::I64, ElemTy::U64 => Self::U64, ElemTy::I32 => Self::I32,
+            ElemTy::I16 => Self::I16, ElemTy::U32 => Self::U32, ElemTy::U16 => Self::U16, ElemTy::U8 => Self::U8,
         }
     }
     const fn is_signed(self) -> bool { matches!(self, Self::I64 | Self::I32 | Self::I16) }
     const fn is_u64_cmp(self) -> bool { matches!(self, Self::U64 | Self::Usize) }
+    const fn bits(self) -> u8 {
+        match self { Self::Bool => 1, Self::U8 => 8, Self::I16 | Self::U16 => 16, Self::I32 | Self::U32 => 32, _ => 64 }
+    }
+    const fn to_unsigned(self) -> Self {
+        match self { Self::I16 => Self::U16, Self::I32 => Self::U32, Self::I64 => Self::U64, o => o }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +92,25 @@ fn parse_int_literal(raw: &str, radix: u32) -> Result<i64, CompileError> {
     u64::from_str_radix(&digits, radix).map(|v| v as i64).map_err(|_| perr(format!("bad int '{raw}'")))
 }
 
+fn parse_int_suffix(raw: &str) -> Result<Option<ValTy>, CompileError> {
+    match raw.trim_start_matches('_') {
+        "" => Ok(None), "u8" => Ok(Some(ValTy::U8)), "u16" => Ok(Some(ValTy::U16)),
+        "u32" => Ok(Some(ValTy::U32)), "u64" => Ok(Some(ValTy::U64)), "usize" => Ok(Some(ValTy::Usize)),
+        "i16" => Ok(Some(ValTy::I16)), "i32" => Ok(Some(ValTy::I32)), "i64" => Ok(Some(ValTy::I64)),
+        s => Err(perr(format!("unsupported int suffix '{s}'"))),
+    }
+}
+
+fn skip_block_comment(b: &[u8], start: usize) -> (usize, bool) {
+    let (mut j, mut d) = (start + 2, 1usize);
+    while j + 1 < b.len() && d > 0 {
+        if &b[j..j + 2] == b"/*" { d += 1; j += 2; }
+        else if &b[j..j + 2] == b"*/" { d -= 1; j += 2; }
+        else { j += 1; }
+    }
+    if d > 0 { (b.len(), false) } else { (j, true) }
+}
+
 fn lex_rust(src: &str) -> Result<Vec<Tok>, CompileError> {
     if !src.is_ascii() { return Err(perr("non-ASCII Rust source")); }
     let (b, mut i, mut out) = (src.as_bytes(), 0usize, Vec::new());
@@ -103,9 +124,9 @@ fn lex_rust(src: &str) -> Result<Vec<Tok>, CompileError> {
         } else if b[i..].starts_with(b"//") {
             while i < b.len() && b[i] != b'\n' { i += 1; }
         } else if b[i..].starts_with(b"/*") {
-            i += 2; while i + 1 < b.len() && &b[i..i + 2] != b"*/" { i += 1; }
-            if i + 1 >= b.len() { return Err(perr("unterminated block comment")); }
-            i += 2;
+            let (next, closed) = skip_block_comment(b, i);
+            if !closed { return Err(perr("unterminated block comment")); }
+            i = next;
         } else if b[i].is_ascii_alphabetic() || b[i] == b'_' {
             let s = i; while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') { i += 1; }
             out.push(Tok::Ident(src[s..i].into()));
@@ -114,20 +135,20 @@ fn lex_rust(src: &str) -> Result<Vec<Tok>, CompileError> {
                 i += 2; (16u32, i)
             } else if b[i] == b'0' && matches!(b.get(i + 1), Some(b'b' | b'B')) {
                 i += 2; (2u32, i)
-            } else {
-                (10u32, i)
-            };
+            } else if b[i] == b'0' && matches!(b.get(i + 1), Some(b'o' | b'O')) {
+                i += 2; (8u32, i)
+            } else { (10u32, i) };
             while i < b.len() && (b[i] == b'_' || (b[i] as char).is_digit(radix)) { i += 1; }
             let end = i;
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') { i += 1; }
-            out.push(Tok::Int(parse_int_literal(&src[start..end], radix)?));
-        } else if let Some(s) = ["..=", "..", "==", "!=", ">=", "<=", "&&", "||", "<<", ">>", "->", "::", "#!"]
-            .into_iter().find(|s| b[i..].starts_with(s.as_bytes()))
-        {
+            let sty = parse_int_suffix(&src[end..i])?;
+            out.push(Tok::Int(parse_int_literal(&src[start..end], radix)?, sty));
+        } else if let Some(s) = [
+            "<<=", ">>=", "..=", "+=", "-=", "*=", "&=", "|=", "^=",
+            "..", "==", "!=", ">=", "<=", "&&", "||", "<<", ">>", "->", "::", "#!",
+        ].into_iter().find(|s| b[i..].starts_with(s.as_bytes())) {
             out.push(Tok::Sym(s.into())); i += s.len();
-        } else {
-            out.push(Tok::Sym((b[i] as char).to_string())); i += 1;
-        }
+        } else { out.push(Tok::Sym((b[i] as char).to_string())); i += 1; }
     }
     Ok(out)
 }
@@ -135,7 +156,7 @@ fn lex_rust(src: &str) -> Result<Vec<Tok>, CompileError> {
 fn parse_signed(toks: &[Tok], p: &mut usize) -> Result<i64, CompileError> {
     let neg = toks.get(*p) == Some(&Tok::Sym("-".into()));
     if neg { *p += 1; }
-    let Some(Tok::Int(v)) = toks.get(*p) else { return Err(perr("expected integer")); };
+    let Some(Tok::Int(v, _)) = toks.get(*p) else { return Err(perr("expected integer")); };
     *p += 1;
     if neg { v.checked_neg().ok_or_else(|| perr("int overflow")) } else { Ok(*v) }
 }
@@ -143,9 +164,7 @@ fn parse_signed(toks: &[Tok], p: &mut usize) -> Result<i64, CompileError> {
 fn parse_domain_list(toks: &[Tok], out: &mut BTreeMap<String, Domain>) -> Result<(), CompileError> {
     let slice = if toks.first() == Some(&Tok::Sym("(".into())) && toks.last() == Some(&Tok::Sym(")".into())) {
         &toks[1..toks.len() - 1]
-    } else {
-        toks
-    };
+    } else { toks };
     for part in slice.split(|t| *t == Tok::Sym(",".into())).filter(|p| !p.is_empty()) {
         let mut p = 0usize;
         let name = match part.get(p) { Some(Tok::Ident(s)) => { p += 1; s.clone() } _ => return Err(perr("expected domain param")) };
@@ -161,9 +180,7 @@ fn parse_domain_list(toks: &[Tok], out: &mut BTreeMap<String, Domain>) -> Result
             if m <= 0 || part.get(p) != Some(&Tok::Sym("==".into())) { return Err(perr("bad mod clause")); }
             p += 1;
             Domain::congruent(lo, hi, m, parse_signed(part, &mut p)?)
-        } else {
-            Domain::range(lo, hi)
-        };
+        } else { Domain::range(lo, hi) };
         if p != part.len() { return Err(perr("trailing domain tokens")); }
         out.insert(name, dom);
     }
@@ -190,13 +207,17 @@ fn binop_prec(tok: Option<&Tok>) -> Option<(u8, &'static str)> {
     })
 }
 
+fn compound_binop(tok: Option<&Tok>) -> Option<&'static str> {
+    let Tok::Sym(s) = tok? else { return None };
+    Some(match s.as_str() {
+        "+=" => "+", "-=" => "-", "*=" => "*", "&=" => "&", "|=" => "|", "^=" => "^", "<<=" => "<<", ">>=" => ">>",
+        _ => return None,
+    })
+}
+
 fn elem_from_scalar_name(name: &str) -> Option<(ElemTy, ValTy, Domain)> {
-    if name == "usize" {
-        return Some((ElemTy::I64, ValTy::Usize, Domain::range(0, i64::MAX)));
-    }
-    if name == "bool" {
-        return Some((ElemTy::U8, ValTy::U8, Domain::range(0, 1)));
-    }
+    if name == "usize" { return Some((ElemTy::I64, ValTy::Usize, Domain::range(0, i64::MAX))); }
+    if name == "bool" { return Some((ElemTy::U8, ValTy::Bool, Domain::range(0, 1))); }
     let e = ElemTy::from_rust_name(name)?;
     Some((e, ValTy::from_elem(e), e.natural_domain()))
 }
@@ -239,23 +260,32 @@ struct Lowerer {
     init_mem: NodeId,
     mem: NodeId,
     buf_ids: BTreeMap<String, u8>,
+    slice_bufs: BTreeMap<u8, Option<u8>>,
     lane_loaded: BTreeSet<u8>,
     vars: BTreeMap<String, (NodeId, ValTy)>,
     consts: BTreeMap<String, i64>,
     final_out: Vec<(u8, u8, NodeId)>,
     helpers: BTreeMap<String, HelperFn>,
-    bool_masks: BTreeMap<NodeId, NodeId>,
+    bool_masks: BTreeMap<NodeId, (NodeId, u64)>,
     inline_depth: usize,
+    depth: usize,
 }
 
 impl Lowerer {
-    fn new(toks: Vec<Tok>, helpers: BTreeMap<String, HelperFn>) -> Self {
+    fn new(toks: Vec<Tok>, helpers: BTreeMap<String, HelperFn>, consts: BTreeMap<String, i64>) -> Self {
         Self {
             toks, pos: 0, k: Kernel::new(""), doms: Vec::new(), init_mem: 0, mem: 0,
-            buf_ids: BTreeMap::new(), lane_loaded: BTreeSet::new(), vars: BTreeMap::new(),
-            consts: BTreeMap::new(), final_out: Vec::new(), helpers,
-            bool_masks: BTreeMap::new(), inline_depth: 0,
+            buf_ids: BTreeMap::new(), slice_bufs: BTreeMap::new(), lane_loaded: BTreeSet::new(),
+            vars: BTreeMap::new(), consts, final_out: Vec::new(), helpers,
+            bool_masks: BTreeMap::new(), inline_depth: 0, depth: 0,
         }
+    }
+    fn with_depth<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, CompileError>) -> Result<T, CompileError> {
+        if self.depth >= MAX_PARSE_DEPTH { return Err(perr("expression nesting depth exceeded")); }
+        self.depth += 1;
+        let r = f(self);
+        self.depth -= 1;
+        r
     }
     fn peek(&self) -> Option<&Tok> { self.toks.get(self.pos) }
     fn eat(&mut self, is_sym: bool, s: &str) -> bool {
@@ -290,13 +320,48 @@ impl Lowerer {
         if let Op::Sub(a, b) = op {
             if self.doms.get(a).and_then(|x| x.is_const()) == Some(0) {
                 if let Some(bd) = self.doms.get(b) {
-                    if !bd.is_empty() && bd.lo >= 0 && bd.hi <= 1 {
-                        self.bool_masks.insert(id, b);
-                    }
+                    if !bd.is_empty() && bd.lo >= 0 && bd.hi <= 1 { self.bool_masks.insert(id, (b, u64::MAX)); }
                 }
             }
         }
         id
+    }
+    fn mask_to_ty(&mut self, n: NodeId, ty: ValTy) -> NodeId {
+        let d = self.dom(n);
+        match ty {
+            ValTy::I64 | ValTy::U64 | ValTy::Usize => n,
+            ValTy::Bool | ValTy::U8 | ValTy::U16 | ValTy::U32 => {
+                let lim = (1i64 << ty.bits()) - 1;
+                if !d.is_empty() && d.is_nonneg() && d.hi <= lim { return n; }
+                if let Some(c) = d.is_const() { return self.push(Op::Const(c & lim)); }
+                let bm = self.bool_masks.get(&n).copied();
+                let m = self.push(Op::Const(lim));
+                let res = self.push(Op::BitAnd(n, m));
+                if let Some((cond, mb)) = bm { self.bool_masks.insert(res, (cond, mb & (lim as u64))); }
+                res
+            }
+            ValTy::I16 | ValTy::I32 => {
+                let (sh, lo, hi) = if ty == ValTy::I32 { (32u8, i32::MIN as i64, i32::MAX as i64) } else { (48u8, i16::MIN as i64, i16::MAX as i64) };
+                if !d.is_empty() && d.lo >= lo && d.hi <= hi { return n; }
+                if let Some(c) = d.is_const() { return self.push(Op::Const((c << sh) >> sh)); }
+                let s = self.push(Op::Shl(n, sh));
+                self.push(Op::Shr(s, sh))
+            }
+        }
+    }
+    fn mask_shift_for_ty(&mut self, amt: NodeId, ty: ValTy) -> NodeId {
+        let m = i64::from(ty.bits()) - 1;
+        let d = self.dom(amt);
+        if !d.is_empty() && d.is_nonneg() && d.hi <= m { return amt; }
+        if let Some(c) = d.is_const() { return self.push(Op::Const(c & m)); }
+        let mc = self.push(Op::Const(m));
+        self.push(Op::BitAnd(amt, mc))
+    }
+    fn zero_ext_narrow(&mut self, n: NodeId, ty: ValTy) -> NodeId {
+        match ty { ValTy::I32 => self.mask_to_ty(n, ValTy::U32), ValTy::I16 => self.mask_to_ty(n, ValTy::U16), _ => n }
+    }
+    fn touch_slice_lane(&mut self, buf: u8, lane: u8) {
+        if let Some(slot) = self.slice_bufs.get_mut(&buf) { *slot = Some(slot.map_or(lane, |cur| cur.max(lane))); }
     }
     fn dom(&self, id: NodeId) -> Domain { self.doms.get(id).copied().unwrap_or_else(Domain::top) }
     fn as_bool(&mut self, id: NodeId) -> NodeId {
@@ -312,9 +377,7 @@ impl Lowerer {
         self.mem = self.push(Op::Store { mem: self.mem, buf, lane, val });
         if let Some(slot) = self.final_out.iter_mut().find(|o| o.0 == buf && o.1 == lane) {
             slot.2 = val;
-        } else {
-            self.final_out.push((buf, lane, val));
-        }
+        } else { self.final_out.push((buf, lane, val)); }
     }
     fn realize(&mut self, ev: ExprVal) -> Result<(NodeId, ValTy), CompileError> {
         match ev {
@@ -331,22 +394,23 @@ impl Lowerer {
         let ev = self.parse_prec(min_p)?;
         self.realize(ev)
     }
-    fn push_shift(&mut self, base: NodeId, ty: ValTy, amt: NodeId, is_shr: bool, _check_ushr: bool) -> Result<NodeId, CompileError> {
+    fn push_shift(&mut self, base: NodeId, ty: ValTy, amt: NodeId, is_shr: bool, is_wrapping: bool) -> Result<NodeId, CompileError> {
+        let amt = if is_wrapping || ty.bits() < 64 { self.mask_shift_for_ty(amt, ty) } else { amt };
         if let Some(s) = self.dom(amt).is_const() {
             if !(0..64).contains(&s) { return Err(CompileError::InvalidShift(s as u8)); }
-            if !is_shr { return Ok(self.push(Op::Shl(base, s as u8))); }
-            if !ty.is_signed() && !self.dom(base).is_nonneg() {
-                return Ok(self.push(Op::Ushr(base, s as u8)));
+            if !is_shr {
+                let sh = self.push(Op::Shl(base, s as u8));
+                return Ok(self.mask_to_ty(sh, ty));
             }
+            if !ty.is_signed() && !self.dom(base).is_nonneg() { return Ok(self.push(Op::Ushr(base, s as u8))); }
             return Ok(self.push(Op::Shr(base, s as u8)));
         }
         if !is_shr {
-            Ok(self.push(Op::ShlVar(base, amt)))
+            let sh = self.push(Op::ShlVar(base, amt));
+            Ok(self.mask_to_ty(sh, ty))
         } else if !ty.is_signed() {
             Ok(self.push(Op::ShrVarU(base, amt)))
-        } else {
-            Err(perr("signed variable right shift unsupported in kernel IR"))
-        }
+        } else { Err(perr("signed variable right shift unsupported in kernel IR")) }
     }
     fn push_div(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
         if let Some(d) = self.dom(rhs).is_const() {
@@ -377,7 +441,7 @@ impl Lowerer {
     }
     fn try_const(&self, start: usize, end: usize) -> Option<i64> {
         let atom = |p: &mut usize| match self.toks.get(*p)? {
-            Tok::Int(v) => { *p += 1; Some(*v) }
+            Tok::Int(v, _) => { *p += 1; Some(*v) }
             Tok::Ident(s) => { *p += 1; self.consts.get(s).copied() }
             _ => None,
         };
@@ -433,16 +497,15 @@ impl Lowerer {
             next.modulus = 1; next.rem = 0;
             if let Some(slot) = self.doms.get_mut(a) { *slot = next; }
             Some((a, old))
-        } else {
-            None
-        }
+        } else { None }
     }
     fn restore_branch(&mut self, saved: Option<(NodeId, Domain)>) {
         if let Some((id, d)) = saved {
             if let Some(slot) = self.doms.get_mut(id) { *slot = d; }
         }
     }
-    fn parse_if_stmt(&mut self) -> Result<(), CompileError> {
+    fn parse_if_stmt(&mut self) -> Result<(), CompileError> { self.with_depth(|s| s.parse_if_stmt_inner()) }
+    fn parse_if_stmt_inner(&mut self) -> Result<(), CompileError> {
         let (cond, _) = self.parse_node(1)?;
         let (sv, sm, so) = (self.vars.clone(), self.mem, self.final_out.clone());
         let st = self.narrow_for_branch(cond, true);
@@ -480,6 +543,9 @@ impl Lowerer {
         Ok(())
     }
     fn parse_if_expr_vals(&mut self) -> Result<Vec<(NodeId, ValTy)>, CompileError> {
+        self.with_depth(|s| s.parse_if_expr_vals_inner())
+    }
+    fn parse_if_expr_vals_inner(&mut self) -> Result<Vec<(NodeId, ValTy)>, CompileError> {
         if self.eat_id("let") {
             let some_kw = self.req_id()?;
             if some_kw != "Some" { return Err(perr("if-let only supports Some(var)")); }
@@ -496,13 +562,16 @@ impl Lowerer {
             let (val, ok) = match meth.as_str() {
                 "checked_add" => {
                     let sum = self.push(Op::Add(lhs, rhs));
-                    let cmp = self.push(Op::Cmp(CmpKind::Uge, sum, lhs));
-                    (sum, cmp)
+                    let cmp = if lty.bits() < 64 && !lty.is_signed() {
+                        let lc = self.push(Op::Const((1i64 << lty.bits()) - 1));
+                        self.push(Op::Cmp(CmpKind::Le, sum, lc))
+                    } else { self.push(Op::Cmp(CmpKind::Uge, sum, lhs)) };
+                    (self.mask_to_ty(sum, lty), cmp)
                 }
                 "checked_sub" => {
                     let diff = self.push(Op::Sub(lhs, rhs));
                     let cmp = self.push(Op::Cmp(CmpKind::Uge, lhs, rhs));
-                    (diff, cmp)
+                    (self.mask_to_ty(diff, lty), cmp)
                 }
                 _ => return Err(perr(format!("unsupported if-let method '{meth}'"))),
             };
@@ -570,12 +639,16 @@ impl Lowerer {
                         let (lhs, ty) = self.realize(lhs_ev)?;
                         let (res, ovf) = if m == "overflowing_add" {
                             let s = self.push(Op::Add(lhs, rhs));
-                            (s, self.push(Op::Cmp(CmpKind::Ult, s, lhs)))
+                            let ov = if ty.bits() < 64 && !ty.is_signed() {
+                                let lc = self.push(Op::Const((1i64 << ty.bits()) - 1));
+                                self.push(Op::Cmp(CmpKind::Gt, s, lc))
+                            } else { self.push(Op::Cmp(CmpKind::Ult, s, lhs)) };
+                            (self.mask_to_ty(s, ty), ov)
                         } else {
                             let d = self.push(Op::Sub(lhs, rhs));
-                            (d, self.push(Op::Cmp(CmpKind::Ult, lhs, rhs)))
+                            (self.mask_to_ty(d, ty), self.push(Op::Cmp(CmpKind::Ult, lhs, rhs)))
                         };
-                        return Ok(vec![(res, ty), (ovf, ValTy::U8)]);
+                        return Ok(vec![(res, ty), (ovf, ValTy::Bool)]);
                     }
                 }
             }
@@ -591,9 +664,7 @@ impl Lowerer {
                 names.push(self.req_id()?);
                 if !self.eat_sym(",") { self.req_sym(")")?; break; }
             }
-            if self.eat_sym(":") {
-                let _ = self.skip_balanced("(", ")")?;
-            }
+            if self.eat_sym(":") { let _ = self.skip_balanced("(", ")")?; }
             self.req_sym("=")?;
             let vals = self.parse_tuple_rhs()?;
             self.req_sym(";")?;
@@ -605,100 +676,191 @@ impl Lowerer {
         }
         let _ = self.eat_id("mut");
         let name = self.req_id()?;
-        if self.eat_sym(":") { let _ = self.req_id()?; }
+        let ann_ty = if self.eat_sym(":") {
+            let tn = self.req_id()?;
+            elem_from_scalar_name(&tn).map(|(_, t, _)| t)
+        } else { None };
         self.req_sym("=")?;
-        let val = self.parse_node(1)?;
+        let (mut vn, mut vt) = self.parse_node(1)?;
         self.req_sym(";")?;
-        self.vars.insert(name, val);
+        if let Some(t) = ann_ty { vn = self.mask_to_ty(vn, t); vt = t; }
+        self.vars.insert(name, (vn, vt));
         Ok(())
     }
-    fn parse_block(&mut self) -> Result<(), CompileError> {
-        self.req_sym("{")?;
-        while !self.eat_sym("}") {
-            if self.pos >= self.toks.len() { return Err(perr("unclosed block")); }
-            if self.eat_id("for") {
-                let var = self.req_id()?;
-                if !self.eat_id("in") { return Err(perr("expected 'in'")); }
-                let lo = parse_signed(&self.toks, &mut self.pos)?;
-                let incl = if self.eat_sym("..=") { true } else { self.req_sym("..")?; false };
-                let hi = parse_signed(&self.toks, &mut self.pos)?;
-                let hi_e = if incl { hi.checked_add(1).ok_or_else(|| perr("loop overflow"))? } else { hi };
-                if lo < 0 || hi_e < lo || hi_e - lo > MAX_UNROLL {
-                    return Err(perr("for-loop bounds must be constant with 0..=16 trips"));
-                }
-                let (bpos, mut epos) = (self.pos, self.pos);
-                if lo == hi_e { self.skip_balanced("{", "}")?; continue; }
-                for v in lo..hi_e {
-                    let (sv, sc) = (self.vars.clone(), self.consts.clone());
-                    self.consts.insert(var.clone(), v);
-                    self.pos = bpos;
-                    self.parse_block()?;
-                    epos = self.pos;
-                    self.vars = sv; self.consts = sc;
-                }
-                self.pos = epos;
-            } else if self.eat_id("if") {
-                self.parse_if_stmt()?;
-            } else if self.eat_id("let") {
-                self.parse_let_stmt()?;
-            } else if self.eat_id("assert") {
-                let (vname, chk) = self.parse_assert()?;
-                self.req_sym(";")?;
-                if let Some(n) = vname { self.vars.insert(n, (chk, ValTy::I64)); }
-            } else if let Some(Tok::Ident(name)) = self.peek().cloned() {
-                if let Some(&buf) = self.buf_ids.get(&name) {
+    fn parse_bound(&mut self) -> Result<i64, CompileError> {
+        if let Some(Tok::Ident(c)) = self.peek().cloned() {
+            if let Some(&v) = self.consts.get(&c) { self.pos += 1; return Ok(v); }
+        }
+        parse_signed(&self.toks, &mut self.pos)
+    }
+    fn parse_for_stmt(&mut self) -> Result<(), CompileError> {
+        let var = self.req_id()?;
+        if !self.eat_id("in") { return Err(perr("expected 'in'")); }
+        let lo = self.parse_bound()?;
+        let incl = if self.eat_sym("..=") { true } else { self.req_sym("..")?; false };
+        let hi = self.parse_bound()?;
+        let hi_e = if incl { hi.checked_add(1).ok_or_else(|| perr("loop overflow"))? } else { hi };
+        if lo < 0 || hi_e < lo || hi_e - lo > MAX_UNROLL {
+            return Err(perr("for-loop bounds must be constant with 0..=16 trips"));
+        }
+        let (bpos, mut epos) = (self.pos, self.pos);
+        if lo == hi_e { self.skip_balanced("{", "}")?; return Ok(()); }
+        let outer_keys: BTreeSet<String> = self.vars.keys().cloned().collect();
+        let sc = self.consts.clone();
+        for v in lo..hi_e {
+            self.consts = sc.clone();
+            self.consts.insert(var.clone(), v);
+            self.pos = bpos;
+            self.parse_block()?;
+            epos = self.pos;
+            self.vars.retain(|k, _| outer_keys.contains(k));
+        }
+        self.consts = sc;
+        self.pos = epos;
+        Ok(())
+    }
+    fn try_parse_stmt(&mut self, allow_if: bool) -> Result<bool, CompileError> {
+        if self.eat_id("for") { self.parse_for_stmt()?; return Ok(true); }
+        if self.eat_id("let") { self.parse_let_stmt()?; return Ok(true); }
+        if self.eat_id("assert") {
+            let (vname, chk) = self.parse_assert()?;
+            self.req_sym(";")?;
+            if let Some(n) = vname { self.vars.insert(n, (chk, ValTy::I64)); }
+            return Ok(true);
+        }
+        if allow_if && self.eat_id("if") { self.parse_if_stmt()?; return Ok(true); }
+        if let Some(Tok::Ident(name)) = self.peek().cloned() {
+            if let Some(&buf) = self.buf_ids.get(&name) {
+                if self.toks.get(self.pos + 1) == Some(&Tok::Sym("[".into())) {
+                    let saved = self.pos;
                     self.pos += 1;
                     let lstart = self.skip_balanced("[", "]")?;
+                    if self.peek() != Some(&Tok::Sym("=".into())) && compound_binop(self.peek()).is_none() {
+                        self.pos = saved;
+                        return Ok(false);
+                    }
                     let lv = self.try_const(lstart, self.pos - 1).ok_or_else(|| perr("store index must be constant lane"))?;
                     let max_lanes = self.k.bufs.get(buf as usize).map_or(LANES as i64, |b| i64::from(b.lanes));
                     if lv < 0 || lv >= max_lanes { return Err(CompileError::InvalidLane(lane_u8(lv))); }
-                    self.req_sym("=")?;
+                    let val = if self.eat_sym("=") {
+                        self.parse_node(1)?.0
+                    } else if let Some(bop) = compound_binop(self.peek()) {
+                        self.pos += 1;
+                        let b_elem = self.k.bufs.get(buf as usize).map_or(ElemTy::I64, |b| b.elem_ty);
+                        let ty = ValTy::from_elem(b_elem);
+                        let old = self.push(Op::Load { mem: self.mem, buf, lane: lv as u8 });
+                        let rhs = self.parse_prec(1)?;
+                        let ev = self.apply_binop(bop, ExprVal::Node(old, ty), rhs)?;
+                        self.realize(ev)?.0
+                    } else { return Err(perr("expected assignment operator")); };
+                    self.req_sym(";")?;
+                    self.touch_slice_lane(buf, lv as u8);
+                    self.record_store(buf, lv as u8, val);
+                    return Ok(true);
+                }
+            }
+            if let Some(&(old_id, old_ty)) = self.vars.get(&name) {
+                let nxt = self.toks.get(self.pos + 1);
+                if nxt == Some(&Tok::Sym("=".into())) {
+                    self.pos += 2;
                     let (val, _) = self.parse_node(1)?;
                     self.req_sym(";")?;
-                    self.record_store(buf, lv as u8, val);
-                } else if self.vars.contains_key(&name) {
-                    self.pos += 1;
-                    self.req_sym("=")?;
-                    let val = self.parse_node(1)?;
-                    self.req_sym(";")?;
-                    self.vars.insert(name, val);
-                } else {
-                    return Err(perr(format!("unknown target '{name}'")));
+                    let masked = self.mask_to_ty(val, old_ty);
+                    self.vars.insert(name, (masked, old_ty));
+                    return Ok(true);
                 }
-            } else {
-                return Err(perr("unexpected token in kernel body"));
+                if let Some(bop) = compound_binop(nxt) {
+                    self.pos += 2;
+                    let rhs = self.parse_prec(1)?;
+                    self.req_sym(";")?;
+                    let ev = self.apply_binop(bop, ExprVal::Node(old_id, old_ty), rhs)?;
+                    let (val, _) = self.realize(ev)?;
+                    let masked = self.mask_to_ty(val, old_ty);
+                    self.vars.insert(name, (masked, old_ty));
+                    return Ok(true);
+                }
             }
         }
-        Ok(())
+        Ok(false)
+    }
+    fn parse_block(&mut self) -> Result<(), CompileError> {
+        self.with_depth(|s| {
+            s.req_sym("{")?;
+            while !s.eat_sym("}") {
+                if s.pos >= s.toks.len() { return Err(perr("unclosed block")); }
+                if !s.try_parse_stmt(true)? { return Err(perr("unexpected token in kernel body")); }
+            }
+            Ok(())
+        })
+    }
+    fn is_early_return_if(&self) -> bool {
+        let (mut p, mut d) = (self.pos + 1, 0usize);
+        while p < self.toks.len() {
+            match &self.toks[p] {
+                Tok::Sym(s) if s == "(" || s == "[" => d += 1,
+                Tok::Sym(s) if s == ")" || s == "]" => d = d.saturating_sub(1),
+                Tok::Sym(s) if s == "{" && d == 0 => return self.toks.get(p + 1) == Some(&Tok::Ident("return".into())),
+                _ => {}
+            }
+            p += 1;
+        }
+        false
+    }
+    fn parse_expr_block_tail(&mut self) -> Result<Vec<(NodeId, ValTy)>, CompileError> {
+        self.with_depth(|s| {
+            loop {
+                if s.pos >= s.toks.len() { return Err(perr("unclosed expr block")); }
+                if s.try_parse_stmt(false)? { continue; }
+                if s.eat_id("return") {
+                    let out = s.parse_tuple_rhs()?;
+                    let _ = s.eat_sym(";");
+                    s.req_sym("}")?;
+                    return Ok(out);
+                }
+                if s.peek() == Some(&Tok::Ident("if".into())) && s.is_early_return_if() {
+                    s.pos += 1;
+                    let (cond, _) = s.parse_node(1)?;
+                    let st = s.narrow_for_branch(cond, true);
+                    let tv_res = (|| -> Result<Vec<(NodeId, ValTy)>, CompileError> {
+                        s.req_sym("{")?;
+                        if !s.eat_id("return") { return Err(perr("expected 'return'")); }
+                        let rv = s.parse_tuple_rhs()?;
+                        let _ = s.eat_sym(";");
+                        s.req_sym("}")?;
+                        Ok(rv)
+                    })();
+                    s.restore_branch(st);
+                    let tv = tv_res?;
+                    let sf = s.narrow_for_branch(cond, false);
+                    let fv_res = s.parse_expr_block_tail();
+                    s.restore_branch(sf);
+                    let fv = fv_res?;
+                    if tv.len() != fv.len() { return Err(perr("early-return tuple arity mismatch")); }
+                    return Ok(tv.into_iter().zip(fv).map(|((t, ty), (f, _))| (s.merge_select(cond, t, f), ty)).collect());
+                }
+                break;
+            }
+            let out = s.parse_tuple_rhs()?;
+            let _ = s.eat_sym(";");
+            s.req_sym("}")?;
+            Ok(out)
+        })
     }
     fn parse_expr_block(&mut self) -> Result<Vec<(NodeId, ValTy)>, CompileError> {
         self.req_sym("{")?;
-        loop {
-            if self.pos >= self.toks.len() { return Err(perr("unclosed expr block")); }
-            if self.eat_id("let") {
-                self.parse_let_stmt()?;
-            } else if self.eat_id("assert") {
-                let (vname, chk) = self.parse_assert()?;
-                self.req_sym(";")?;
-                if let Some(n) = vname { self.vars.insert(n, (chk, ValTy::I64)); }
-            } else {
-                break;
-            }
-        }
-        let out = self.parse_tuple_rhs()?;
-        let _ = self.eat_sym(";");
-        self.req_sym("}")?;
-        Ok(out)
+        self.parse_expr_block_tail()
     }
     fn parse_prec(&mut self, min_p: u8) -> Result<ExprVal, CompileError> {
-        let mut lhs = self.parse_cast()?;
-        while let Some((p, op)) = binop_prec(self.peek()) {
-            if p < min_p { break; }
-            self.pos += 1;
-            let rhs = self.parse_prec(p + 1)?;
-            lhs = self.apply_binop(op, lhs, rhs)?;
-        }
-        Ok(lhs)
+        self.with_depth(|s| {
+            let mut lhs = s.parse_cast()?;
+            while let Some((p, op)) = binop_prec(s.peek()) {
+                if p < min_p { break; }
+                s.pos += 1;
+                let rhs = s.parse_prec(p + 1)?;
+                lhs = s.apply_binop(op, lhs, rhs)?;
+            }
+            Ok(lhs)
+        })
     }
     fn apply_binop(&mut self, op: &str, lhs: ExprVal, rhs: ExprVal) -> Result<ExprVal, CompileError> {
         if op == "^" {
@@ -717,52 +879,55 @@ impl Lowerer {
             return Ok(ExprVal::Xor(ln, rn, ty));
         }
         if op == "&" {
-            if let (ExprVal::Xor(a, b, ty), ExprVal::Node(mask, _)) = (lhs, rhs) {
-                if let Some(&cond) = self.bool_masks.get(&mask) {
-                    return Ok(ExprVal::MaskedXor { a, b, cond, ty });
-                }
-            }
-            if let (ExprVal::Node(mask, _), ExprVal::Xor(a, b, ty)) = (lhs, rhs) {
-                if let Some(&cond) = self.bool_masks.get(&mask) {
-                    return Ok(ExprVal::MaskedXor { a, b, cond, ty });
+            let xor_mask = match (lhs, rhs) {
+                (ExprVal::Xor(a, b, ty), ExprVal::Node(mask, _))
+                | (ExprVal::Node(mask, _), ExprVal::Xor(a, b, ty)) => Some((a, b, ty, mask)),
+                _ => None,
+            };
+            if let Some((a, b, ty, mask)) = xor_mask {
+                if let Some(&(cond, mb)) = self.bool_masks.get(&mask) {
+                    let (da, db) = (self.dom(a), self.dom(b));
+                    let fits = mb == u64::MAX || (!da.is_empty() && !db.is_empty() && da.is_nonneg() && db.is_nonneg() && (da.hi as u64) <= mb && (db.hi as u64) <= mb);
+                    if fits { return Ok(ExprVal::MaskedXor { a, b, cond, ty }); }
                 }
             }
         }
         let ((ln, ty), (rn, rty)) = (self.realize(lhs)?, self.realize(rhs)?);
         let u64_cmp = ty.is_u64_cmp() || rty.is_u64_cmp();
-        let id = match op {
+        let (id, out_ty) = match op {
             "||" => {
                 let (ba, bb) = (self.as_bool(ln), self.as_bool(rn));
                 let s = self.push(Op::Add(ba, bb));
                 let z = self.push(Op::Const(0));
-                self.push(Op::Cmp(CmpKind::Ne, s, z))
+                (self.push(Op::Cmp(CmpKind::Ne, s, z)), ValTy::Bool)
             }
             "&&" => {
                 let (ba, bb) = (self.as_bool(ln), self.as_bool(rn));
-                self.push(Op::BitAnd(ba, bb))
+                (self.push(Op::BitAnd(ba, bb)), ValTy::Bool)
             }
-            "==" => self.push(Op::Cmp(CmpKind::Eq, ln, rn)),
-            "!=" => self.push(Op::Cmp(CmpKind::Ne, ln, rn)),
-            "<" => self.push(Op::Cmp(if u64_cmp { CmpKind::Ult } else { CmpKind::Lt }, ln, rn)),
-            "<=" => self.push(Op::Cmp(if u64_cmp { CmpKind::Ule } else { CmpKind::Le }, ln, rn)),
-            ">" => self.push(Op::Cmp(if u64_cmp { CmpKind::Ugt } else { CmpKind::Gt }, ln, rn)),
-            ">=" => self.push(Op::Cmp(if u64_cmp { CmpKind::Uge } else { CmpKind::Ge }, ln, rn)),
-            "|" => match (self.dom(ln).is_const(), self.dom(rn).is_const()) {
-                (Some(a), Some(b)) => self.push(Op::Const(a | b)),
-                _ if disjoint_or_pow2(self.dom(ln), self.dom(rn)) || disjoint_or_pow2(self.dom(rn), self.dom(ln)) => {
-                    self.push(Op::Add(ln, rn))
-                }
-                _ => self.push(Op::BitOr(ln, rn)),
-            },
-            "&" => self.push(Op::BitAnd(ln, rn)),
-            "<<" | ">>" => self.push_shift(ln, ty, rn, op == ">>", true)?,
-            "+" => self.push(Op::Add(ln, rn)),
-            "-" => self.push(Op::Sub(ln, rn)),
-            "*" => self.push(Op::Mul(ln, rn)),
-            "/" => self.push_div(ln, rn),
-            _ => self.push(Op::Rem(ln, rn)),
+            "==" => (self.push(Op::Cmp(CmpKind::Eq, ln, rn)), ValTy::Bool),
+            "!=" => (self.push(Op::Cmp(CmpKind::Ne, ln, rn)), ValTy::Bool),
+            "<" => (self.push(Op::Cmp(if u64_cmp { CmpKind::Ult } else { CmpKind::Lt }, ln, rn)), ValTy::Bool),
+            "<=" => (self.push(Op::Cmp(if u64_cmp { CmpKind::Ule } else { CmpKind::Le }, ln, rn)), ValTy::Bool),
+            ">" => (self.push(Op::Cmp(if u64_cmp { CmpKind::Ugt } else { CmpKind::Gt }, ln, rn)), ValTy::Bool),
+            ">=" => (self.push(Op::Cmp(if u64_cmp { CmpKind::Uge } else { CmpKind::Ge }, ln, rn)), ValTy::Bool),
+            "|" => {
+                let v = match (self.dom(ln).is_const(), self.dom(rn).is_const()) {
+                    (Some(a), Some(b)) => self.push(Op::Const(a | b)),
+                    _ if disjoint_or_pow2(self.dom(ln), self.dom(rn)) || disjoint_or_pow2(self.dom(rn), self.dom(ln)) => self.push(Op::Add(ln, rn)),
+                    _ => self.push(Op::BitOr(ln, rn)),
+                };
+                (v, ty)
+            }
+            "&" => (self.push(Op::BitAnd(ln, rn)), ty),
+            "<<" | ">>" => (self.push_shift(ln, ty, rn, op == ">>", false)?, ty),
+            "+" => { let v = self.push(Op::Add(ln, rn)); (self.mask_to_ty(v, ty), ty) }
+            "-" => { let v = self.push(Op::Sub(ln, rn)); (self.mask_to_ty(v, ty), ty) }
+            "*" => { let v = self.push(Op::Mul(ln, rn)); (self.mask_to_ty(v, ty), ty) }
+            "/" => (self.push_div(ln, rn), ty),
+            _ => (self.push(Op::Rem(ln, rn)), ty),
         };
-        Ok(ExprVal::Node(id, ty))
+        Ok(ExprVal::Node(id, out_ty))
     }
     fn parse_cast(&mut self) -> Result<ExprVal, CompileError> {
         let mut expr = self.parse_primary()?;
@@ -773,31 +938,46 @@ impl Lowerer {
             self.req_sym("(")?;
             if self.eat_sym(")") {
                 n = match m.as_str() {
-                    "wrapping_neg" => { let z = self.push(Op::Const(0)); self.push(Op::Sub(z, n)) }
+                    "wrapping_neg" => { let z = self.push(Op::Const(0)); let r = self.push(Op::Sub(z, n)); self.mask_to_ty(r, ty) }
                     "abs" => {
                         let z = self.push(Op::Const(0));
                         let lt = self.push(Op::Cmp(CmpKind::Lt, n, z));
                         let neg = self.push(Op::Sub(z, n));
-                        self.push(Op::Select { cond: lt, t_val: neg, f_val: n })
+                        let s = self.push(Op::Select { cond: lt, t_val: neg, f_val: n });
+                        self.mask_to_ty(s, ty)
                     }
-                    "count_ones" => {
-                        let v = match ty {
-                            ValTy::I32 => { let mask = self.push(Op::Const(0xFFFF_FFFF)); self.push(Op::BitAnd(n, mask)) }
-                            ValTy::I16 => { let mask = self.push(Op::Const(0xFFFF)); self.push(Op::BitAnd(n, mask)) }
-                            _ => n,
-                        };
-                        out_ty = ValTy::U32;
-                        self.push(Op::Popcnt(v))
-                    }
+                    "count_ones" => { let v = self.zero_ext_narrow(n, ty); out_ty = ValTy::U32; self.push(Op::Popcnt(v)) }
                     "trailing_zeros" => {
-                        let v = match ty {
-                            ValTy::U32 | ValTy::I32 => { let hi = self.push(Op::Const(1i64 << 32)); self.push(Op::BitOr(n, hi)) }
-                            ValTy::U16 | ValTy::I16 => { let hi = self.push(Op::Const(1i64 << 16)); self.push(Op::BitOr(n, hi)) }
-                            ValTy::U8 => { let hi = self.push(Op::Const(1i64 << 8)); self.push(Op::BitOr(n, hi)) }
-                            _ => n,
-                        };
+                        let v = if ty.bits() < 64 { let hi = self.push(Op::Const(1i64 << ty.bits())); self.push(Op::BitOr(n, hi)) } else { n };
                         out_ty = ValTy::U32;
                         self.push(Op::Tzcnt(v))
+                    }
+                    "leading_zeros" => {
+                        let w = i64::from(ty.bits());
+                        let mut v = self.zero_ext_narrow(n, ty);
+                        for s in [1u8, 2, 4, 8, 16, 32] {
+                            if i64::from(s) < w {
+                                let sh = if !self.dom(v).is_nonneg() { self.push(Op::Ushr(v, s)) } else { self.push(Op::Shr(v, s)) };
+                                v = self.push(Op::BitOr(v, sh));
+                            }
+                        }
+                        let (wc, pc) = (self.push(Op::Const(w)), self.push(Op::Popcnt(v)));
+                        out_ty = ValTy::U32;
+                        self.push(Op::Sub(wc, pc))
+                    }
+                    "swap_bytes" => {
+                        let mut v = self.zero_ext_narrow(n, ty);
+                        for (sh, mask) in [(8u8, 0x00FF_00FF_00FF_00FFu64 as i64), (16u8, 0x0000_FFFF_0000_FFFFu64 as i64), (32u8, 0x0000_0000_FFFF_FFFFu64 as i64)] {
+                            if sh < ty.bits() {
+                                let mc = self.push(Op::Const(mask));
+                                let lo = self.push(Op::BitAnd(v, mc));
+                                let lsh = self.push(Op::Shl(lo, sh));
+                                let rsh = if !self.dom(v).is_nonneg() { self.push(Op::Ushr(v, sh)) } else { self.push(Op::Shr(v, sh)) };
+                                let hi = self.push(Op::BitAnd(rsh, mc));
+                                v = self.push(Op::BitOr(lsh, hi));
+                            }
+                        }
+                        self.mask_to_ty(v, ty)
                     }
                     _ => return Err(perr(format!("unsupported 0-arg method '.{m}'"))),
                 };
@@ -805,9 +985,9 @@ impl Lowerer {
                 let (arg, _) = self.parse_node(1)?;
                 self.req_sym(")")?;
                 n = match m.as_str() {
-                    "wrapping_add" => self.push(Op::Add(n, arg)),
-                    "wrapping_sub" => self.push(Op::Sub(n, arg)),
-                    "wrapping_mul" => self.push(Op::Mul(n, arg)),
+                    "wrapping_add" => { let r = self.push(Op::Add(n, arg)); self.mask_to_ty(r, ty) }
+                    "wrapping_sub" => { let r = self.push(Op::Sub(n, arg)); self.mask_to_ty(r, ty) }
+                    "wrapping_mul" => { let r = self.push(Op::Mul(n, arg)); self.mask_to_ty(r, ty) }
                     "saturating_sub" => {
                         if ty.is_signed() { return Err(perr("saturating_sub requires unsigned integer")); }
                         let ge = self.push(Op::Cmp(CmpKind::Uge, n, arg));
@@ -815,7 +995,40 @@ impl Lowerer {
                         let z = self.push(Op::Const(0));
                         self.push(Op::Select { cond: ge, t_val: diff, f_val: z })
                     }
-                    "wrapping_shl" | "wrapping_shr" => self.push_shift(n, ty, arg, m == "wrapping_shr", false)?,
+                    "saturating_add" => {
+                        if ty.is_signed() { return Err(perr("saturating_add requires unsigned integer")); }
+                        let sum = self.push(Op::Add(n, arg));
+                        if ty.bits() < 64 {
+                            let lc = self.push(Op::Const((1i64 << ty.bits()) - 1));
+                            let gt = self.push(Op::Cmp(CmpKind::Gt, sum, lc));
+                            self.push(Op::Select { cond: gt, t_val: lc, f_val: sum })
+                        } else {
+                            let ovf = self.push(Op::Cmp(CmpKind::Ult, sum, n));
+                            let mx = self.push(Op::Const(-1));
+                            self.push(Op::Select { cond: ovf, t_val: mx, f_val: sum })
+                        }
+                    }
+                    "abs_diff" => {
+                        let cmp_k = if ty.is_u64_cmp() { CmpKind::Uge } else { CmpKind::Ge };
+                        let ge = self.push(Op::Cmp(cmp_k, n, arg));
+                        let (d1, d2) = (self.push(Op::Sub(n, arg)), self.push(Op::Sub(arg, n)));
+                        let raw = self.push(Op::Select { cond: ge, t_val: d1, f_val: d2 });
+                        out_ty = ty.to_unsigned();
+                        self.mask_to_ty(raw, out_ty)
+                    }
+                    "wrapping_shl" | "wrapping_shr" => self.push_shift(n, ty, arg, m == "wrapping_shr", true)?,
+                    "rotate_left" | "rotate_right" => {
+                        let v = self.zero_ext_narrow(n, ty);
+                        let uty = ty.to_unsigned();
+                        let s = self.mask_shift_for_ty(arg, ty);
+                        let wc = self.push(Op::Const(i64::from(ty.bits())));
+                        let diff = self.push(Op::Sub(wc, s));
+                        let inv = self.mask_shift_for_ty(diff, ty);
+                        let (ls, rs) = if m == "rotate_left" { (s, inv) } else { (inv, s) };
+                        let (a, b) = (self.push_shift(v, uty, ls, false, true)?, self.push_shift(v, uty, rs, true, true)?);
+                        let raw = self.push(Op::BitOr(a, b));
+                        self.mask_to_ty(raw, ty)
+                    }
                     "min" => { let k = if ty.is_u64_cmp() { CmpKind::Ult } else { CmpKind::Lt }; let c = self.push(Op::Cmp(k, n, arg)); self.push(Op::Select { cond: c, t_val: n, f_val: arg }) }
                     "max" => { let k = if ty.is_u64_cmp() { CmpKind::Ugt } else { CmpKind::Gt }; let c = self.push(Op::Cmp(k, n, arg)); self.push(Op::Select { cond: c, t_val: n, f_val: arg }) }
                     "div_ceil" => {
@@ -831,51 +1044,10 @@ impl Lowerer {
             expr = ExprVal::Node(n, out_ty);
         }
         while self.eat_id("as") {
-            let (mut n, _) = self.realize(expr)?;
-            let d = self.dom(n);
+            let (n, _) = self.realize(expr)?;
             let target = self.req_id()?;
-            let ty = match target.as_str() {
-                "i64" => ValTy::I64,
-                "u64" => ValTy::U64,
-                "usize" => ValTy::Usize,
-                "u32" => {
-                    if !d.fits_u32() {
-                        let m = self.push(Op::Const(0xFFFF_FFFF));
-                        n = self.push(Op::BitAnd(n, m));
-                    }
-                    ValTy::U32
-                }
-                "u16" => {
-                    if !d.is_nonneg() || d.hi > u16::MAX as i64 {
-                        let m = self.push(Op::Const(0xFFFF));
-                        n = self.push(Op::BitAnd(n, m));
-                    }
-                    ValTy::U16
-                }
-                "u8" => {
-                    if !d.is_nonneg() || d.hi > u8::MAX as i64 {
-                        let m = self.push(Op::Const(0xFF));
-                        n = self.push(Op::BitAnd(n, m));
-                    }
-                    ValTy::U8
-                }
-                "i32" => {
-                    if d.is_empty() || d.lo < i32::MIN as i64 || d.hi > i32::MAX as i64 {
-                        let s = self.push(Op::Shl(n, 32));
-                        n = self.push(Op::Shr(s, 32));
-                    }
-                    ValTy::I32
-                }
-                "i16" => {
-                    if d.is_empty() || d.lo < i16::MIN as i64 || d.hi > i16::MAX as i64 {
-                        let s = self.push(Op::Shl(n, 48));
-                        n = self.push(Op::Shr(s, 48));
-                    }
-                    ValTy::I16
-                }
-                o => return Err(perr(format!("unsupported cast '{o}'"))),
-            };
-            expr = ExprVal::Node(n, ty);
+            let (_, ty, _) = elem_from_scalar_name(&target).ok_or_else(|| perr(format!("unsupported cast '{target}'")))?;
+            expr = ExprVal::Node(self.mask_to_ty(n, ty), ty);
         }
         Ok(expr)
     }
@@ -903,24 +1075,36 @@ impl Lowerer {
         if vals.len() != 1 { return Err(perr("tuple helper call unsupported inside scalar expr")); }
         Ok(ExprVal::Node(vals[0].0, vals[0].1))
     }
-    fn parse_primary(&mut self) -> Result<ExprVal, CompileError> {
+    fn parse_primary(&mut self) -> Result<ExprVal, CompileError> { self.with_depth(|s| s.parse_primary_inner()) }
+    fn parse_primary_inner(&mut self) -> Result<ExprVal, CompileError> {
         if self.eat_sym("-") {
-            if let Some(&Tok::Int(v)) = self.peek() {
+            if let Some(&Tok::Int(v, sty)) = self.peek() {
                 self.pos += 1;
-                return Ok(ExprVal::Node(self.push(Op::Const(v.checked_neg().ok_or_else(|| perr("int overflow"))?)), ValTy::I64));
+                let nv = v.checked_neg().ok_or_else(|| perr("int overflow"))?;
+                let ty = sty.unwrap_or(ValTy::I64);
+                let n = self.push(Op::Const(nv));
+                return Ok(ExprVal::Node(if sty.is_some() { self.mask_to_ty(n, ty) } else { n }, ty));
             }
             let (e, ty) = self.parse_primary().and_then(|ev| self.realize(ev))?;
             let z = self.push(Op::Const(0));
-            return Ok(ExprVal::Node(self.push(Op::Sub(z, e)), ty));
+            let r = self.push(Op::Sub(z, e));
+            return Ok(ExprVal::Node(self.mask_to_ty(r, ty), ty));
         }
         if self.eat_sym("!") {
-            let (e, _) = self.parse_primary().and_then(|ev| self.realize(ev))?;
-            let z = self.push(Op::Const(0));
-            return Ok(ExprVal::Node(self.push(Op::Cmp(CmpKind::Eq, e, z)), ValTy::I64));
+            let (e, ty) = self.parse_primary().and_then(|ev| self.realize(ev))?;
+            if ty == ValTy::Bool {
+                let z = self.push(Op::Const(0));
+                return Ok(ExprVal::Node(self.push(Op::Cmp(CmpKind::Eq, e, z)), ValTy::Bool));
+            }
+            let m = self.push(Op::Const(-1));
+            let x = self.push(Op::BitXor(e, m));
+            return Ok(ExprVal::Node(self.mask_to_ty(x, ty), ty));
         }
-        if let Some(&Tok::Int(v)) = self.peek() {
+        if let Some(&Tok::Int(v, sty)) = self.peek() {
             self.pos += 1;
-            return Ok(ExprVal::Node(self.push(Op::Const(v)), ValTy::I64));
+            let ty = sty.unwrap_or(ValTy::I64);
+            let n = self.push(Op::Const(v));
+            return Ok(ExprVal::Node(if sty.is_some() { self.mask_to_ty(n, ty) } else { n }, ty));
         }
         if self.eat_sym("(") {
             let v = self.parse_prec(1)?;
@@ -942,7 +1126,7 @@ impl Lowerer {
         }
         let name = self.req_id()?;
         if name == "true" || name == "false" {
-            return Ok(ExprVal::Node(self.push(Op::Const(i64::from(name == "true"))), ValTy::I64));
+            return Ok(ExprVal::Node(self.push(Op::Const(i64::from(name == "true"))), ValTy::Bool));
         }
         if self.eat_sym("::") {
             let method = self.req_id()?;
@@ -951,18 +1135,18 @@ impl Lowerer {
                 let (arg, _) = self.parse_node(1)?;
                 self.req_sym(")")?;
                 let ty = elem_from_scalar_name(&name).map_or(ValTy::I64, |(_, t, _)| t);
-                return Ok(ExprVal::Node(arg, ty));
+                return Ok(ExprVal::Node(self.mask_to_ty(arg, ty), ty));
             }
             if method == "MAX" || method == "MIN" {
                 let c = match (name.as_str(), method.as_str()) {
-                    ("u64", "MAX") => (u64::MAX as i64, ValTy::U64),
-                    ("u64", "MIN") => (0, ValTy::U64),
-                    ("u32", "MAX") => (u32::MAX as i64, ValTy::U32),
-                    ("u32", "MIN") => (0, ValTy::U32),
-                    ("u16", "MAX") => (u16::MAX as i64, ValTy::U16),
-                    ("u8", "MAX") => (u8::MAX as i64, ValTy::U8),
-                    ("i64", "MAX") => (i64::MAX, ValTy::I64),
-                    ("i64", "MIN") => (i64::MIN, ValTy::I64),
+                    ("u64", "MAX") => (u64::MAX as i64, ValTy::U64), ("u64", "MIN") => (0, ValTy::U64),
+                    ("usize", "MAX") => (u64::MAX as i64, ValTy::Usize), ("usize", "MIN") => (0, ValTy::Usize),
+                    ("u32", "MAX") => (u32::MAX as i64, ValTy::U32), ("u32", "MIN") => (0, ValTy::U32),
+                    ("u16", "MAX") => (u16::MAX as i64, ValTy::U16), ("u16", "MIN") => (0, ValTy::U16),
+                    ("u8", "MAX") => (u8::MAX as i64, ValTy::U8), ("u8", "MIN") => (0, ValTy::U8),
+                    ("i64", "MAX") => (i64::MAX, ValTy::I64), ("i64", "MIN") => (i64::MIN, ValTy::I64),
+                    ("i32", "MAX") => (i32::MAX as i64, ValTy::I32), ("i32", "MIN") => (i32::MIN as i64, ValTy::I32),
+                    ("i16", "MAX") => (i16::MAX as i64, ValTy::I16), ("i16", "MIN") => (i16::MIN as i64, ValTy::I16),
                     _ => return Err(perr(format!("unsupported const '{name}::{method}'"))),
                 };
                 return Ok(ExprVal::Node(self.push(Op::Const(c.0)), c.1));
@@ -991,13 +1175,13 @@ impl Lowerer {
                 if let Some(lv) = self.try_const(istart, self.pos - 1) {
                     if lv < 0 || lv >= b_lanes as i64 { return Err(CompileError::InvalidLane(lane_u8(lv))); }
                     self.lane_loaded.insert(buf);
+                    self.touch_slice_lane(buf, lv as u8);
                     let m = if b_acc == BufAccess::ReadOnly { self.init_mem } else { self.mem };
                     return Ok(ExprVal::Node(self.push(Op::Load { mem: m, buf, lane: lv as u8 }), ty));
                 }
+                if self.slice_bufs.contains_key(&buf) { return Err(perr("dynamic index on unsized slice unsupported")); }
                 if b_acc == BufAccess::ReadOnly && !self.lane_loaded.contains(&buf) {
-                    if let Some(slot) = self.k.bufs.get_mut(buf as usize) {
-                        slot.access = BufAccess::LookupTable(b_lanes);
-                    }
+                    if let Some(slot) = self.k.bufs.get_mut(buf as usize) { slot.access = BufAccess::LookupTable(b_lanes); }
                 }
             }
             self.pos = saved;
@@ -1027,10 +1211,8 @@ fn parse_fn_header(low: &mut Lowerer, domains: &mut BTreeMap<String, Domain>) ->
             _ => break,
         }
     }
-    if low.eat_id("pub") && low.peek() == Some(&Tok::Sym("(".into())) {
-        low.skip_balanced("(", ")")?;
-    }
-    let _ = low.eat_id("const");
+    if low.eat_id("pub") && low.peek() == Some(&Tok::Sym("(".into())) { low.skip_balanced("(", ")")?; }
+    while low.eat_id("const") || low.eat_id("unsafe") {}
     if !low.eat_id("fn") { return Err(perr("expected 'fn'")); }
     let name = low.req_id()?;
     low.req_sym("(")?;
@@ -1046,16 +1228,18 @@ fn parse_kernel_internal(
     src: &str,
     overrides: &BTreeMap<String, Domain>,
     helpers: &BTreeMap<String, HelperFn>,
+    consts: &BTreeMap<String, i64>,
     allow_scalar_lift: bool,
 ) -> Result<Kernel, CompileError> {
     let mut domains = BTreeMap::new();
-    let mut low = Lowerer::new(lex_rust(src)?, helpers.clone());
+    let mut low = Lowerer::new(lex_rust(src)?, helpers.clone(), consts.clone());
     low.k.name = parse_fn_header(&mut low, &mut domains)?;
     for (k, v) in overrides { domains.insert(k.clone(), *v); }
 
     let mut scalar_params: Vec<(String, ElemTy, ValTy, Domain)> = Vec::new();
     let mut saw_array = false;
     while !low.eat_sym(")") {
+        let _ = low.eat_id("mut");
         let pname = low.req_id()?;
         low.req_sym(":")?;
         if low.eat_sym("&") {
@@ -1065,23 +1249,27 @@ fn parse_kernel_internal(
             let ty_name = low.req_id()?;
             let elem_ty = ElemTy::from_rust_name(&ty_name)
                 .ok_or_else(|| perr(format!("unsupported buffer element type '{ty_name}'")))?;
-            low.req_sym(";")?;
-            let len = match low.peek() {
-                Some(&Tok::Int(v)) if v > 0 => { low.pos += 1; v as usize }
-                _ => return Err(perr("expected array len")),
-            };
+            let (len, is_slice) = if low.eat_sym(";") {
+                let n = match low.peek().cloned() {
+                    Some(Tok::Int(v, _)) if v > 0 => { low.pos += 1; v as usize }
+                    Some(Tok::Ident(c)) if low.consts.get(&c).is_some_and(|&v| v > 0) => {
+                        let v = low.consts[&c] as usize; low.pos += 1; v
+                    }
+                    _ => return Err(perr("expected array len")),
+                };
+                (n, false)
+            } else { (LANES, true) };
             low.req_sym("]")?;
             let (access, lanes) = if is_mut {
                 if len == 0 || len > LANES { return Err(perr("&mut buffer lanes must be 1..=8")); }
                 (BufAccess::MutNoAlias, len as u8)
             } else if len <= LANES {
                 (BufAccess::ReadOnly, len as u8)
-            } else {
-                (BufAccess::LookupTable(len), LANES as u8)
-            };
+            } else { (BufAccess::LookupTable(len), LANES as u8) };
             let dom = domains.get(&pname).copied().map_or_else(|| elem_ty.natural_domain(), |d| tighten_with_elem(d, elem_ty));
             let id = low.k.add_typed_buf(pname.clone(), access, elem_ty, lanes, dom);
             low.buf_ids.insert(pname, id);
+            if is_slice { low.slice_bufs.insert(id, None); }
         } else {
             if !allow_scalar_lift || saw_array { return Err(perr("expected '&[T; N]' buffer param")); }
             let ty_name = low.req_id()?;
@@ -1116,8 +1304,8 @@ fn parse_kernel_internal(
             let (e, _, d) = elem_from_scalar_name(&tn).ok_or_else(|| perr(format!("unsupported return type '{tn}'")))?;
             ret_tys.push((e, d));
         }
-        if ret_tys.is_empty() || ret_tys.len() > 2 || scalar_params.len() + ret_tys.len() > 5 {
-            return Err(perr("scalar lift supports 1..=2 returns and <= 5 total buffers"));
+        if ret_tys.is_empty() || ret_tys.len() > 4 || scalar_params.len() + ret_tys.len() > 5 {
+            return Err(perr("scalar lift supports 1..=4 returns and <= 5 total buffers"));
         }
         let mut in_bufs = Vec::new();
         for (pname, elem_ty, vty, dom) in scalar_params {
@@ -1141,12 +1329,13 @@ fn parse_kernel_internal(
             low.pos = body_pos;
             let res = low.parse_expr_block()?;
             if res.len() != out_bufs.len() { return Err(perr("scalar return arity mismatch")); }
-            for (&obuf, (val, _)) in out_bufs.iter().zip(res) {
-                low.record_store(obuf, lane, val);
-            }
+            for (&obuf, (val, _)) in out_bufs.iter().zip(res) { low.record_store(obuf, lane, val); }
         }
     }
 
+    for (bid, max_lane) in &low.slice_bufs {
+        if let Some(b) = low.k.bufs.get_mut(*bid as usize) { b.lanes = max_lane.map_or(1, |m| m + 1); }
+    }
     for (buf, lane, val) in low.final_out { low.k.add_output(buf, lane, val); }
     low.k.validate()?;
     Ok(low.k)
@@ -1155,43 +1344,47 @@ fn parse_kernel_internal(
 /// Parse a raw safe-Rust `.rs` kernel function (with optional preceding helper functions) into `Kernel` IR.
 pub fn parse_rust_kernel(src: &str) -> Result<Kernel, CompileError> {
     let clean = sanitize_ascii_comments(src);
-    let fns = extract_top_level_fns(&clean);
+    let (fns, consts) = extract_top_level_items(&clean);
     if fns.len() > 1 {
         let mut helpers = BTreeMap::new();
         for (_, snippet) in &fns {
-            if let Some((name, h)) = try_parse_helper_fn(snippet) {
-                helpers.insert(name, h);
-            }
+            if let Some((name, h)) = try_parse_helper_fn(snippet, &consts) { helpers.insert(name, h); }
         }
         if !helpers.is_empty() {
             if let Some((_, snippet)) = fns.iter().find(|(n, _)| !helpers.contains_key(n)) {
-                return parse_kernel_internal(snippet, &BTreeMap::new(), &helpers, true);
+                return parse_kernel_internal(snippet, &BTreeMap::new(), &helpers, &consts, true);
             }
         }
     }
-    parse_kernel_internal(src, &BTreeMap::new(), &BTreeMap::new(), false)
+    if fns.len() == 1 && !consts.is_empty() {
+        return parse_kernel_internal(&fns[0].1, &BTreeMap::new(), &BTreeMap::new(), &consts, true);
+    }
+    parse_kernel_internal(src, &BTreeMap::new(), &BTreeMap::new(), &consts, false)
 }
 
 /// Parse a named entry kernel from a multi-function safe-Rust module, inlining all sibling helpers.
 pub fn parse_rust_pipeline(src: &str, entry: &str) -> Result<Kernel, CompileError> {
     let clean = sanitize_ascii_comments(src);
-    let fns = extract_top_level_fns(&clean);
+    let (fns, consts) = extract_top_level_items(&clean);
     let mut helpers = BTreeMap::new();
     for (name, snippet) in &fns {
         if name != entry {
-            if let Some((hname, h)) = try_parse_helper_fn(snippet) {
-                helpers.insert(hname, h);
-            }
+            if let Some((hname, h)) = try_parse_helper_fn(snippet, &consts) { helpers.insert(hname, h); }
         }
     }
     let (_, snippet) = fns.iter().find(|(n, _)| n == entry)
         .ok_or_else(|| perr(format!("pipeline entry '{entry}' not found")))?;
-    parse_kernel_internal(snippet, &BTreeMap::new(), &helpers, true)
+    parse_kernel_internal(snippet, &BTreeMap::new(), &helpers, &consts, true)
 }
 
 /// Parse a raw safe-Rust `.rs` kernel function with explicit parameter domain overrides.
 pub fn parse_rust_kernel_with_domains(src: &str, overrides: &BTreeMap<String, Domain>) -> Result<Kernel, CompileError> {
-    parse_kernel_internal(src, overrides, &BTreeMap::new(), true)
+    let clean = sanitize_ascii_comments(src);
+    let (fns, consts) = extract_top_level_items(&clean);
+    if fns.len() == 1 && !consts.is_empty() {
+        return parse_kernel_internal(&fns[0].1, overrides, &BTreeMap::new(), &consts, true);
+    }
+    parse_kernel_internal(src, overrides, &BTreeMap::new(), &consts, true)
 }
 
 /// Compile a raw safe-Rust `.rs` kernel source directly through E-Graph + zero-spill codegen.
@@ -1233,9 +1426,7 @@ fn sanitize_ascii_comments(src: &str) -> String {
             in_str = true; out.push(c);
         } else if c.is_ascii() {
             out.push(c);
-        } else {
-            out.push(' ');
-        }
+        } else { out.push(' '); }
     }
     out
 }
@@ -1243,19 +1434,9 @@ fn sanitize_ascii_comments(src: &str) -> String {
 fn skip_ws_and_comments(b: &[u8], mut i: usize) -> usize {
     loop {
         while i < b.len() && b[i].is_ascii_whitespace() { i += 1; }
-        if i + 1 < b.len() && &b[i..i + 2] == b"//" {
-            while i < b.len() && b[i] != b'\n' { i += 1; }
-        } else if i + 1 < b.len() && &b[i..i + 2] == b"/*" {
-            i += 2;
-            let mut d = 1usize;
-            while i + 1 < b.len() && d > 0 {
-                if &b[i..i + 2] == b"/*" { d += 1; i += 2; }
-                else if &b[i..i + 2] == b"*/" { d -= 1; i += 2; }
-                else { i += 1; }
-            }
-        } else {
-            return i;
-        }
+        if i + 1 < b.len() && &b[i..i + 2] == b"//" { while i < b.len() && b[i] != b'\n' { i += 1; } }
+        else if i + 1 < b.len() && &b[i..i + 2] == b"/*" { i = skip_block_comment(b, i).0; }
+        else { return i; }
     }
 }
 
@@ -1265,16 +1446,7 @@ fn scan_code_byte(b: &[u8], i: usize) -> Option<usize> {
         while j < b.len() && b[j] != b'\n' { j += 1; }
         return Some(j);
     }
-    if i + 1 < b.len() && &b[i..i + 2] == b"/*" {
-        let mut j = i + 2;
-        let mut d = 1usize;
-        while j + 1 < b.len() && d > 0 {
-            if &b[j..j + 2] == b"/*" { d += 1; j += 2; }
-            else if &b[j..j + 2] == b"*/" { d -= 1; j += 2; }
-            else { j += 1; }
-        }
-        return Some(j);
-    }
+    if i + 1 < b.len() && &b[i..i + 2] == b"/*" { return Some(skip_block_comment(b, i).0); }
     if b[i] == b'"' {
         let mut j = i + 1;
         while j < b.len() {
@@ -1293,26 +1465,37 @@ fn scan_code_byte(b: &[u8], i: usize) -> Option<usize> {
 }
 
 fn find_matching_delim(b: &[u8], open_pos: usize, open: u8, close: u8) -> Option<usize> {
-    let mut i = open_pos + 1;
-    let mut depth = 1usize;
+    let (mut i, mut depth) = (open_pos + 1, 1usize);
     while i < b.len() {
         if let Some(next) = scan_code_byte(b, i) { i = next; continue; }
         if b[i] == open { depth += 1; }
-        else if b[i] == close {
-            depth -= 1;
-            if depth == 0 { return Some(i); }
-        }
+        else if b[i] == close { depth -= 1; if depth == 0 { return Some(i); } }
         i += 1;
     }
     None
 }
 
-fn extract_top_level_fns(clean: &str) -> Vec<(String, String)> {
+fn try_parse_top_const(snippet: &str, consts: &BTreeMap<String, i64>) -> Option<(String, i64)> {
+    let toks = lex_rust(snippet).ok()?;
+    let mut low = Lowerer::new(toks, BTreeMap::new(), consts.clone());
+    if low.eat_id("pub") && low.peek() == Some(&Tok::Sym("(".into())) { low.skip_balanced("(", ")").ok()?; }
+    if !low.eat_id("const") { return None; }
+    let name = low.req_id().ok()?;
+    low.req_sym(":").ok()?;
+    let tname = low.req_id().ok()?;
+    let (_, ty, _) = elem_from_scalar_name(&tname)?;
+    low.req_sym("=").ok()?;
+    let (id, _) = low.parse_node(1).ok()?;
+    low.req_sym(";").ok()?;
+    let masked = low.mask_to_ty(id, ty);
+    Some((name, low.dom(masked).is_const()?))
+}
+
+fn extract_top_level_items(clean: &str) -> (Vec<(String, String)>, BTreeMap<String, i64>) {
+    if !clean.is_ascii() { return (Vec::new(), BTreeMap::new()); }
     let b = clean.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let mut pending_prefix = String::new();
-    let mut skip_cfg_test = false;
+    let (mut out, mut consts) = (Vec::new(), BTreeMap::new());
+    let (mut i, mut pending_prefix, mut skip_cfg_test) = (0usize, String::new(), false);
     while i < b.len() {
         while i < b.len() && b[i].is_ascii_whitespace() { i += 1; }
         if i >= b.len() { break; }
@@ -1331,10 +1514,7 @@ fn extract_top_level_fns(clean: &str) -> Vec<(String, String)> {
                 if let Some(end) = find_matching_delim(b, op, b'[', b']') {
                     let attr = &clean[i..=end];
                     if attr.contains("cfg(test)") { skip_cfg_test = true; }
-                    else if attr.contains("zero_domain") {
-                        pending_prefix.push_str(attr);
-                        pending_prefix.push('\n');
-                    }
+                    else if attr.contains("zero_domain") { pending_prefix.push_str(attr); pending_prefix.push('\n'); }
                     i = end + 1;
                     continue;
                 }
@@ -1342,9 +1522,7 @@ fn extract_top_level_fns(clean: &str) -> Vec<(String, String)> {
             }
         }
         let item_start = i;
-        let mut is_fn = false;
-        let mut fn_name = String::new();
-        let mut scan = i;
+        let (mut is_fn, mut is_const, mut fn_name, mut scan) = (false, false, String::new(), i);
         while scan < b.len() {
             scan = skip_ws_and_comments(b, scan);
             if scan >= b.len() { break; }
@@ -1358,8 +1536,10 @@ fn extract_top_level_fns(clean: &str) -> Vec<(String, String)> {
                 }
                 continue;
             }
-            if word == "const" { continue; }
+            if word == "unsafe" { continue; }
+            if word == "const" { is_const = true; continue; }
             if word == "fn" {
+                is_const = false;
                 let ns = skip_ws_and_comments(b, scan);
                 let mut ne = ns;
                 while ne < b.len() && (b[ne].is_ascii_alphanumeric() || b[ne] == b'_') { ne += 1; }
@@ -1367,8 +1547,7 @@ fn extract_top_level_fns(clean: &str) -> Vec<(String, String)> {
             }
             break;
         }
-        let mut j = item_start;
-        let mut item_end = b.len();
+        let (mut j, mut item_end) = (item_start, b.len());
         while j < b.len() {
             if let Some(next) = scan_code_byte(b, j) { j = next; continue; }
             if b[j] == b'(' {
@@ -1379,14 +1558,17 @@ fn extract_top_level_fns(clean: &str) -> Vec<(String, String)> {
                 if let Some(end) = find_matching_delim(b, j, b'[', b']') { j = end + 1; continue; }
                 break;
             }
-            if b[j] == b';' { item_end = j + 1; break; }
+            if b[j] == b';' {
+                item_end = j + 1;
+                if is_const && !skip_cfg_test {
+                    if let Some((cn, cv)) = try_parse_top_const(&clean[item_start..=j], &consts) { consts.insert(cn, cv); }
+                }
+                break;
+            }
             if b[j] == b'{' {
                 if let Some(end) = find_matching_delim(b, j, b'{', b'}') {
                     item_end = end + 1;
-                    if is_fn && !skip_cfg_test {
-                        let snippet = format!("{}{}", pending_prefix, &clean[item_start..=end]);
-                        out.push((fn_name.clone(), snippet));
-                    }
+                    if is_fn && !skip_cfg_test { out.push((fn_name.clone(), format!("{}{}", pending_prefix, &clean[item_start..=end]))); }
                 }
                 break;
             }
@@ -1396,16 +1578,17 @@ fn extract_top_level_fns(clean: &str) -> Vec<(String, String)> {
         skip_cfg_test = false;
         i = item_end.max(i + 1);
     }
-    out
+    (out, consts)
 }
 
-fn try_parse_helper_fn(snippet: &str) -> Option<(String, HelperFn)> {
+fn try_parse_helper_fn(snippet: &str, consts: &BTreeMap<String, i64>) -> Option<(String, HelperFn)> {
     let toks = lex_rust(snippet).ok()?;
-    let mut low = Lowerer::new(toks, BTreeMap::new());
+    let mut low = Lowerer::new(toks, BTreeMap::new(), consts.clone());
     let mut domains = BTreeMap::new();
     let name = parse_fn_header(&mut low, &mut domains).ok()?;
     let mut params = Vec::new();
     while !low.eat_sym(")") {
+        let _ = low.eat_id("mut");
         let pname = low.req_id().ok()?;
         low.req_sym(":").ok()?;
         let tname = low.req_id().ok()?;
@@ -1439,12 +1622,10 @@ pub fn parse_rust_file_kernels(
     domain_overrides: &BTreeMap<String, BTreeMap<String, Domain>>,
 ) -> Vec<Kernel> {
     let clean = sanitize_ascii_comments(src);
-    let fns = extract_top_level_fns(&clean);
+    let (fns, consts) = extract_top_level_items(&clean);
     let mut helpers = BTreeMap::new();
     for (_, snippet) in &fns {
-        if let Some((name, h)) = try_parse_helper_fn(snippet) {
-            helpers.insert(name, h);
-        }
+        if let Some((name, h)) = try_parse_helper_fn(snippet, &consts) { helpers.insert(name, h); }
     }
     let global = domain_overrides.get("*").cloned().unwrap_or_default();
     let mut out = Vec::new();
@@ -1453,9 +1634,7 @@ pub fn parse_rust_file_kernels(
         if let Some(specific) = domain_overrides.get(&name) {
             for (k, v) in specific { ov.insert(k.clone(), *v); }
         }
-        if let Ok(k) = parse_kernel_internal(&snippet, &ov, &helpers, true) {
-            out.push(k);
-        }
+        if let Ok(k) = parse_kernel_internal(&snippet, &ov, &helpers, &consts, true) { out.push(k); }
     }
     out
 }
@@ -1478,9 +1657,7 @@ fn collect_rs_files(path: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()
                 matches!(n, "target" | "tests" | "benches" | "examples" | ".git")
             });
             if !skip { collect_rs_files(&p, out)?; }
-        } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
-            out.push(p);
-        }
+        } else if p.extension().and_then(|e| e.to_str()) == Some("rs") { out.push(p); }
     }
     Ok(())
 }
@@ -1499,7 +1676,7 @@ pub fn extract_crate_kernels(
         let Ok(src) = fs::read_to_string(&file) else { continue; };
         files_scanned += 1;
         let clean = sanitize_ascii_comments(&src);
-        let fns = extract_top_level_fns(&clean);
+        let (fns, _) = extract_top_level_items(&clean);
         functions_seen += fns.len();
         let file_label = file.strip_prefix(path).unwrap_or(&file).display().to_string();
         for kernel in parse_rust_file_kernels(&src, domain_overrides) {

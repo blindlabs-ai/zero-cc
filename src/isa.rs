@@ -172,9 +172,7 @@ impl X86Emit {
             self.code.extend_from_slice(&[x86_rex_w(0, dst), 0xC7, x86_modrm(3, 0, dst)]);
             self.code.extend_from_slice(&v32.to_le_bytes());
             self.insns += 1;
-        } else {
-            self.movabs_imm64(dst, v as u64);
-        }
+        } else { self.movabs_imm64(dst, v as u64); }
     }
     fn push_mem_disp(&mut self, reg: u8, base: u8, disp: i32) {
         let b7 = base & 7;
@@ -194,9 +192,7 @@ impl X86Emit {
     }
     fn push_load_prefix_opc(&mut self, ty: ElemTy, dst: u8, idx: u8, base: u8) {
         let need_w = matches!(ty, ElemTy::I64 | ElemTy::U64 | ElemTy::I32 | ElemTy::I16);
-        if need_w || dst >= 8 || idx >= 8 || base >= 8 {
-            self.code.push(x86_rex_byte(need_w, dst, idx, base));
-        }
+        if need_w || dst >= 8 || idx >= 8 || base >= 8 { self.code.push(x86_rex_byte(need_w, dst, idx, base)); }
         match ty {
             ElemTy::I64 | ElemTy::U64 | ElemTy::U32 => self.code.push(0x8B),
             ElemTy::I32 => self.code.push(0x63),
@@ -233,9 +229,7 @@ impl X86Emit {
         let scale = ty.scale_shift();
         if (base & 7) == 5 {
             self.code.extend_from_slice(&[x86_modrm(1, dst, 4), x86_sib(scale, idx, base), 0]);
-        } else {
-            self.code.extend_from_slice(&[x86_modrm(0, dst, 4), x86_sib(scale, idx, base)]);
-        }
+        } else { self.code.extend_from_slice(&[x86_modrm(0, dst, 4), x86_sib(scale, idx, base)]); }
         self.insns += 1;
     }
     fn op_imm8(&mut self, opc: u8, subop: u8, dst: u8, imm: u8, skip_zero: bool) {
@@ -254,10 +248,15 @@ impl X86Emit {
         self.code.push((if is_pop { 0x58 } else { 0x50 }) + (r & 7));
         self.insns += 1;
     }
-    pub(crate) fn vex_ymm_op_w(&mut self, map: u8, w: u8, opc: u8, dst: u8, vvvv: u8, rm: u8) {
-        let vw = x86_vex3_word((dst >> 3) & 1, (rm >> 3) & 1, map, w, vvvv, 1, 1).to_le_bytes();
+    fn vex3_reg(&mut self, cfg: [u8; 5], dst: u8, vvvv: u8, rm: u8, imm: Option<u8>) {
+        let [map, w, l, pp, opc] = cfg;
+        let vw = x86_vex3_word((dst >> 3) & 1, (rm >> 3) & 1, map, w, vvvv, l, pp).to_le_bytes();
         self.code.extend_from_slice(&[0xC4, vw[0], vw[1], opc, x86_modrm(3, dst, rm)]);
+        if let Some(i) = imm { self.code.push(i); }
         self.insns += 1;
+    }
+    pub(crate) fn vex_ymm_op_w(&mut self, map: u8, w: u8, opc: u8, dst: u8, vvvv: u8, rm: u8) {
+        self.vex3_reg([map, w, 1, 1, opc], dst, vvvv, rm, None);
     }
     pub(crate) fn vex_ymm_op(&mut self, map: u8, opc: u8, dst: u8, vvvv: u8, rm: u8) {
         self.vex_ymm_op_w(map, 0, opc, dst, vvvv, rm);
@@ -267,53 +266,33 @@ impl X86Emit {
         self.code.extend_from_slice(&[0x0F, 0x18]);
         self.push_mem_disp(1, base, disp);
     }
-    fn bmi2_shift(&mut self, pp: u8, dst: u8, src: u8, amt: u8) {
-        let vw = x86_vex3_word((dst >> 3) & 1, (src >> 3) & 1, 2, 1, amt, 0, pp).to_le_bytes();
-        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], 0xF7, x86_modrm(3, dst, src)]);
-        self.insns += 1;
-    }
+    fn bmi2_shift(&mut self, pp: u8, dst: u8, src: u8, amt: u8) { self.vex3_reg([2, 1, 0, pp, 0xF7], dst, amt, src, None); }
     pub(crate) fn vex_ymm_imm(&mut self, map: u8, opc: u8, dst: u8, vvvv: u8, rm: u8, imm: u8) {
-        self.vex_ymm_op(map, opc, dst, vvvv, rm);
-        self.code.push(imm);
+        self.vex3_reg([map, 0, 1, 1, opc], dst, vvvv, rm, Some(imm));
     }
     pub(crate) fn vex_vshufps(&mut self, dst: u8, vvvv: u8, rm: u8, imm: u8) {
-        let vw = x86_vex3_word((dst >> 3) & 1, (rm >> 3) & 1, 1, 0, vvvv, 1, 0).to_le_bytes();
-        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], 0xC6, x86_modrm(3, dst, rm), imm]);
-        self.insns += 1;
+        self.vex3_reg([1, 0, 1, 0, 0xC6], dst, vvvv, rm, Some(imm));
     }
     pub(crate) fn vex_vpermq(&mut self, dst: u8, src: u8, imm: u8) {
-        let vw = x86_vex3_word((dst >> 3) & 1, (src >> 3) & 1, 3, 1, 0, 1, 1).to_le_bytes();
-        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], 0x00, x86_modrm(3, dst, src), imm]);
-        self.insns += 1;
+        self.vex3_reg([3, 1, 1, 1, 0x00], dst, 0, src, Some(imm));
     }
-    pub(crate) fn vex_vptest(&mut self, a: u8, b: u8) {
-        let vw = x86_vex3_word((a >> 3) & 1, (b >> 3) & 1, 2, 0, 0, 1, 1).to_le_bytes();
-        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], 0x17, x86_modrm(3, a, b)]);
-        self.insns += 1;
-    }
-    pub(crate) fn jcc_placeholder(&mut self, cc: u8) -> usize {
+    pub(crate) fn vex_vptest(&mut self, a: u8, b: u8) { self.vex3_reg([2, 0, 1, 1, 0x17], a, 0, b, None); }
+    fn jump_placeholder(&mut self, cc: Option<u8>) -> usize {
         let pos = self.code.len();
-        self.code.extend_from_slice(&[0x0F, cc, 0, 0, 0, 0]);
+        if let Some(c) = cc { self.code.extend_from_slice(&[0x0F, c, 0, 0, 0, 0]); }
+        else { self.code.extend_from_slice(&[0xE9, 0, 0, 0, 0]); }
         self.insns += 1;
         pos
     }
-    pub(crate) fn jmp_placeholder(&mut self) -> usize {
-        let pos = self.code.len();
-        self.code.extend_from_slice(&[0xE9, 0, 0, 0, 0]);
-        self.insns += 1;
-        pos
-    }
+    pub(crate) fn jcc_placeholder(&mut self, cc: u8) -> usize { self.jump_placeholder(Some(cc)) }
+    pub(crate) fn jmp_placeholder(&mut self) -> usize { self.jump_placeholder(None) }
     pub(crate) fn patch_rel32(&mut self, pos: usize, op_len: usize, target: usize) {
         let rel = (target as isize) - ((pos + op_len + 4) as isize);
         if let Some(s) = self.code.get_mut(pos + op_len..pos + op_len + 4) { s.copy_from_slice(&(rel as i32).to_le_bytes()); }
     }
-    fn vex_extracti128(&mut self, dst_xmm: u8, src_ymm: u8, imm: u8) {
-        self.vex_ymm_imm(3, 0x39, src_ymm, 0, dst_xmm, imm);
-    }
+    fn vex_extracti128(&mut self, dst_xmm: u8, src_ymm: u8, imm: u8) { self.vex_ymm_imm(3, 0x39, src_ymm, 0, dst_xmm, imm); }
     pub(crate) fn vex_shift_imm(&mut self, opc: u8, sub: u8, dst: u8, src: u8, imm: u8) {
-        let vw = x86_vex3_word(0, (src >> 3) & 1, 1, 0, dst, 1, 1).to_le_bytes();
-        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], opc, x86_modrm(3, sub, src), imm]);
-        self.insns += 1;
+        self.vex3_reg([1, 0, 1, 1, opc], sub, dst, src, Some(imm));
     }
     pub(crate) fn vex_mem_op(&mut self, enc: [u8; 6], reg: u8, base: u8, disp: i32) {
         let [map, l, pp, w, vvvv, opc] = enc;
@@ -333,33 +312,23 @@ impl X86Emit {
         self.insns += 1;
         self.vex_ymm_op(2, if is_64 { 0x59 } else { 0x58 }, dst, 0, dst);
     }
-    pub(crate) fn vex_broadcast_rip(&mut self, dst: u8, val: i64) {
+    fn vex_broadcast_rip_w(&mut self, dst: u8, val: i64, opc: u8) {
         if val == 0 { self.vex_ymm_op(1, 0xEF, dst, dst, dst); return; }
         let idx = match self.const_pool.iter().position(|&c| c == val) {
             Some(i) => i,
             None => { let i = self.const_pool.len(); self.const_pool.push(val); i }
         };
         let vw = x86_vex3_word((dst >> 3) & 1, 0, 2, 0, 0, 1, 1).to_le_bytes();
-        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], 0x59, x86_modrm(0, dst, 5)]);
+        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], opc, x86_modrm(0, dst, 5)]);
         let disp_off = self.code.len();
         self.code.extend_from_slice(&0i32.to_le_bytes());
         self.const_patches.push((disp_off, idx));
         self.insns += 1;
     }
+    pub(crate) fn vex_broadcast_rip(&mut self, dst: u8, val: i64) { self.vex_broadcast_rip_w(dst, val, 0x59); }
     pub(crate) fn vex_broadcast32_rip(&mut self, dst: u8, val: u32) {
-        if val == 0 { self.vex_ymm_op(1, 0xEF, dst, dst, dst); return; }
         if val == u32::MAX { self.vex_ymm_op(1, 0x76, dst, dst, dst); return; }
-        let c64 = i64::from(val);
-        let idx = match self.const_pool.iter().position(|&c| c == c64) {
-            Some(i) => i,
-            None => { let i = self.const_pool.len(); self.const_pool.push(c64); i }
-        };
-        let vw = x86_vex3_word((dst >> 3) & 1, 0, 2, 0, 0, 1, 1).to_le_bytes();
-        self.code.extend_from_slice(&[0xC4, vw[0], vw[1], 0x58, x86_modrm(0, dst, 5)]);
-        let disp_off = self.code.len();
-        self.code.extend_from_slice(&0i32.to_le_bytes());
-        self.const_patches.push((disp_off, idx));
-        self.insns += 1;
+        self.vex_broadcast_rip_w(dst, i64::from(val), 0x58);
     }
     fn finalize_const_pool(&mut self) {
         if self.const_pool.is_empty() { return; }
@@ -427,9 +396,7 @@ fn match_vec4(
             for &id in &ids[1..] { if k.nodes.get(id).copied() != Some(Op::Const(c)) { return None; } }
             if let Some(&(_, prev)) = memo.iter().find(|&&(m, _)| k.nodes.get(m[0]).copied() == Some(Op::Const(c)) && m[1..].iter().all(|&x| k.nodes.get(x).copied() == Some(Op::Const(c)))) {
                 prev
-            } else {
-                let d = alloc(next_ymm)?; steps.push(AvxStep::Const(d, c)); d
-            }
+            } else { let d = alloc(next_ymm)?; steps.push(AvxStep::Const(d, c)); d }
         }
         Op::Load { mem, buf, lane } if (lane == 0 || lane == 4) && k.nodes.get(mem).copied() == Some(Op::MemInit) => {
             for (i, &id) in ids.iter().enumerate().skip(1) {
@@ -649,6 +616,18 @@ impl<'a> W32Ctx<'a> {
                         _ => return None,
                     }
                 }
+                if matches!(o0, Op::BitAnd(_, _)) {
+                    if lb.iter().all(|&b| self.k.nodes.get(b).copied() == Some(Op::Const(0xFFFF_FFFF))) {
+                        let v = self.match_vec8(la)?;
+                        self.memo.push((ids, v));
+                        return Some(v);
+                    }
+                    if la.iter().all(|&a| self.k.nodes.get(a).copied() == Some(Op::Const(0xFFFF_FFFF))) {
+                        let v = self.match_vec8(lb)?;
+                        self.memo.push((ids, v));
+                        return Some(v);
+                    }
+                }
                 let (va, vb) = (self.match_vec8(la)?, self.match_vec8(lb)?);
                 let d = self.alloc_v();
                 self.steps.push(match o0 {
@@ -720,9 +699,7 @@ fn try_plan_avx2_w32(k: &Kernel, sched: &ScheduleReport, doms: &[Domain], max_ve
     }
     if sched.order.iter().any(|&id| matches!(k.nodes.get(id), Some(Op::Store { .. } | Op::LoadLut { .. } | Op::BoundsCheck { .. } | Op::Div(_, _) | Op::Rem(_, _)))
         || matches!(k.nodes.get(id), Some(&Op::Load { mem, .. }) if k.nodes.get(mem).copied() != Some(Op::MemInit)))
-    {
-        return None;
-    }
+    { return None; }
     let mut out_groups: Vec<(u8, ElemTy, [NodeId; LANES])> = Vec::new();
     for b in &k.bufs {
         if b.access == BufAccess::MutNoAlias {
@@ -766,9 +743,7 @@ fn try_plan_avx2_w32(k: &Kernel, sched: &ScheduleReport, doms: &[Domain], max_ve
             let unsigned = lanes.iter().all(|&id| doms.get(id).copied().is_some_and(Domain::fits_u32));
             if !signed && !unsigned { return None; }
             ctx.steps.push(W32Step::StoreI64 { src: vr, buf, signed });
-        } else {
-            ctx.steps.push(W32Step::Store32(vr, buf));
-        }
+        } else { ctx.steps.push(W32Step::Store32(vr, buf)); }
     }
 
     let limit = max_vecs.min(14);
@@ -935,12 +910,8 @@ fn try_plan_avx2_batch4(k: &Kernel, sched: &ScheduleReport, doms: &[Domain], max
             || b.lanes == 0
             || if b.access == BufAccess::ReadOnly && b.lanes == 1 {
                 false
-            } else {
-                !matches!(b.elem_ty, ElemTy::I64 | ElemTy::U64 | ElemTy::I32 | ElemTy::U32)
-            }
-    }) {
-        return None;
-    }
+            } else { !matches!(b.elem_ty, ElemTy::I64 | ElemTy::U64 | ElemTy::I32 | ElemTy::U32) }
+    }) { return None; }
     for &id in &sched.order {
         match *k.nodes.get(id)? {
             Op::MemInit | Op::Const(_) | Op::Add(_, _) | Op::Sub(_, _) | Op::BitAnd(_, _)
@@ -967,9 +938,7 @@ fn try_plan_avx2_batch4(k: &Kernel, sched: &ScheduleReport, doms: &[Domain], max
         for o in &k.outputs {
             if o.buf != ob || usize::from(o.lane) >= n_lanes || lanes[usize::from(o.lane)] != usize::MAX
                 || matches!(k.nodes.get(o.val), Some(Op::Const(_) | Op::MemInit))
-            {
-                ok = false; break;
-            }
+            { ok = false; break; }
             lanes[usize::from(o.lane)] = o.val;
         }
         if ok && !lanes[..n_lanes].contains(&usize::MAX) {
@@ -1056,11 +1025,15 @@ fn b4_const_reg(e: &mut X86Emit, plan: &Batch4Plan, c: i64, scratch: u8) -> u8 {
     scratch
 }
 
+fn b4_node_ymm(plan: &Batch4Plan, id: NodeId) -> Result<u8, CompileError> {
+    plan.node_ymm.get(id).and_then(|&r| r).ok_or(CompileError::InvalidNode(id))
+}
+
 fn b4_val_reg(e: &mut X86Emit, k: &Kernel, plan: &Batch4Plan, id: NodeId, scratch: u8) -> Result<u8, CompileError> {
     match k.nodes.get(id).copied().ok_or(CompileError::InvalidNode(id))? {
         Op::Const(c) => Ok(b4_const_reg(e, plan, c, scratch)),
         Op::MemInit => Ok(b4_const_reg(e, plan, 0, scratch)),
-        _ => plan.node_ymm.get(id).and_then(|&r| r).ok_or(CompileError::InvalidNode(id)),
+        _ => b4_node_ymm(plan, id),
     }
 }
 
@@ -1239,9 +1212,7 @@ fn emit_x86_batch4_body(e: &mut X86Emit, k: &Kernel, sched: &ScheduleReport, ra:
                     };
                     if matches!(kind, CmpKind::Gt | CmpKind::Le | CmpKind::Ugt | CmpKind::Ule) {
                         e.vex_ymm_op(2, 0x37, dst, va, vb);
-                    } else {
-                        e.vex_ymm_op(2, 0x37, dst, vb, va);
-                    }
+                    } else { e.vex_ymm_op(2, 0x37, dst, vb, va); }
                 }
                 e.vex_shift_imm(0x73, 2, dst, dst, 63);
                 if matches!(kind, CmpKind::Ne | CmpKind::Le | CmpKind::Ge | CmpKind::Ule | CmpKind::Uge) {
@@ -1276,8 +1247,7 @@ fn emit_x86_batch4_body(e: &mut X86Emit, k: &Kernel, sched: &ScheduleReport, ra:
         Some(TransposeOut::Lanes2(ob, lanes)) => {
             let breg = *ra.buf_reg.get(ob as usize).ok_or(CompileError::InvalidBuffer(ob))?;
             let base_off = base_blk * 16;
-            let r0 = b4_val_reg(e, k, plan, lanes[0], 14)?;
-            let r1 = b4_val_reg(e, k, plan, lanes[1], 15)?;
+            let (r0, r1) = (b4_node_ymm(plan, lanes[0])?, b4_node_ymm(plan, lanes[1])?);
             e.vex_ymm_op(1, 0x6C, 14, r0, r1);
             e.vex_ymm_op(1, 0x6D, 15, r0, r1);
             e.vex_ymm_imm(3, 0x46, r0, 14, 15, 0x20);
@@ -1289,8 +1259,8 @@ fn emit_x86_batch4_body(e: &mut X86Emit, k: &Kernel, sched: &ScheduleReport, ra:
             let breg = *ra.buf_reg.get(ob as usize).ok_or(CompileError::InvalidBuffer(ob))?;
             let base_off = base_blk * 32;
             let [r0, r1, r2, r3] = [
-                b4_val_reg(e, k, plan, lanes[0], 13)?, b4_val_reg(e, k, plan, lanes[1], 13)?,
-                b4_val_reg(e, k, plan, lanes[2], 13)?, b4_val_reg(e, k, plan, lanes[3], 13)?,
+                b4_node_ymm(plan, lanes[0])?, b4_node_ymm(plan, lanes[1])?,
+                b4_node_ymm(plan, lanes[2])?, b4_node_ymm(plan, lanes[3])?,
             ];
             e.vex_ymm_op(1, 0x6C, 13, r0, r1);
             e.vex_ymm_op(1, 0x6C, 14, r2, r3);
@@ -1483,9 +1453,7 @@ fn emit_x86_module(kernel: &Kernel, base: &Kernel, sched: &ScheduleReport, ra: &
             }
         }
         base_b8.or_else(|| crate::batch8::try_plan_avx2_batch8(kernel, sched, doms, max_vecs))
-    } else {
-        None
-    };
+    } else { None };
     let b4_plan = if avx_plan.is_none() && w32_plan.is_none() && b8_plan.is_none() { try_plan_avx2_batch4(kernel, sched, doms, max_vecs) } else { None };
     let single_vec = avx_plan.is_some() || w32_plan.is_some();
     let mut saved: Vec<u8> = if single_vec { Vec::new() } else { ra.callee_saved.clone() };
@@ -1499,9 +1467,7 @@ fn emit_x86_module(kernel: &Kernel, base: &Kernel, sched: &ScheduleReport, ra: &
         emit_x86_w32_consts(&mut e, w32);
         emit_x86_w32_body(&mut e, kernel, w32, ra, 0)?;
         e.vzeroupper();
-    } else {
-        emit_x86_body(&mut e, kernel, sched, ra, doms)?;
-    }
+    } else { emit_x86_body(&mut e, kernel, sched, ra, doms)?; }
     for &r in saved.iter().rev() { e.stack_op(r, true); }
     e.ret();
     let k_size = e.code.len() as u64;
@@ -1693,9 +1659,7 @@ fn emit_x86_module(kernel: &Kernel, base: &Kernel, sched: &ScheduleReport, ra: &
             let loop_top = e.code.len();
             if let Some(ref steps) = avx_plan {
                 emit_x86_avx2_steps(&mut e, steps, ra, Some(false))?;
-            } else {
-                emit_x86_body(&mut e, kernel, sched, ra, doms)?;
-            }
+            } else { emit_x86_body(&mut e, kernel, sched, ra, doms)?; }
             for (&br, b) in ra.buf_reg.iter().zip(kernel.bufs.iter()) {
                 if !matches!(b.access, BufAccess::LookupTable(_)) { e.add_imm(br, b.block_bytes() as i32); }
             }
@@ -1825,9 +1789,7 @@ fn emit_arm_body(e: &mut ArmEmit, kernel: &Kernel, sched: &ScheduleReport, ra: &
             Op::Div(a, b) | Op::Rem(a, b) => {
                 let (va, vb) = (arm_val(e, kernel, ra, a, 16)?, arm_val(e, kernel, ra, b, 17)?);
                 let (da, db) = (doms.get(a).copied().unwrap_or_else(Domain::top), doms.get(b).copied().unwrap_or_else(Domain::top));
-                if db.is_empty() || db.contains(0) {
-                    e.put(0xB400_0040 | (vb as u32 & 31)); e.put(0xD420_0000);
-                }
+                if db.is_empty() || db.contains(0) { e.put(0xB500_0040 | (vb as u32 & 31)); e.put(0xD420_0000); }
                 if (da.is_empty() || da.contains(i64::MIN)) && (db.is_empty() || db.contains(-1)) {
                     e.put(arm64_imm12(0xB100_0000, 1, vb, 31));
                     let skip = if vb == 17 { 0x5400_00C1 } else { 0x5400_00A1 };
@@ -2022,9 +1984,7 @@ fn pack_exec_data(kernel: &Kernel, inputs: &[&[i64]]) -> Result<PackedExecData, 
                     let nb = slice.len() / lanes;
                     if let Some(prev) = blk_opt {
                         if prev != nb { return Err(berr("standalone inputs have mismatched block counts")); }
-                    } else {
-                        blk_opt = Some(nb);
-                    }
+                    } else { blk_opt = Some(nb); }
                 }
             }
         }
@@ -2080,9 +2040,7 @@ fn emit_x86_start(start_off: usize, b_off: u64, data_vaddr: u64, buf_offs: &[u64
         let rel8 = (loop_top as isize) - ((e.code.len() + 2) as isize);
         e.code.extend_from_slice(&[0x72, rel8 as u8]); e.insns += 1;
         e.code.extend_from_slice(&[0x83, 0xE7, 0x7F]); e.insns += 1;
-    } else {
-        e.code.extend_from_slice(&[0x31, 0xFF]); e.insns += 1;
-    }
+    } else { e.code.extend_from_slice(&[0x31, 0xFF]); e.insns += 1; }
     e.code.extend_from_slice(&[0xB8, 0x3C, 0x00, 0x00, 0x00]); e.insns += 1;
     e.code.extend_from_slice(&[0x0F, 0x05]); e.insns += 1;
     e.ud2();
@@ -2092,9 +2050,7 @@ fn emit_x86_start(start_off: usize, b_off: u64, data_vaddr: u64, buf_offs: &[u64
 fn emit_arm_start(start_off: usize, b_off: u64, data_vaddr: u64, buf_offs: &[u64], blocks: usize, primary_out: Option<(u64, usize)>) -> Result<(Vec<u8>, usize), CompileError> {
     if buf_offs.len() > 7 { return Err(berr("aarch64 _start arg overflow")); }
     let mut e = ArmEmit::new();
-    for (i, &boff) in buf_offs.iter().enumerate() {
-        e.mov_imm64_fixed(i as u8, data_vaddr.saturating_add(boff));
-    }
+    for (i, &boff) in buf_offs.iter().enumerate() { e.mov_imm64_fixed(i as u8, data_vaddr.saturating_add(boff)); }
     e.mov_imm64_fixed(buf_offs.len() as u8, blocks as u64);
     let bl_words = ((b_off as isize) - ((start_off + e.code.len()) as isize)) / 4;
     e.put(0x9400_0000 | ((bl_words as u32) & 0x03FF_FFFF));
@@ -2117,9 +2073,7 @@ fn emit_arm_start(start_off: usize, b_off: u64, data_vaddr: u64, buf_offs: &[u64
         let back_words = ((loop_top as isize) - (e.code.len() as isize)) / 4;
         e.put(0x5400_0003 | (((back_words as u32) & 0x7_FFFF) << 5));
         e.put(0x9240_1800);
-    } else {
-        e.put(0xD280_0000);
-    }
+    } else { e.put(0xD280_0000); }
     e.put(0xD280_0BA8);
     e.put(0xD400_0001);
     e.put(0xD420_0000);
@@ -2215,9 +2169,7 @@ pub fn compile_standalone_elf_exec(kernel: &Kernel, budget: RegBudget, isa: Targ
     let entry_vaddr = ELF_EXEC_TEXT_VADDR + start_off as u64;
     if summary.machine != isa.e_machine() || !summary.has_nonexec_gnu_stack || summary.symbols.len() != 3
         || summary.entry_vaddr != entry_vaddr || summary.data_vaddr != data_vaddr
-    {
-        return Err(berr("elf64 exec airlock verification mismatch"));
-    }
+    { return Err(berr("elf64 exec airlock verification mismatch")); }
     let output_bytes = primary_out.map_or(0, |(_, n)| n);
     Ok(StandaloneExec {
         isa, kernel_sym: syms[0].name.clone(), batch_sym: syms[1].name.clone(), entry_sym: String::from("_start"),

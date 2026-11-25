@@ -112,27 +112,19 @@ pub struct CompiledWasm {
     pub summary: WasmSummary,
 }
 
-fn werr(msg: impl Into<String>) -> CompileError {
-    CompileError::BackendError(msg.into())
-}
+fn werr(msg: impl Into<String>) -> CompileError { CompileError::BackendError(msg.into()) }
 
 fn push_uleb_u32(out: &mut Vec<u8>, mut v: u32) {
     loop {
         let mut b = (v & 0x7F) as u8;
         v >>= 7;
-        if v != 0 {
-            b |= 0x80;
-        }
+        if v != 0 { b |= 0x80; }
         out.push(b);
-        if v == 0 {
-            break;
-        }
+        if v == 0 { break; }
     }
 }
 
-fn push_sleb_i32(out: &mut Vec<u8>, v: i32) {
-    push_sleb_i64(out, i64::from(v));
-}
+fn push_sleb_i32(out: &mut Vec<u8>, v: i32) { push_sleb_i64(out, i64::from(v)); }
 
 fn push_sleb_i64(out: &mut Vec<u8>, mut v: i64) {
     loop {
@@ -140,9 +132,7 @@ fn push_sleb_i64(out: &mut Vec<u8>, mut v: i64) {
         v >>= 7;
         let done = (v == 0 && (b & 0x40) == 0) || (v == -1 && (b & 0x40) != 0);
         out.push(if done { b } else { b | 0x80 });
-        if done {
-            break;
-        }
+        if done { break; }
     }
 }
 
@@ -163,9 +153,7 @@ struct WasmBuf {
 }
 
 impl WasmBuf {
-    fn op(&mut self, b: u8) {
-        self.code.push(b);
-    }
+    fn op(&mut self, b: u8) { self.code.push(b); }
     fn local_get(&mut self, idx: u32) {
         self.op(0x20);
         push_uleb_u32(&mut self.code, idx);
@@ -206,32 +194,19 @@ impl WasmBuf {
     fn v128_const_i32x4(&mut self, v: u32) {
         self.simd(SIMD_V128_CONST);
         let b = v.to_le_bytes();
-        for _ in 0..4 {
-            self.code.extend_from_slice(&b);
-        }
+        for _ in 0..4 { self.code.extend_from_slice(&b); }
     }
-    fn load_elem_i64(&mut self, ty: ElemTy, offset: u32) {
-        let opcode = match ty {
-            ElemTy::I64 | ElemTy::U64 => 0x29,
-            ElemTy::I32 => 0x34,
-            ElemTy::I16 => 0x32,
-            ElemTy::U32 => 0x35,
-            ElemTy::U16 => 0x33,
-            ElemTy::U8 => 0x31,
+    fn mem_elem_i64(&mut self, ty: ElemTy, offset: u32, is_store: bool) {
+        let opcode = if is_store {
+            match ty { ElemTy::I64 | ElemTy::U64 => 0x37, ElemTy::I32 | ElemTy::U32 => 0x3E, ElemTy::I16 | ElemTy::U16 => 0x3D, ElemTy::U8 => 0x3C }
+        } else {
+            match ty { ElemTy::I64 | ElemTy::U64 => 0x29, ElemTy::I32 => 0x34, ElemTy::I16 => 0x32, ElemTy::U32 => 0x35, ElemTy::U16 => 0x33, ElemTy::U8 => 0x31 }
         };
         self.op(opcode);
         self.memarg(u32::from(ty.scale_shift()), offset);
     }
-    fn store_elem_i64(&mut self, ty: ElemTy, offset: u32) {
-        let opcode = match ty {
-            ElemTy::I64 | ElemTy::U64 => 0x37,
-            ElemTy::I32 | ElemTy::U32 => 0x3E,
-            ElemTy::I16 | ElemTy::U16 => 0x3D,
-            ElemTy::U8 => 0x3C,
-        };
-        self.op(opcode);
-        self.memarg(u32::from(ty.scale_shift()), offset);
-    }
+    fn load_elem_i64(&mut self, ty: ElemTy, offset: u32) { self.mem_elem_i64(ty, offset, false); }
+    fn store_elem_i64(&mut self, ty: ElemTy, offset: u32) { self.mem_elem_i64(ty, offset, true); }
 }
 
 fn is_inline_scalar(op: Op<NodeId>) -> bool {
@@ -245,16 +220,12 @@ fn alloc_ssa_locals(k: &Kernel, sched: &ScheduleReport, base_local: u32) -> Resu
         let op = k.nodes.get(id).copied().ok_or(CompileError::InvalidNode(id))?;
         let (kids, cnt) = op.children();
         for &kid in kids.iter().take(cnt) {
-            if let Some(ls) = last_step.get_mut(kid) {
-                *ls = (*ls).max(step);
-            }
+            if let Some(ls) = last_step.get_mut(kid) { *ls = (*ls).max(step); }
         }
     }
     for &(ostep, oi) in &sched.output_order {
         if let Some(o) = k.outputs.get(oi) {
-            if let Some(ls) = last_step.get_mut(o.val) {
-                *ls = (*ls).max(ostep.saturating_add(1));
-            }
+            if let Some(ls) = last_step.get_mut(o.val) { *ls = (*ls).max(ostep.saturating_add(1)); }
         }
     }
     let mut node_loc: Vec<Option<u32>> = vec![None; n];
@@ -272,18 +243,14 @@ fn alloc_ssa_locals(k: &Kernel, sched: &ScheduleReport, base_local: u32) -> Resu
                     s
                 }
             };
-            if let Some(dst) = node_loc.get_mut(id) {
-                *dst = Some(base_local.saturating_add(slot));
-            }
+            if let Some(dst) = node_loc.get_mut(id) { *dst = Some(base_local.saturating_add(slot)); }
             active.push((id, slot));
         }
         let mut keep = Vec::with_capacity(active.len());
         for (aid, slot) in active.drain(..) {
             if last_step.get(aid).copied().unwrap_or(0) <= step {
                 free.push(slot);
-            } else {
-                keep.push((aid, slot));
-            }
+            } else { keep.push((aid, slot)); }
         }
         active = keep;
     }
@@ -317,13 +284,11 @@ fn emit_scalar_output(e: &mut WasmBuf, k: &Kernel, locs: &[Option<u32>], oi: usi
     Ok(())
 }
 
-fn emit_scalar_body(e: &mut WasmBuf, k: &Kernel, sched: &ScheduleReport, locs: &[Option<u32>]) -> Result<(), CompileError> {
+fn emit_scalar_body(e: &mut WasmBuf, k: &Kernel, sched: &ScheduleReport, doms: &[Domain], locs: &[Option<u32>]) -> Result<(), CompileError> {
     let mut out_idx = 0usize;
     for (step, &id) in sched.order.iter().enumerate() {
         while let Some(&(ostep, oi)) = sched.output_order.get(out_idx) {
-            if ostep > step {
-                break;
-            }
+            if ostep > step { break; }
             emit_scalar_output(e, k, locs, oi)?;
             out_idx += 1;
         }
@@ -347,8 +312,20 @@ fn emit_scalar_body(e: &mut WasmBuf, k: &Kernel, sched: &ScheduleReport, locs: &
                     }
                     Op::LoadLut { buf, idx } => {
                         let b = k.bufs.get(usize::from(buf)).ok_or(CompileError::InvalidBuffer(buf))?;
+                        let BufAccess::LookupTable(len) = b.access else { return Err(CompileError::InvalidBuffer(buf)); };
+                        let d = doms.get(idx).copied().unwrap_or_else(Domain::top);
                         e.local_get(u32::from(buf));
                         push_scalar_val(e, k, locs, idx)?;
+                        if d.is_empty() || !d.is_nonneg() || d.hi >= len as i64 {
+                            e.local_tee(dst);
+                            e.i64_const(len as i64);
+                            e.op(0x5A);
+                            e.op(0x04);
+                            e.op(0x40);
+                            e.op(0x00);
+                            e.op(0x0B);
+                            e.local_get(dst);
+                        }
                         e.op(0xA7);
                         let sh = b.elem_ty.scale_shift();
                         if sh > 0 {
@@ -371,6 +348,23 @@ fn emit_scalar_body(e: &mut WasmBuf, k: &Kernel, sched: &ScheduleReport, locs: &
                     }
                     Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::Rem(a, b)
                     | Op::BitAnd(a, b) | Op::BitOr(a, b) | Op::BitXor(a, b) | Op::ShlVar(a, b) | Op::ShrVarU(a, b) => {
+                        if matches!(op, Op::Rem(_, _)) {
+                            let da = doms.get(a).copied().unwrap_or_else(Domain::top);
+                            let db = doms.get(b).copied().unwrap_or_else(Domain::top);
+                            if (da.is_empty() || da.contains(i64::MIN)) && (db.is_empty() || db.contains(-1)) {
+                                push_scalar_val(e, k, locs, a)?;
+                                e.i64_const(i64::MIN);
+                                e.op(0x51);
+                                push_scalar_val(e, k, locs, b)?;
+                                e.i64_const(-1);
+                                e.op(0x51);
+                                e.op(0x71);
+                                e.op(0x04);
+                                e.op(0x40);
+                                e.op(0x00);
+                                e.op(0x0B);
+                            }
+                        }
                         push_scalar_val(e, k, locs, a)?;
                         push_scalar_val(e, k, locs, b)?;
                         let opc = match op {
@@ -477,9 +471,7 @@ struct I32x4Ctx<'a> {
 
 impl<'a> I32x4Ctx<'a> {
     fn fits(&self, id: NodeId) -> bool {
-        let Some(d) = self.doms.get(id).copied() else {
-            return false;
-        };
+        let Some(d) = self.doms.get(id).copied() else { return false; };
         if self.unsigned { d.fits_u32() } else { d.fits_i32() }
     }
 
@@ -491,9 +483,7 @@ impl<'a> I32x4Ctx<'a> {
     }
 
     fn intern_const(&mut self, val: u32) -> usize {
-        if let Some(&(id, _)) = self.consts.iter().find(|&&(_, c)| c == val) {
-            return id;
-        }
+        if let Some(&(id, _)) = self.consts.iter().find(|&&(_, c)| c == val) { return id; }
         let id = self.push_step(I32x4Op::Const, false);
         self.consts.push((id, val));
         id
@@ -502,9 +492,7 @@ impl<'a> I32x4Ctx<'a> {
     fn ensure_val(&mut self, v: usize) -> usize {
         if self.is_mask.get(v).copied().unwrap_or(false) {
             self.push_step(I32x4Op::MaskTo01(v), false)
-        } else {
-            v
-        }
+        } else { v }
     }
 
     fn ensure_mask(&mut self, v: usize) -> usize {
@@ -517,26 +505,18 @@ impl<'a> I32x4Ctx<'a> {
     }
 
     fn match_lanes(&mut self, ids: [NodeId; LANES]) -> Option<usize> {
-        if let Some(&(_, v)) = self.memo.iter().find(|&&(k, _)| k == ids) {
-            return Some(v);
-        }
+        if let Some(&(_, v)) = self.memo.iter().find(|&&(k, _)| k == ids) { return Some(v); }
         let any_full = ids.iter().any(|&id| self.needs_full.get(id).copied().unwrap_or(false));
-        if any_full && !ids.iter().all(|&id| self.fits(id)) {
-            return None;
-        }
+        if any_full && !ids.iter().all(|&id| self.fits(id)) { return None; }
         let first = self.k.nodes.get(ids[0]).copied()?;
         let res = match first {
             Op::Const(c) => {
-                if !ids.iter().all(|&id| self.k.nodes.get(id).copied() == Some(Op::Const(c))) {
-                    return None;
-                }
+                if !ids.iter().all(|&id| self.k.nodes.get(id).copied() == Some(Op::Const(c))) { return None; }
                 self.intern_const(c as u32)
             }
             Op::Load { buf, .. } => {
                 let b = self.k.bufs.get(usize::from(buf))?;
-                if !matches!(b.elem_ty, ElemTy::I32 | ElemTy::U32 | ElemTy::I16 | ElemTy::U16) {
-                    return None;
-                }
+                if !matches!(b.elem_ty, ElemTy::I32 | ElemTy::U32 | ElemTy::I16 | ElemTy::U16) { return None; }
                 for (lane_idx, &id) in ids.iter().enumerate() {
                     match self.k.nodes.get(id).copied()? {
                         Op::Load { mem, buf: b2, lane }
@@ -563,6 +543,20 @@ impl<'a> I32x4Ctx<'a> {
                         *sb = b;
                     }
                 }
+                if matches!(first, Op::BitAnd(_, _)) {
+                    if lb.iter().all(|&b| self.k.nodes.get(b).copied() == Some(Op::Const(0xFFFF_FFFF))) {
+                        let v = self.match_lanes(la)?;
+                        let v = self.ensure_val(v);
+                        self.memo.push((ids, v));
+                        return Some(v);
+                    }
+                    if la.iter().all(|&a| self.k.nodes.get(a).copied() == Some(Op::Const(0xFFFF_FFFF))) {
+                        let v = self.match_lanes(lb)?;
+                        let v = self.ensure_val(v);
+                        self.memo.push((ids, v));
+                        return Some(v);
+                    }
+                }
                 let va = self.match_lanes(la)?;
                 let vb = self.match_lanes(lb)?;
                 let va = self.ensure_val(va);
@@ -576,9 +570,7 @@ impl<'a> I32x4Ctx<'a> {
                 self.push_step(op, false)
             }
             Op::Shl(_, s) | Op::Shr(_, s) => {
-                if s >= 32 {
-                    return None;
-                }
+                if s >= 32 { return None; }
                 let is_shr = matches!(first, Op::Shr(_, _));
                 let mut la = [0usize; LANES];
                 for (i, &id) in ids.iter().enumerate() {
@@ -587,12 +579,8 @@ impl<'a> I32x4Ctx<'a> {
                         (true, Op::Shr(a, s2)) if s2 == s => a,
                         _ => return None,
                     };
-                    if is_shr && s > 0 && !self.fits(a) {
-                        return None;
-                    }
-                    if let Some(sa) = la.get_mut(i) {
-                        *sa = a;
-                    }
+                    if is_shr && s > 0 && !self.fits(a) { return None; }
+                    if let Some(sa) = la.get_mut(i) { *sa = a; }
                 }
                 let va = self.match_lanes(la)?;
                 let va = self.ensure_val(va);
@@ -600,17 +588,11 @@ impl<'a> I32x4Ctx<'a> {
                 self.push_step(op, false)
             }
             Op::Cmp(kind, _, _) => {
-                if kind.is_unsigned() && !self.unsigned {
-                    return None;
-                }
+                if kind.is_unsigned() && !self.unsigned { return None; }
                 let (mut la, mut lb) = ([0usize; LANES], [0usize; LANES]);
                 for (i, &id) in ids.iter().enumerate() {
-                    let Op::Cmp(k2, a, b) = self.k.nodes.get(id).copied()? else {
-                        return None;
-                    };
-                    if k2 != kind || !self.fits(a) || !self.fits(b) {
-                        return None;
-                    }
+                    let Op::Cmp(k2, a, b) = self.k.nodes.get(id).copied()? else { return None; };
+                    if k2 != kind || !self.fits(a) || !self.fits(b) { return None; }
                     if let (Some(sa), Some(sb)) = (la.get_mut(i), lb.get_mut(i)) {
                         *sa = a;
                         *sb = b;
@@ -625,9 +607,7 @@ impl<'a> I32x4Ctx<'a> {
             Op::Select { .. } => {
                 let (mut lc, mut lt, mut lf) = ([0usize; LANES], [0usize; LANES], [0usize; LANES]);
                 for (i, &id) in ids.iter().enumerate() {
-                    let Op::Select { cond, t_val, f_val } = self.k.nodes.get(id).copied()? else {
-                        return None;
-                    };
+                    let Op::Select { cond, t_val, f_val } = self.k.nodes.get(id).copied()? else { return None; };
                     if let (Some(sc), Some(st), Some(sf)) = (lc.get_mut(i), lt.get_mut(i), lf.get_mut(i)) {
                         *sc = cond;
                         *st = t_val;
@@ -652,54 +632,38 @@ impl<'a> I32x4Ctx<'a> {
 fn try_plan_i32x4_mode(k: &Kernel, sched: &ScheduleReport, doms: &[Domain], unsigned: bool) -> Option<I32x4Plan> {
     if k.outputs.is_empty()
         || k.bufs.iter().any(|b| matches!(b.access, BufAccess::LookupTable(_)) || usize::from(b.lanes) != LANES)
-    {
-        return None;
-    }
+    { return None; }
     if sched.order.iter().any(|&id| {
         matches!(
             k.nodes.get(id),
             Some(Op::Store { .. } | Op::LoadLut { .. } | Op::BoundsCheck { .. } | Op::Div(_, _) | Op::Rem(_, _))
         ) || matches!(k.nodes.get(id), Some(&Op::Load { mem, .. }) if k.nodes.get(mem).copied() != Some(Op::MemInit))
-    }) {
-        return None;
-    }
+    }) { return None; }
     let mut out_groups: Vec<(u8, ElemTy, [NodeId; LANES])> = Vec::new();
     for b in &k.bufs {
         if b.access == BufAccess::MutNoAlias {
-            if !matches!(b.elem_ty, ElemTy::I32 | ElemTy::U32 | ElemTy::I64) {
-                return None;
-            }
+            if !matches!(b.elem_ty, ElemTy::I32 | ElemTy::U32 | ElemTy::I64) { return None; }
             out_groups.push((b.id, b.elem_ty, [usize::MAX; LANES]));
         }
     }
-    if out_groups.is_empty() {
-        return None;
-    }
+    if out_groups.is_empty() { return None; }
     for o in &k.outputs {
         let g = out_groups.iter_mut().find(|g| g.0 == o.buf)?;
         let slot = g.2.get_mut(usize::from(o.lane))?;
-        if *slot != usize::MAX {
-            return None;
-        }
+        if *slot != usize::MAX { return None; }
         *slot = o.val;
     }
-    if out_groups.iter().any(|g| g.2.contains(&usize::MAX)) {
-        return None;
-    }
+    if out_groups.iter().any(|g| g.2.contains(&usize::MAX)) { return None; }
     let mut needs_full = vec![false; k.nodes.len()];
     for g in &out_groups {
         if g.1 == ElemTy::I64 {
             for &v in &g.2 {
-                if let Some(sl) = needs_full.get_mut(v) {
-                    *sl = true;
-                }
+                if let Some(sl) = needs_full.get_mut(v) { *sl = true; }
             }
         }
     }
     for &id in sched.order.iter().rev() {
-        let Some(&op) = k.nodes.get(id) else {
-            continue;
-        };
+        let Some(&op) = k.nodes.get(id) else { continue; };
         match op {
             Op::Cmp(_, a, b) => {
                 if let Some(s) = needs_full.get_mut(a) { *s = true; }
@@ -735,13 +699,9 @@ fn try_plan_i32x4_mode(k: &Kernel, sched: &ScheduleReport, doms: &[Domain], unsi
         let signed_ext = if ty == ElemTy::I64 {
             let signed = lanes.iter().all(|&id| doms.get(id).copied().is_some_and(Domain::fits_i32));
             let unsig = lanes.iter().all(|&id| doms.get(id).copied().is_some_and(Domain::fits_u32));
-            if !signed && !unsig {
-                return None;
-            }
+            if !signed && !unsig { return None; }
             !unsig
-        } else {
-            false
-        };
+        } else { false };
         outputs.push((buf, ty, v, signed_ext));
     }
     Some(I32x4Plan { steps: ctx.steps, outputs, consts: ctx.consts })
@@ -834,9 +794,7 @@ fn emit_i32x4_half(e: &mut WasmBuf, plan: &I32x4Plan, base_v: u32, half_idx: u32
         if ty == ElemTy::I64 {
             let (ext_lo, ext_hi) = if signed_ext {
                 (SIMD_I64X2_EXTEND_LOW_I32X4_S, SIMD_I64X2_EXTEND_HIGH_I32X4_S)
-            } else {
-                (SIMD_I64X2_EXTEND_LOW_I32X4_U, SIMD_I64X2_EXTEND_HIGH_I32X4_U)
-            };
+            } else { (SIMD_I64X2_EXTEND_LOW_I32X4_U, SIMD_I64X2_EXTEND_HIGH_I32X4_U) };
             e.local_get(u32::from(buf));
             e.local_get(base_v + src as u32);
             e.simd(ext_lo);
@@ -856,9 +814,7 @@ fn emit_i32x4_half(e: &mut WasmBuf, plan: &I32x4Plan, base_v: u32, half_idx: u32
 fn can_plan_i64x2(k: &Kernel, sched: &ScheduleReport) -> bool {
     if k.outputs.is_empty()
         || k.bufs.iter().any(|b| matches!(b.access, BufAccess::LookupTable(_)) || b.lanes == 0)
-    {
-        return false;
-    }
+    { return false; }
     sched.order.iter().all(|&id| {
         match k.nodes.get(id) {
             Some(
@@ -888,24 +844,18 @@ fn collect_hoisted_consts_i64(k: &Kernel, sched: &ScheduleReport) -> Vec<i64> {
     let mut bump = |c: i64| {
         if let Some(entry) = counts.iter_mut().find(|e| e.0 == c) {
             entry.1 += 1;
-        } else {
-            counts.push((c, 1));
-        }
+        } else { counts.push((c, 1)); }
     };
     for &id in &sched.order {
         if let Some(&op) = k.nodes.get(id) {
             let (kids, cnt) = op.children();
             for &kid in kids.iter().take(cnt) {
-                if let Some(Op::Const(c)) = k.nodes.get(kid).copied() {
-                    bump(c);
-                }
+                if let Some(Op::Const(c)) = k.nodes.get(kid).copied() { bump(c); }
             }
         }
     }
     for o in &k.outputs {
-        if let Some(Op::Const(c)) = k.nodes.get(o.val).copied() {
-            bump(c);
-        }
+        if let Some(Op::Const(c)) = k.nodes.get(o.val).copied() { bump(c); }
     }
     counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     counts.into_iter().filter(|&(_, cnt)| cnt >= 2).take(16).map(|(c, _)| c).collect()
@@ -914,9 +864,7 @@ fn collect_hoisted_consts_i64(k: &Kernel, sched: &ScheduleReport) -> Vec<i64> {
 fn push_i64x2_const(e: &mut WasmBuf, hoisted: &[(i64, u32)], c: i64) {
     if let Some(&(_, loc)) = hoisted.iter().find(|&&(v, _)| v == c) {
         e.local_get(loc);
-    } else {
-        e.v128_const_i64x2(c, c);
-    }
+    } else { e.v128_const_i64x2(c, c); }
 }
 
 fn push_i64x2_val(
@@ -999,9 +947,7 @@ fn emit_i64x2_body(
     let mut out_idx = 0usize;
     for (step, &id) in sched.order.iter().enumerate() {
         while let Some(&(ostep, oi)) = sched.output_order.get(out_idx) {
-            if ostep > step {
-                break;
-            }
+            if ostep > step { break; }
             let o = k.outputs.get(oi).ok_or(CompileError::InvalidNode(oi))?;
             emit_i64x2_store_pair(e, k, locs, &is_mask, hoisted, scratch_v, (o.buf, o.lane, o.val))?;
             out_idx += 1;
@@ -1075,9 +1021,7 @@ fn emit_i64x2_body(
                         };
                         e.simd(sub);
                         e.local_set(dst);
-                        if let Some(m) = is_mask.get_mut(id) {
-                            *m = true;
-                        }
+                        if let Some(m) = is_mask.get_mut(id) { *m = true; }
                     }
                     Op::Select { cond, t_val, f_val } => {
                         push_i64x2_val(e, k, locs, &is_mask, hoisted, t_val)?;
@@ -1195,7 +1139,7 @@ fn lower_kernel_pair(
 
     let (s_locs, s_ni64) = alloc_ssa_locals(k, sched, nb as u32)?;
     let mut s_buf = WasmBuf::default();
-    emit_scalar_body(&mut s_buf, k, sched, &s_locs)?;
+    emit_scalar_body(&mut s_buf, k, sched, doms, &s_locs)?;
     let single_body = finish_func_body(&[(s_ni64, VAL_I64)], &s_buf.code);
 
     let n_loc = nb as u32;
@@ -1242,9 +1186,7 @@ fn lower_kernel_pair(
         b_buf.op(0x4A);
         b_buf.op(0x04);
         b_buf.op(0x40);
-        for idx in 0..nb {
-            b_buf.local_get(idx as u32);
-        }
+        for idx in 0..nb { b_buf.local_get(idx as u32); }
         b_buf.op(0x10);
         push_uleb_u32(&mut b_buf.code, single_func_idx);
         b_buf.op(0x0B);
@@ -1270,7 +1212,7 @@ fn lower_kernel_pair(
     b_buf.op(0x4C);
     b_buf.op(0x0D);
     push_uleb_u32(&mut b_buf.code, 1);
-    emit_scalar_body(&mut b_buf, k, sched, &b_locs)?;
+    emit_scalar_body(&mut b_buf, k, sched, doms, &b_locs)?;
     emit_ptr_advance(&mut b_buf, k, 1);
     b_buf.local_get(n_loc);
     b_buf.i32_const(1);
@@ -1399,9 +1341,7 @@ pub fn compile_kernels_wasm_with_memory(
     budget: RegBudget,
     import_memory: bool,
 ) -> Result<(Vec<u8>, WasmSummary), CompileError> {
-    if kernels.is_empty() {
-        return Err(werr("cannot emit wasm module with zero kernels"));
-    }
+    if kernels.is_empty() { return Err(werr("cannot emit wasm module with zero kernels")); }
     let mut lowered = Vec::with_capacity(kernels.len());
     for (idx, k) in kernels.iter().enumerate() {
         k.validate()?;
@@ -1433,13 +1373,9 @@ fn read_uleb_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, CompileError> {
     for _ in 0..5 {
         let b = read_byte(bytes, pos)?;
         let low = u32::from(b & 0x7F);
-        if shift == 28 && (b & 0xF0) != 0 {
-            return Err(werr("wasm uleb32 overflow"));
-        }
+        if shift == 28 && (b & 0xF0) != 0 { return Err(werr("wasm uleb32 overflow")); }
         val |= low << shift;
-        if (b & 0x80) == 0 {
-            return Ok(val);
-        }
+        if (b & 0x80) == 0 { return Ok(val); }
         shift += 7;
     }
     Err(werr("wasm uleb32 exceeds 5 bytes"))
@@ -1448,16 +1384,12 @@ fn read_uleb_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, CompileError> {
 fn skip_sleb(bytes: &[u8], pos: &mut usize, max_bytes: usize) -> Result<(), CompileError> {
     for _ in 0..max_bytes {
         let b = read_byte(bytes, pos)?;
-        if (b & 0x80) == 0 {
-            return Ok(());
-        }
+        if (b & 0x80) == 0 { return Ok(()); }
     }
     Err(werr("wasm sleb exceeds max byte width"))
 }
 
-fn is_valtype(b: u8) -> bool {
-    matches!(b, 0x7B..=0x7F)
-}
+fn is_valtype(b: u8) -> bool { matches!(b, 0x7B..=0x7F) }
 
 fn read_utf8_name(bytes: &[u8], pos: &mut usize) -> Result<String, CompileError> {
     let len = read_uleb_u32(bytes, pos)? as usize;
@@ -1470,9 +1402,7 @@ fn read_utf8_name(bytes: &[u8], pos: &mut usize) -> Result<String, CompileError>
 
 fn skip_memarg(bytes: &[u8], pos: &mut usize, max_align_log2: u32) -> Result<(), CompileError> {
     let align = read_uleb_u32(bytes, pos)?;
-    if align > max_align_log2 {
-        return Err(werr("wasm memarg alignment exceeds natural width"));
-    }
+    if align > max_align_log2 { return Err(werr("wasm memarg alignment exceeds natural width")); }
     let _ = read_uleb_u32(bytes, pos)?;
     Ok(())
 }
@@ -1489,9 +1419,7 @@ fn verify_code_body(
     for _ in 0..local_groups {
         let _ = read_uleb_u32(body, &mut pos)?;
         let ty = read_byte(body, &mut pos)?;
-        if !is_valtype(ty) {
-            return Err(werr("wasm invalid local valtype"));
-        }
+        if !is_valtype(ty) { return Err(werr("wasm invalid local valtype")); }
     }
     let mut depth = 1usize;
     while pos < body.len() {
@@ -1501,40 +1429,26 @@ fn verify_code_body(
             0x00 | 0x01 | 0x0F | 0x1A | 0x1B => {}
             0x02..=0x04 => {
                 let bt = read_byte(body, &mut pos)?;
-                if bt != 0x40 && !is_valtype(bt) {
-                    return Err(werr("wasm invalid blocktype"));
-                }
+                if bt != 0x40 && !is_valtype(bt) { return Err(werr("wasm invalid blocktype")); }
                 depth += 1;
             }
             0x05 => {
-                if depth < 2 {
-                    return Err(werr("wasm stray else outside if block"));
-                }
+                if depth < 2 { return Err(werr("wasm stray else outside if block")); }
             }
             0x0B => {
-                if depth == 0 {
-                    return Err(werr("wasm unbalanced end"));
-                }
+                if depth == 0 { return Err(werr("wasm unbalanced end")); }
                 depth -= 1;
-                if depth == 0 && pos != body.len() {
-                    return Err(werr("wasm trailing bytes after function end"));
-                }
+                if depth == 0 && pos != body.len() { return Err(werr("wasm trailing bytes after function end")); }
             }
             0x0C | 0x0D => {
                 let lbl = read_uleb_u32(body, &mut pos)? as usize;
-                if lbl >= depth {
-                    return Err(werr("wasm branch label exceeds block depth"));
-                }
+                if lbl >= depth { return Err(werr("wasm branch label exceeds block depth")); }
             }
             0x10 => {
                 let fidx = read_uleb_u32(body, &mut pos)? as usize;
-                if fidx >= func_count {
-                    return Err(werr("wasm call target out of bounds"));
-                }
+                if fidx >= func_count { return Err(werr("wasm call target out of bounds")); }
             }
-            0x20..=0x24 => {
-                let _ = read_uleb_u32(body, &mut pos)?;
-            }
+            0x20..=0x24 => { let _ = read_uleb_u32(body, &mut pos)?; }
             0x28 | 0x36 => skip_memarg(body, &mut pos, 2)?,
             0x29 | 0x37 => skip_memarg(body, &mut pos, 3)?,
             0x2C | 0x2D | 0x30 | 0x31 | 0x3A | 0x3C => skip_memarg(body, &mut pos, 0)?,
@@ -1543,9 +1457,7 @@ fn verify_code_body(
             0x41 => skip_sleb(body, &mut pos, 5)?,
             0x42 => skip_sleb(body, &mut pos, 10)?,
             0x45..=0x6C | 0x71..=0x7E | 0x83..=0x8A | 0xA7..=0xC4 => {}
-            0x6D..=0x70 | 0x7F..=0x82 => {
-                *div_rem_insns += 1;
-            }
+            0x6D..=0x70 | 0x7F..=0x82 => { *div_rem_insns += 1; }
             0xFD => {
                 *simd_insns += 1;
                 let sub = read_uleb_u32(body, &mut pos)?;
@@ -1557,14 +1469,10 @@ fn verify_code_body(
                     0x09 => skip_memarg(body, &mut pos, 2)?,
                     SIMD_V128_CONST | 0x0D => {
                         let end = pos.checked_add(16).ok_or_else(|| werr("wasm v128 imm overflow"))?;
-                        if end > body.len() {
-                            return Err(werr("wasm v128 immediate truncated"));
-                        }
+                        if end > body.len() { return Err(werr("wasm v128 immediate truncated")); }
                         pos = end;
                     }
-                    0x15..=0x22 => {
-                        let _ = read_byte(body, &mut pos)?;
-                    }
+                    0x15..=0x22 => { let _ = read_byte(body, &mut pos)?; }
                     0x54 | 0x58 => {
                         skip_memarg(body, &mut pos, 0)?;
                         let _ = read_byte(body, &mut pos)?;
@@ -1580,9 +1488,7 @@ fn verify_code_body(
                     SIMD_V128_LOAD64_LANE | SIMD_V128_STORE64_LANE => {
                         skip_memarg(body, &mut pos, 3)?;
                         let lane = read_byte(body, &mut pos)?;
-                        if lane > 1 {
-                            return Err(werr("wasm v128 64-bit lane index out of range"));
-                        }
+                        if lane > 1 { return Err(werr("wasm v128 64-bit lane index out of range")); }
                     }
                     0x0F..=0x14 | 0x23..=0x53 | 0x5C..=0xFF => {}
                     _ => return Err(werr(format!("wasm unsupported simd opcode 0x{sub:x}"))),
@@ -1591,17 +1497,13 @@ fn verify_code_body(
             _ => return Err(werr(format!("wasm unsupported opcode 0x{op:02x}"))),
         }
     }
-    if depth != 0 {
-        return Err(werr("wasm unbalanced block/loop/if without closing end"));
-    }
+    if depth != 0 { return Err(werr("wasm unbalanced block/loop/if without closing end")); }
     Ok(())
 }
 
 /// Self-verifying `0t` airlock parser for standalone `WASM32` (+`SIMD128`) binary modules emitted by `zero-cc`.
 pub fn verify_wasm_module(bytes: &[u8]) -> Result<WasmSummary, CompileError> {
-    if bytes.get(0..8) != Some(&WASM_MAGIC_VERSION) {
-        return Err(werr("bad wasm magic or version"));
-    }
+    if bytes.get(0..8) != Some(&WASM_MAGIC_VERSION) { return Err(werr("bad wasm magic or version")); }
     let mut pos = 8usize;
     let mut prev_sec_id = 0u8;
     let mut type_count = 0usize;
@@ -1619,9 +1521,7 @@ pub fn verify_wasm_module(bytes: &[u8]) -> Result<WasmSummary, CompileError> {
         let sec_id = read_byte(bytes, &mut pos)?;
         let sec_len = read_uleb_u32(bytes, &mut pos)? as usize;
         if sec_id != 0 {
-            if sec_id <= prev_sec_id || sec_id > 12 {
-                return Err(werr("wasm out-of-order or duplicate section id"));
-            }
+            if sec_id <= prev_sec_id || sec_id > 12 { return Err(werr("wasm out-of-order or duplicate section id")); }
             prev_sec_id = sec_id;
         }
         let sec_end = pos.checked_add(sec_len).ok_or_else(|| werr("wasm section length overflow"))?;
@@ -1633,20 +1533,14 @@ pub fn verify_wasm_module(bytes: &[u8]) -> Result<WasmSummary, CompileError> {
             SEC_TYPE => {
                 type_count = read_uleb_u32(payload, &mut p)? as usize;
                 for _ in 0..type_count {
-                    if read_byte(payload, &mut p)? != 0x60 {
-                        return Err(werr("wasm type section expected 0x60 functype"));
-                    }
+                    if read_byte(payload, &mut p)? != 0x60 { return Err(werr("wasm type section expected 0x60 functype")); }
                     let nparams = read_uleb_u32(payload, &mut p)? as usize;
                     for _ in 0..nparams {
-                        if !is_valtype(read_byte(payload, &mut p)?) {
-                            return Err(werr("wasm invalid param valtype"));
-                        }
+                        if !is_valtype(read_byte(payload, &mut p)?) { return Err(werr("wasm invalid param valtype")); }
                     }
                     let nres = read_uleb_u32(payload, &mut p)? as usize;
                     for _ in 0..nres {
-                        if !is_valtype(read_byte(payload, &mut p)?) {
-                            return Err(werr("wasm invalid result valtype"));
-                        }
+                        if !is_valtype(read_byte(payload, &mut p)?) { return Err(werr("wasm invalid result valtype")); }
                     }
                 }
             }
@@ -1661,16 +1555,12 @@ pub fn verify_wasm_module(bytes: &[u8]) -> Result<WasmSummary, CompileError> {
                     }
                     let flags = read_byte(payload, &mut p)?;
                     let min_p = read_uleb_u32(payload, &mut p)?;
-                    if mem_count == 0 {
-                        mem_min_pages = min_p;
-                    }
+                    if mem_count == 0 { mem_min_pages = min_p; }
                     match flags {
                         0x00 => {}
                         0x01 => {
                             let max_p = read_uleb_u32(payload, &mut p)?;
-                            if max_p < min_p {
-                                return Err(werr("wasm imported memory max < min"));
-                            }
+                            if max_p < min_p { return Err(werr("wasm imported memory max < min")); }
                         }
                         _ => return Err(werr("wasm invalid imported memory limits flag")),
                     }
@@ -1682,32 +1572,22 @@ pub fn verify_wasm_module(bytes: &[u8]) -> Result<WasmSummary, CompileError> {
                 func_count = read_uleb_u32(payload, &mut p)? as usize;
                 for _ in 0..func_count {
                     let tidx = read_uleb_u32(payload, &mut p)? as usize;
-                    if tidx >= type_count {
-                        return Err(werr("wasm function type index out of range"));
-                    }
+                    if tidx >= type_count { return Err(werr("wasm function type index out of range")); }
                 }
             }
             SEC_MEM => {
-                if imports_memory {
-                    return Err(werr("wasm module cannot both import and define memory"));
-                }
+                if imports_memory { return Err(werr("wasm module cannot both import and define memory")); }
                 mem_count = read_uleb_u32(payload, &mut p)? as usize;
-                if mem_count == 0 {
-                    return Err(werr("wasm memory section empty"));
-                }
+                if mem_count == 0 { return Err(werr("wasm memory section empty")); }
                 for i in 0..mem_count {
                     let flags = read_byte(payload, &mut p)?;
                     let min_p = read_uleb_u32(payload, &mut p)?;
-                    if i == 0 {
-                        mem_min_pages = min_p;
-                    }
+                    if i == 0 { mem_min_pages = min_p; }
                     match flags {
                         0x00 => {}
                         0x01 => {
                             let max_p = read_uleb_u32(payload, &mut p)?;
-                            if max_p < min_p {
-                                return Err(werr("wasm memory max < min"));
-                            }
+                            if max_p < min_p { return Err(werr("wasm memory max < min")); }
                         }
                         _ => return Err(werr("wasm invalid memory limits flag")),
                     }
@@ -1730,9 +1610,7 @@ pub fn verify_wasm_module(bytes: &[u8]) -> Result<WasmSummary, CompileError> {
             }
             SEC_CODE => {
                 code_body_count = read_uleb_u32(payload, &mut p)? as usize;
-                if code_body_count != func_count {
-                    return Err(werr("wasm code body count mismatches function section"));
-                }
+                if code_body_count != func_count { return Err(werr("wasm code body count mismatches function section")); }
                 for _ in 0..code_body_count {
                     let bsz = read_uleb_u32(payload, &mut p)? as usize;
                     let bend = p.checked_add(bsz).ok_or_else(|| werr("wasm code body length overflow"))?;
@@ -1741,14 +1619,10 @@ pub fn verify_wasm_module(bytes: &[u8]) -> Result<WasmSummary, CompileError> {
                     verify_code_body(body, func_count, &mut total_insns, &mut simd_insns, &mut div_rem_insns)?;
                 }
             }
-            0 => {
-                p = payload.len();
-            }
+            0 => { p = payload.len(); }
             _ => return Err(werr(format!("wasm unexpected section id {sec_id}"))),
         }
-        if p != payload.len() {
-            return Err(werr("wasm section payload length mismatch"));
-        }
+        if p != payload.len() { return Err(werr("wasm section payload length mismatch")); }
     }
 
     if type_count == 0 || func_count == 0 || mem_count == 0 || code_body_count != func_count {

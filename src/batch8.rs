@@ -64,6 +64,7 @@ enum B8Step {
     CmpGtS32 { dst: usize, a: usize, b: usize },
     ShlImm32 { dst: usize, src: usize, s: u8 },
     ShrImm32 { dst: usize, src: usize, s: u8 },
+    SarImm32 { dst: usize, src: usize, s: u8 },
     ShlVar32 { dst: usize, a: usize, b: usize },
     ShrVar32 { dst: usize, a: usize, b: usize },
     Blend32 { dst: usize, f_val: usize, t_val: usize, mask: usize },
@@ -93,6 +94,7 @@ impl B8Step {
             | Self::CmpGtS32 { dst, .. }
             | Self::ShlImm32 { dst, .. }
             | Self::ShrImm32 { dst, .. }
+            | Self::SarImm32 { dst, .. }
             | Self::ShlVar32 { dst, .. }
             | Self::ShrVar32 { dst, .. }
             | Self::Blend32 { dst, .. }
@@ -104,7 +106,7 @@ impl B8Step {
     fn for_each_use(&self, mut f: impl FnMut(usize)) {
         match *self {
             Self::LoadNarrow { .. } | Self::LoadSplit64 { .. } => {}
-            Self::Mov { src, .. } | Self::ShlImm32 { src, .. } | Self::ShrImm32 { src, .. } => f(src),
+            Self::Mov { src, .. } | Self::ShlImm32 { src, .. } | Self::ShrImm32 { src, .. } | Self::SarImm32 { src, .. } => f(src),
             Self::Add32 { a, b, .. }
             | Self::Sub32 { a, b, .. }
             | Self::Mul32 { a, b, .. }
@@ -158,9 +160,7 @@ fn analyze_bool_masks(k: &Kernel, sched: &ScheduleReport) -> Vec<bool> {
             Op::Cmp(_, _, _) => true,
             Op::BitAnd(a, b) | Op::BitOr(a, b) => is_bool_prod[a] && is_bool_prod[b],
             Op::Select { t_val, f_val, .. } => {
-                let b_or_01 = |x: NodeId| {
-                    is_bool_prod[x] || matches!(k.nodes.get(x), Some(Op::Const(0 | 1)))
-                };
+                let b_or_01 = |x: NodeId| { is_bool_prod[x] || matches!(k.nodes.get(x), Some(Op::Const(0 | 1))) };
                 b_or_01(t_val) && b_or_01(f_val)
             }
             _ => false,
@@ -243,9 +243,8 @@ fn analyze_demanded_lo32(k: &Kernel, sched: &ScheduleReport) -> Vec<bool> {
             Op::Add(a, b) | Op::Sub(a, b) | Op::BitOr(a, b) | Op::BitXor(a, b) => {
                 if hi { needs_hi[a] = true; needs_hi[b] = true; }
             }
-            Op::ShlVar(a, _) | Op::ShrVarU(a, _) => {
-                if hi { needs_hi[a] = true; }
-            }
+            Op::ShlVar(a, _) => { if hi { needs_hi[a] = true; } }
+            Op::ShrVarU(a, _) => { needs_hi[a] = true; }
             _ => {}
         }
     }
@@ -271,9 +270,7 @@ impl<'a> B8Builder<'a> {
         v
     }
 
-    fn const32(&mut self, val: u32) -> usize {
-        b8_ensure_const(&mut self.consts, &mut self.next_v, val)
-    }
+    fn const32(&mut self, val: u32) -> usize { b8_ensure_const(&mut self.consts, &mut self.next_v, val) }
 
     fn emit(&mut self, s: B8Step) { self.steps.push(s); }
 
@@ -282,9 +279,7 @@ impl<'a> B8Builder<'a> {
             let d = self.alloc_v();
             self.emit(B8Step::Mov { dst: d, src: v });
             d
-        } else {
-            v
-        }
+        } else { v }
     }
 
     fn emit_popcnt_words(&mut self, x_lo: usize, x_hi: Option<usize>) -> usize {
@@ -318,21 +313,16 @@ impl<'a> B8Builder<'a> {
         }
     }
 
-    fn is_zero_hi(&self, v: B8Val) -> bool {
+    fn is_zero_half(&self, v: B8Val, hi: bool) -> bool {
         match v {
-            B8Val::Const(c) => (c >> 32) == 0,
-            B8Val::Lo32(_) | B8Val::Mask32(_) => true,
-            B8Val::Hi32(_) | B8Val::Split64(_, _) => false,
+            B8Val::Const(c) => if hi { (c >> 32) == 0 } else { (c as u32) == 0 },
+            B8Val::Lo32(_) | B8Val::Mask32(_) => hi,
+            B8Val::Hi32(_) => !hi,
+            B8Val::Split64(_, _) => false,
         }
     }
-
-    fn is_zero_lo(&self, v: B8Val) -> bool {
-        match v {
-            B8Val::Const(c) => (c as u32) == 0,
-            B8Val::Hi32(_) => true,
-            B8Val::Lo32(_) | B8Val::Mask32(_) | B8Val::Split64(_, _) => false,
-        }
-    }
+    fn is_zero_hi(&self, v: B8Val) -> bool { self.is_zero_half(v, true) }
+    fn is_zero_lo(&self, v: B8Val) -> bool { self.is_zero_half(v, false) }
 
     fn val_mask(&mut self, v: B8Val) -> usize {
         match v {
@@ -744,15 +734,11 @@ impl<'a> B8Builder<'a> {
                     CmpKind::Ge => CmpKind::Uge,
                     other => other,
                 }
-            } else {
-                kind
-            };
+            } else { kind };
             if !eff_kind.is_unsigned()
                 && !matches!(eff_kind, CmpKind::Eq | CmpKind::Ne)
                 && (!self.doms[a].fits_i32() || !self.doms[b].fits_i32())
-            {
-                return None;
-            }
+            { return None; }
             match (va, vb) {
                 (_, B8Val::Const(c)) => {
                     let la = self.val_lo32(va);
@@ -783,12 +769,8 @@ impl<'a> B8Builder<'a> {
                     CmpKind::Ge => CmpKind::Uge,
                     other => other,
                 }
-            } else {
-                kind
-            };
-            if !(eff_kind.is_unsigned() || matches!(eff_kind, CmpKind::Eq | CmpKind::Ne)) {
-                return None;
-            }
+            } else { kind };
+            if !(eff_kind.is_unsigned() || matches!(eff_kind, CmpKind::Eq | CmpKind::Ne)) { return None; }
             match (va, vb) {
                 (B8Val::Split64(lo, hi), B8Val::Const(c)) => self.cmp_split64_u_const(eff_kind, lo, hi, c),
                 (B8Val::Const(c), B8Val::Split64(lo, hi)) => {
@@ -865,17 +847,22 @@ impl<'a> B8Builder<'a> {
                         self.emit(B8Step::LoadNarrow { dst: d, buf, ty: bdecl.elem_ty, permute: self.use_perm });
                         B8Val::Lo32(d)
                     }
-                    ElemTy::I32 | ElemTy::I16 if bdecl.domain.is_nonneg() => {
-                        let d = self.alloc_v();
-                        self.emit(B8Step::LoadNarrow { dst: d, buf, ty: bdecl.elem_ty, permute: self.use_perm });
-                        B8Val::Lo32(d)
+                    ElemTy::I32 | ElemTy::I16 => {
+                        let lo = self.alloc_v();
+                        self.emit(B8Step::LoadNarrow { dst: lo, buf, ty: bdecl.elem_ty, permute: self.use_perm });
+                        if bdecl.domain.is_nonneg() || self.demanded_lo32[id] {
+                            B8Val::Lo32(lo)
+                        } else {
+                            let hi = self.alloc_v();
+                            self.emit(B8Step::SarImm32 { dst: hi, src: lo, s: 31 });
+                            B8Val::Split64(lo, hi)
+                        }
                     }
                     ElemTy::U64 | ElemTy::I64 => {
                         let (lo, hi) = (self.alloc_v(), self.alloc_v());
                         self.emit(B8Step::LoadSplit64 { lo, hi, buf });
                         B8Val::Split64(lo, hi)
                     }
-                    _ => return None,
                 }
             }
             Op::Add(a, b) => self.lower_add(id, a, b)?,
@@ -903,9 +890,7 @@ impl<'a> B8Builder<'a> {
                     let hi = self.alloc_v();
                     self.emit(B8Step::MulHiShr { dst: hi, x_lo, x_hi, c: c_v, shift: 0, hi_mode: MulHiMode::General });
                     B8Val::Split64(lo, hi)
-                } else {
-                    return None;
-                }
+                } else { return None; }
             }
             Op::Popcnt(a) => {
                 let va = self.vals[a]?;
@@ -1615,16 +1600,12 @@ fn extract_fastpath_candidate(k: &Kernel, out_buf: u8) -> Option<B8FastPath> {
             _ => None,
         };
         if let Some(b) = bound {
-            if b > u64::from(desc_lo_max) && b <= 0xFFFF_FFFF {
-                addr_bound = Some(addr_bound.map_or(b, |prev| prev.min(b)));
-            }
+            if b > u64::from(desc_lo_max) && b <= 0xFFFF_FFFF { addr_bound = Some(addr_bound.map_or(b, |prev| prev.min(b))); }
         }
     }
     let bound = addr_bound?;
     let mut p2 = 1u64 << 31;
-    while p2 > 1 && (p2 - 1).saturating_add(u64::from(desc_lo_max)) > bound {
-        p2 >>= 1;
-    }
+    while p2 > 1 && (p2 - 1).saturating_add(u64::from(desc_lo_max)) > bound { p2 >>= 1; }
     if p2 <= u64::from(desc_lo_max) { return None; }
     let addr_zero_mask = !(p2 - 1);
 
@@ -1752,9 +1733,7 @@ fn prove_fastpath_on_ir(k: &Kernel, sched: &ScheduleReport, mut fp: B8FastPath, 
                     SymInfo { lo: 0, hi: u64::MAX, expr: SymExpr::BufBits { buf, and_mask: u64::MAX, or_mask: 0 } }
                 } else if let Some(g) = ng.filter(|g| g.prefix_buf == buf) {
                     SymInfo { lo: 0, hi: u64::from(g.prefix_max), expr: SymExpr::Prefix(buf) }
-                } else {
-                    SymInfo::any()
-                }
+                } else { SymInfo::any() }
             }
             Op::Add(a, b) => {
                 let (sa, sb) = (sym[a], sym[b]);
@@ -1771,9 +1750,7 @@ fn prove_fastpath_on_ir(k: &Kernel, sched: &ScheduleReport, mut fp: B8FastPath, 
                     } else { SymInfo::any() }
                 } else if sb.hi <= sa.lo {
                     SymInfo::range(sa.lo - sb.hi, sa.hi - sb.lo)
-                } else {
-                    SymInfo::any()
-                }
+                } else { SymInfo::any() }
             }
             Op::Mul(a, b) => {
                 let (sa, sb) = (sym[a], sym[b]);
@@ -1792,25 +1769,19 @@ fn prove_fastpath_on_ir(k: &Kernel, sched: &ScheduleReport, mut fp: B8FastPath, 
                     SymInfo { lo: 0, hi: u64::from(u32::MAX & !fp.desc_hi_zero_mask), expr: SymExpr::DescHi(fp.desc_buf) }
                 } else if s == 32 && ng.is_some_and(|g| matches!(sa.expr, SymExpr::BufBits { buf, and_mask: u64::MAX, or_mask: 0 } if buf == g.net_buf)) {
                     SymInfo { lo: 0, hi: u64::from(u32::MAX), expr: SymExpr::NetCidr(ng.map_or(0, |g| g.net_buf)) }
-                } else {
-                    SymInfo::range(sa.lo >> s, sa.hi >> s)
-                }
+                } else { SymInfo::range(sa.lo >> s, sa.hi >> s) }
             }
             Op::Shl(a, s) => {
                 let sa = sym[a];
                 if let SymExpr::Const(c) = sa.expr {
                     SymInfo::from_const(if s < 64 { c << s } else { 0 })
-                } else {
-                    SymInfo::any()
-                }
+                } else { SymInfo::any() }
             }
             Op::ShlVar(a, b) => {
                 let (sa, sb) = (sym[a], sym[b]);
                 if let (SymExpr::Const(0xFFFF_FFFF), SymExpr::PrefixShift(pb)) = (sa.expr, sb.expr) {
                     SymInfo { lo: 0, hi: u64::from(u32::MAX), expr: SymExpr::PrefixMask(pb) }
-                } else {
-                    SymInfo::any()
-                }
+                } else { SymInfo::any() }
             }
             Op::BitAnd(a, b) => {
                 let (sa, sb) = (sym[a], sym[b]);
@@ -1818,18 +1789,14 @@ fn prove_fastpath_on_ir(k: &Kernel, sched: &ScheduleReport, mut fp: B8FastPath, 
                     (SymExpr::Const(x), SymExpr::Const(y)) => SymInfo::from_const(x & y),
                     (SymExpr::NetXor(nb), SymExpr::PrefixMask(pb)) | (SymExpr::PrefixMask(pb), SymExpr::NetXor(nb))
                         if ng.is_some_and(|g| g.net_buf == nb && g.prefix_buf == pb) =>
-                    {
-                        SymInfo::from_const(0)
-                    }
+                    { SymInfo::from_const(0) }
                     (SymExpr::PrefixMask(pb), SymExpr::Const(0xFFFF_FFFF))
                     | (SymExpr::Const(0xFFFF_FFFF), SymExpr::PrefixMask(pb)) => {
                         SymInfo { lo: 0, hi: u64::from(u32::MAX), expr: SymExpr::PrefixMask(pb) }
                     }
                     (SymExpr::DescHi(db), SymExpr::Const(m)) | (SymExpr::Const(m), SymExpr::DescHi(db))
                         if db == fp.desc_buf && (m & !u64::from(fp.desc_hi_zero_mask)) == 0 =>
-                    {
-                        SymInfo::from_const(0)
-                    }
+                    { SymInfo::from_const(0) }
                     (SymExpr::BufBits { buf, and_mask, or_mask }, SymExpr::Const(m))
                     | (SymExpr::Const(m), SymExpr::BufBits { buf, and_mask, or_mask }) => {
                         if buf == fp.desc_buf && and_mask == u64::MAX && or_mask == 0 && m == 0xFFFF_FFFF {
@@ -1910,9 +1877,7 @@ fn try_plan_fastpath_superblock(k: &Kernel, sched: &ScheduleReport, out_buf: u8,
 
 pub(crate) fn emit_x86_batch8_fp_consts(e: &mut X86Emit, fp: &B8FastPath) {
     e.vex_broadcast_rip(6, fp.addr_zero_mask as i64);
-    if fp.desc_hi_zero_mask != 0 {
-        e.vex_broadcast_rip(7, (u64::from(fp.desc_hi_zero_mask) << 32) as i64);
-    }
+    if fp.desc_hi_zero_mask != 0 { e.vex_broadcast_rip(7, (u64::from(fp.desc_hi_zero_mask) << 32) as i64); }
     e.vex_broadcast_rip(8, u64::from(0u32.wrapping_sub(fp.desc_lo_min)) as i64);
     let span = fp.desc_lo_max.saturating_sub(fp.desc_lo_min);
     e.vex_broadcast_rip(9, (0xFFFF_FFFF_0000_0000u64 | u64::from(span)) as i64);
@@ -1921,9 +1886,7 @@ pub(crate) fn emit_x86_batch8_fp_consts(e: &mut X86Emit, fp: &B8FastPath) {
     if let Some(ng) = fp.net_guard {
         e.vex_broadcast32_rip(12, ng.prefix_max);
         e.vex_broadcast32_rip(13, u32::MAX);
-        if let Some(rej) = ng.reject_src_const {
-            e.vex_broadcast32_rip(14, rej);
-        }
+        if let Some(rej) = ng.reject_src_const { e.vex_broadcast32_rip(14, rej); }
     }
 }
 
@@ -1953,9 +1916,7 @@ pub(crate) fn emit_x86_batch8_fp_body(e: &mut X86Emit, ra: &RegAlloc, fp: &B8Fas
             e.vex_ymm_op(1, 0x76, 3, 3, 14); // vpcmpeqd ymm3, src_ip, rej
             e.vex_ymm_op(1, 0xEB, 15, 15, 3);
         }
-    } else {
-        e.vex_ymm_op(1, 0xEF, 15, 15, 15);
-    }
+    } else { e.vex_ymm_op(1, 0xEF, 15, 15, 15); }
 
     // Load 8 x u64 addr into ymm0..ymm1 and check `(addr & addr_zero_mask) == 0`.
     e.vex_mem_op([1, 1, 2, 0, 0, 0x6F], 0, addr_reg, 0);
@@ -2039,9 +2000,7 @@ pub(crate) fn try_plan_avx2_batch8(k: &Kernel, sched: &ScheduleReport, doms: &[D
         B8OutLayout::Lane1(out_buf, ob.elem_ty)
     } else if k.outputs.len() == 2 && ob.lanes == 2 && matches!(ob.elem_ty, ElemTy::U64 | ElemTy::I64) {
         B8OutLayout::Lanes2U64(out_buf)
-    } else {
-        return None;
-    };
+    } else { return None; };
 
     let is_mask = analyze_bool_masks(k, sched);
     let demanded_lo32 = analyze_demanded_lo32(k, sched);
@@ -2082,9 +2041,7 @@ pub(crate) fn try_plan_avx2_batch8(k: &Kernel, sched: &ScheduleReport, doms: &[D
                     let d = b.alloc_v();
                     b.emit(B8Step::Mov { dst: d, src: v });
                     d
-                } else {
-                    v
-                };
+                } else { v };
             }
             b.emit(B8Step::Store2U64 { o0_lo: m[0], o0_hi: m[1], o1_lo: m[2], o1_hi: m[3], buf });
         }
@@ -2149,21 +2106,30 @@ pub(crate) fn emit_x86_batch8_body(e: &mut X86Emit, k: &Kernel, ra: &RegAlloc, p
                 let (d, s) = (b8_dst(plan, dst)?, b8_reg(e, plan, src, 14)?);
                 if d != s { e.vex_ymm_op(1, 0xEB, d, s, s); }
             }
-            B8Step::Add32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(1, 0xFE, d, ra_, rb_); }
-            B8Step::Sub32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(1, 0xFA, d, ra_, rb_); }
-            B8Step::Mul32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(2, 0x40, d, ra_, rb_); }
-            B8Step::And32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(1, 0xDB, d, ra_, rb_); }
-            B8Step::Andn32 { dst, mask_inv, val } => { let (d, rm, rv) = (b8_dst(plan, dst)?, b8_reg(e, plan, mask_inv, 14)?, b8_reg(e, plan, val, 15)?); e.vex_ymm_op(1, 0xDF, d, rm, rv); }
-            B8Step::Or32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(1, 0xEB, d, ra_, rb_); }
-            B8Step::Xor32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(1, 0xEF, d, ra_, rb_); }
-            B8Step::MinU32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(2, 0x3B, d, ra_, rb_); }
-            B8Step::MaxU32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(2, 0x3F, d, ra_, rb_); }
-            B8Step::CmpEq32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(1, 0x76, d, ra_, rb_); }
-            B8Step::CmpGtS32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op(1, 0x66, d, ra_, rb_); }
-            B8Step::ShlImm32 { dst, src, s } => { let (d, rs) = (b8_dst(plan, dst)?, b8_reg(e, plan, src, 14)?); e.vex_shift_imm(0x72, 6, d, rs, s); }
-            B8Step::ShrImm32 { dst, src, s } => { let (d, rs) = (b8_dst(plan, dst)?, b8_reg(e, plan, src, 14)?); e.vex_shift_imm(0x72, 2, d, rs, s); }
-            B8Step::ShlVar32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op_w(2, 0, 0x47, d, ra_, rb_); }
-            B8Step::ShrVar32 { dst, a, b } => { let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?); e.vex_ymm_op_w(2, 0, 0x45, d, ra_, rb_); }
+            B8Step::Add32 { dst, a, b } | B8Step::Sub32 { dst, a, b } | B8Step::Mul32 { dst, a, b }
+            | B8Step::And32 { dst, a, b } | B8Step::Or32 { dst, a, b } | B8Step::Xor32 { dst, a, b }
+            | B8Step::MinU32 { dst, a, b } | B8Step::MaxU32 { dst, a, b } | B8Step::CmpEq32 { dst, a, b }
+            | B8Step::CmpGtS32 { dst, a, b } | B8Step::ShlVar32 { dst, a, b } | B8Step::ShrVar32 { dst, a, b } => {
+                let (d, ra_, rb_) = (b8_dst(plan, dst)?, b8_reg(e, plan, a, 14)?, b8_reg(e, plan, b, 15)?);
+                let (map, opc) = match st {
+                    B8Step::Add32 { .. } => (1, 0xFE), B8Step::Sub32 { .. } => (1, 0xFA),
+                    B8Step::Mul32 { .. } => (2, 0x40), B8Step::And32 { .. } => (1, 0xDB),
+                    B8Step::Or32 { .. } => (1, 0xEB), B8Step::Xor32 { .. } => (1, 0xEF),
+                    B8Step::MinU32 { .. } => (2, 0x3B), B8Step::MaxU32 { .. } => (2, 0x3F),
+                    B8Step::CmpEq32 { .. } => (1, 0x76), B8Step::CmpGtS32 { .. } => (1, 0x66),
+                    B8Step::ShlVar32 { .. } => (2, 0x47), _ => (2, 0x45),
+                };
+                e.vex_ymm_op(map, opc, d, ra_, rb_);
+            }
+            B8Step::Andn32 { dst, mask_inv, val } => {
+                let (d, rm, rv) = (b8_dst(plan, dst)?, b8_reg(e, plan, mask_inv, 14)?, b8_reg(e, plan, val, 15)?);
+                e.vex_ymm_op(1, 0xDF, d, rm, rv);
+            }
+            B8Step::ShlImm32 { dst, src, s } | B8Step::ShrImm32 { dst, src, s } | B8Step::SarImm32 { dst, src, s } => {
+                let (d, rs) = (b8_dst(plan, dst)?, b8_reg(e, plan, src, 14)?);
+                let sub = match st { B8Step::ShlImm32 { .. } => 6, B8Step::ShrImm32 { .. } => 2, _ => 4 };
+                e.vex_shift_imm(0x72, sub, d, rs, s);
+            }
             B8Step::Blend32 { dst, f_val, t_val, mask } => {
                 let d = b8_dst(plan, dst)?;
                 let rf = b8_reg(e, plan, f_val, 13)?;
@@ -2183,17 +2149,13 @@ pub(crate) fn emit_x86_batch8_body(e: &mut X86Emit, k: &Kernel, ra: &RegAlloc, p
                 if let Some(xh) = x_hi {
                     let rhi = b8_reg(e, plan, xh, 13)?;
                     match hi_mode {
-                        MulHiMode::NegMask => {
-                            e.vex_ymm_op(1, 0xDB, 14, rhi, rc);
-                        }
+                        MulHiMode::NegMask => { e.vex_ymm_op(1, 0xDB, 14, rhi, rc); }
                         MulHiMode::Pos01 => {
                             e.vex_ymm_op(1, 0xEF, 14, 14, 14);
                             e.vex_ymm_op(1, 0xFA, 14, 14, rhi);
                             e.vex_ymm_op(1, 0xDB, 14, 14, rc);
                         }
-                        MulHiMode::General => {
-                            e.vex_ymm_op(2, 0x40, 14, rhi, rc);
-                        }
+                        MulHiMode::General => { e.vex_ymm_op(2, 0x40, 14, rhi, rc); }
                     }
                     e.vex_ymm_op(1, 0xFE, d, d, 14);
                 }
@@ -2240,12 +2202,8 @@ pub(crate) fn emit_x86_batch8_body(e: &mut X86Emit, k: &Kernel, ra: &RegAlloc, p
                     if unpermute {
                         e.vex_vpermq(14, rl, 0xD8);
                         e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], 14, breg, off);
-                    } else {
-                        e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], rl, breg, off);
-                    }
-                } else {
-                    return Err(CompileError::BackendError("unsupported narrow store1".into()));
-                }
+                    } else { e.vex_mem_op([1, 1, 2, 0, 0, 0x7F], rl, breg, off); }
+                } else { return Err(CompileError::BackendError("unsupported narrow store1".into())); }
             }
             B8Step::Store2U64 { o0_lo, o0_hi, o1_lo, o1_hi, buf } => {
                 let breg = *ra.buf_reg.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;

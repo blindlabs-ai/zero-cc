@@ -98,8 +98,8 @@
   <rect x="816" y="347" width="128" height="26" rx="6" fill="#052E23" stroke="#00F5A0" stroke-width="1"/>
   <text x="880" y="364" class="mono badgeWin">1.53x faster</text>
 
-  <!-- Row 5: rans_renorm_branchless -->
-  <text x="36" y="414" class="mono kname">rans_renorm_branchless</text>
+  <!-- Row 5: rans_refill_branchless -->
+  <text x="36" y="414" class="mono kname">rans_refill_branchless</text>
   <text x="36" y="430" class="mono kmeta">137-&gt;58 ops | AVX2 8x32</text>
   <rect x="250" y="400" width="151.5" height="14" rx="3" fill="url(#gRust)"/>
   <text x="410" y="411" class="mono valR">3.03 ns</text>
