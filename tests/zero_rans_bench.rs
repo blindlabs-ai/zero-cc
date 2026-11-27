@@ -7,8 +7,9 @@ use std::process::Command;
 
 use zero_cc::rust_fe::{kernel_reg_budget, parse_rust_file_kernels};
 use zero_cc::{
-    compile_kernel_direct, compile_standalone_elf_exec, optimize_kernel, verify_elf64_executable,
-    verify_elf64_object, BufAccess, Domain, Kernel, RegBudget, TargetIsa,
+    compile_kernel_direct, compile_kernel_wasm, compile_standalone_elf_exec, optimize_kernel,
+    verify_elf64_executable, verify_elf64_object, verify_wasm_module, BufAccess, CompiledWasm,
+    Domain, ElemTy, Kernel, RegBudget, TargetIsa,
 };
 
 struct XorShift64(u64);
@@ -776,6 +777,526 @@ fn zero_rans_six_kernels_bit_exact_et_exec_objdump_and_live_bench() {
         let sp: f64 = sp_str.parse().unwrap_or_else(|_| panic!("bad speedup in {line}"));
         assert!(sp > 1.05, "expected >1.05x AVX2 speedup over rustc -O3, got {sp:.2}x in {line}");
     }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn pack_buf_bytes(ty: ElemTy, vals: &[i64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * usize::from(ty.bytes()));
+    for &v in vals {
+        ty.push_le_elem(&mut out, v);
+    }
+    out
+}
+
+fn eval_expected_outputs(kernel: &Kernel, inputs: &[Vec<i64>], blocks: usize) -> Vec<(usize, Vec<u8>)> {
+    let mut mut_outs: Vec<(usize, Vec<u8>)> = kernel
+        .bufs
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.access == BufAccess::MutNoAlias)
+        .map(|(idx, b)| (idx, Vec::with_capacity(blocks * b.block_bytes())))
+        .collect();
+    let mut block_slices: Vec<&[i64]> = Vec::with_capacity(kernel.bufs.len());
+    for blk in 0..blocks {
+        block_slices.clear();
+        for (idx, decl) in kernel.bufs.iter().enumerate() {
+            let lanes = usize::from(decl.lanes);
+            block_slices.push(&inputs[idx][blk * lanes..(blk + 1) * lanes]);
+        }
+        let res = kernel.eval(&block_slices).expect("Kernel::eval");
+        for (bidx, bytes) in &mut mut_outs {
+            let decl = &kernel.bufs[*bidx];
+            for &v in res[*bidx].iter().take(usize::from(decl.lanes)) {
+                decl.elem_ty.push_le_elem(bytes, v);
+            }
+        }
+    }
+    mut_outs
+}
+
+fn run_node_wasm_socket_case(
+    dir: &Path,
+    tag: &str,
+    cw: &CompiledWasm,
+    kernel: &Kernel,
+    inputs: &[Vec<i64>],
+    block_counts: &[usize],
+    bench_blocks: usize,
+) -> f64 {
+    let wasm_path = dir.join(format!("{tag}.wasm"));
+    fs::write(&wasm_path, &cw.wasm_bytes).expect("write wasm");
+    let mut buf_meta = Vec::with_capacity(kernel.bufs.len());
+    for (idx, decl) in kernel.bufs.iter().enumerate() {
+        let p = dir.join(format!("{tag}_buf{idx}.bin"));
+        fs::write(&p, pack_buf_bytes(decl.elem_ty, &inputs[idx])).expect("write wasm buf");
+        buf_meta.push(format!(
+            "{{\"idx\":{},\"blockBytes\":{},\"isMut\":{},\"path\":{:?}}}",
+            idx,
+            decl.block_bytes(),
+            decl.access == BufAccess::MutNoAlias,
+            p.to_string_lossy()
+        ));
+    }
+    let mut case_checks = Vec::new();
+    for &n_blocks in block_counts {
+        let expected = eval_expected_outputs(kernel, inputs, n_blocks);
+        let mut exp_entries = Vec::new();
+        for (bidx, exp_bytes) in &expected {
+            let ep = dir.join(format!("{tag}_exp_{n_blocks}_{bidx}.bin"));
+            fs::write(&ep, exp_bytes).expect("write expected wasm out");
+            exp_entries.push(format!("{{\"idx\":{bidx},\"path\":{:?}}}", ep.to_string_lossy()));
+        }
+        case_checks.push(format!("{{\"blocks\":{n_blocks},\"expected\":[{}]}}", exp_entries.join(",")));
+    }
+
+    let script = format!(
+        r#"const fs = require('fs');
+const wasmBytes = fs.readFileSync({wasm_path:?});
+if (!WebAssembly.validate(wasmBytes)) {{
+  console.error('WebAssembly.validate FAILED for {tag}');
+  process.exit(2);
+}}
+const bufs = [{buf_meta}];
+const cases = [{cases}];
+(async () => {{
+  const {{ instance }} = await WebAssembly.instantiate(wasmBytes, {{}});
+  const mem = instance.exports.memory;
+  if (!(mem instanceof WebAssembly.Memory)) {{
+    throw new Error('missing exported memory');
+  }}
+  const singleFn = instance.exports[{kernel_sym:?}];
+  const batchFn = instance.exports[{batch_sym:?}];
+  const rawBufs = bufs.map(b => fs.readFileSync(b.path));
+  let totalBytes = 64;
+  const ptrs = [];
+  for (let i = 0; i < bufs.length; i++) {{
+    totalBytes = (totalBytes + 15) & ~15;
+    ptrs.push(totalBytes);
+    totalBytes += rawBufs[i].length + 64;
+  }}
+  const needPages = Math.ceil(totalBytes / 65536);
+  const curPages = mem.buffer.byteLength / 65536;
+  if (needPages > curPages) mem.grow(needPages - curPages);
+  function loadInputs(nBlocks) {{
+    const view = new Uint8Array(mem.buffer);
+    for (let i = 0; i < bufs.length; i++) {{
+      const len = nBlocks * bufs[i].blockBytes;
+      if (bufs[i].isMut) view.fill(0xAA, ptrs[i], ptrs[i] + len);
+      view.set(rawBufs[i].subarray(0, len), ptrs[i]);
+    }}
+  }}
+  function checkOutputs(expected, label) {{
+    const view = new Uint8Array(mem.buffer);
+    for (const ex of expected) {{
+      const want = fs.readFileSync(ex.path);
+      const got = Buffer.from(view.subarray(ptrs[ex.idx], ptrs[ex.idx] + want.length));
+      if (!got.equals(want)) {{
+        throw new Error(`MISMATCH {tag} ${{label}} buf=${{ex.idx}}`);
+      }}
+    }}
+  }}
+  for (const c of cases) {{
+    loadInputs(c.blocks);
+    batchFn(...ptrs, c.blocks);
+    checkOutputs(c.expected, `batch(${{c.blocks}})`);
+    if (c.blocks === 1) {{
+      loadInputs(1);
+      singleFn(...ptrs);
+      checkOutputs(c.expected, 'single(1)');
+    }}
+  }}
+  loadInputs({bench_blocks});
+  for (let w = 0; w < 8; w++) batchFn(...ptrs, {bench_blocks});
+  const iters = 64;
+  const t0 = process.hrtime.bigint();
+  for (let r = 0; r < iters; r++) batchFn(...ptrs, {bench_blocks});
+  const dtNs = Number(process.hrtime.bigint() - t0);
+  console.log('NS_PER_CALL=' + (dtNs / (iters * {bench_blocks})).toFixed(3));
+}})().catch(err => {{
+  console.error(err);
+  process.exit(1);
+}});
+"#,
+        wasm_path = wasm_path.to_string_lossy(),
+        tag = tag,
+        buf_meta = buf_meta.join(","),
+        cases = case_checks.join(","),
+        kernel_sym = cw.kernel_sym.as_str(),
+        batch_sym = cw.batch_sym.as_str(),
+        bench_blocks = bench_blocks,
+    );
+
+    let js_path = dir.join(format!("{tag}.js"));
+    fs::write(&js_path, &script).expect("write node script");
+    let out = Command::new("node").arg(&js_path).output().expect("run node");
+    assert!(
+        out.status.success(),
+        "node WASM parity failed for {tag}:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("NS_PER_CALL=").and_then(|v| v.parse::<f64>().ok()))
+        .expect("missing NS_PER_CALL from node WASM run")
+}
+
+fn generate_socket_bench_harness(shims: &BTreeMap<String, String>) -> String {
+    let mut src = String::with_capacity(12_288);
+    src.push_str(
+        r#"use std::hint::black_box;
+use std::time::Instant;
+
+#[inline]
+fn ref_zcc_paeth_pred8(w: &[i32; 8], n: &[i32; 8], nw: &[i32; 8], out: &mut [i32; 8]) {
+    for k in 0..8usize {
+        let d_n = n[k] - nw[k];
+        let pa = d_n.max(-d_n);
+        let d_w = w[k] - nw[k];
+        let pb = d_w.max(-d_w);
+        let d_c = d_w + d_n;
+        let pc = d_c.max(-d_c);
+        let m_ab = (pa - pb - 1) >> 31;
+        let m_ac = (pa - pc - 1) >> 31;
+        let m_bc = (pb - pc - 1) >> 31;
+        let sel_w = m_ab & m_ac;
+        let n_or_nw = nw[k] ^ ((n[k] ^ nw[k]) & m_bc);
+        out[k] = n_or_nw ^ ((w[k] ^ n_or_nw) & sel_w);
+    }
+}
+
+#[inline]
+fn ref_zcc_grad_socket8(w: &[i32; 8], n: &[i32; 8], nw: &[i32; 8], out: &mut [i32; 8]) {
+    for k in 0..8usize {
+        let dh = w[k] - nw[k];
+        let qh = -((-24 - dh) >> 31) - ((-7 - dh) >> 31) - ((-1 - dh) >> 31) - ((-dh) >> 31)
+            - ((2 - dh) >> 31) - ((8 - dh) >> 31) - ((24 - dh) >> 31);
+        let dv = n[k] - nw[k];
+        let qv = -((-24 - dv) >> 31) - ((-7 - dv) >> 31) - ((-1 - dv) >> 31) - ((-dv) >> 31)
+            - ((2 - dv) >> 31) - ((8 - dv) >> 31) - ((24 - dv) >> 31);
+        out[k] = (qh << 3) | qv;
+    }
+}
+
+#[inline]
+fn ref_zcc_sub_mod256_8(cur: &[i32; 8], ref_b: &[i32; 8], out: &mut [i32; 8]) {
+    for k in 0..8usize {
+        out[k] = (cur[k] - ref_b[k]) & 255;
+    }
+}
+
+#[inline]
+fn ref_zcc_add_mod256_8(res: &[i32; 8], ref_b: &[i32; 8], out: &mut [i32; 8]) {
+    for k in 0..8usize {
+        out[k] = (res[k] + ref_b[k]) & 255;
+    }
+}
+
+#[inline]
+fn ref_zcc_zigzag_u8_8(err: &[i32; 8], out: &mut [i32; 8]) {
+    for k in 0..8usize {
+        out[k] = ((err[k] << 1) ^ (err[k] >> 7)) & 255;
+    }
+}
+
+#[inline(never)]
+fn ref_paeth_batch(w: &[[i32; 8]], n: &[[i32; 8]], nw: &[[i32; 8]], out: &mut [[i32; 8]]) {
+    for b in 0..out.len() { ref_zcc_paeth_pred8(&w[b], &n[b], &nw[b], &mut out[b]); }
+}
+#[inline(never)]
+fn ref_grad_batch(w: &[[i32; 8]], n: &[[i32; 8]], nw: &[[i32; 8]], out: &mut [[i32; 8]]) {
+    for b in 0..out.len() { ref_zcc_grad_socket8(&w[b], &n[b], &nw[b], &mut out[b]); }
+}
+#[inline(never)]
+fn ref_sub_batch(a: &[[i32; 8]], b: &[[i32; 8]], out: &mut [[i32; 8]]) {
+    for i in 0..out.len() { ref_zcc_sub_mod256_8(&a[i], &b[i], &mut out[i]); }
+}
+#[inline(never)]
+fn ref_add_batch(a: &[[i32; 8]], b: &[[i32; 8]], out: &mut [[i32; 8]]) {
+    for i in 0..out.len() { ref_zcc_add_mod256_8(&a[i], &b[i], &mut out[i]); }
+}
+#[inline(never)]
+fn ref_zz_batch(a: &[[i32; 8]], out: &mut [[i32; 8]]) {
+    for i in 0..out.len() { ref_zcc_zigzag_u8_8(&a[i], &mut out[i]); }
+}
+"#,
+    );
+
+    for (name, shim) in shims {
+        src.push_str(&format!("\nmod {name}_mod {{\n{shim}}}\n"));
+    }
+
+    src.push_str(
+        r#"
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn range_i32(&mut self, lo: i32, hi: i32) -> i32 {
+        let span = (i64::from(hi) - i64::from(lo) + 1) as u64;
+        (i64::from(lo) + (self.next() % span) as i64) as i32
+    }
+}
+
+fn bench_pair<F1: FnMut(), F2: FnMut()>(name: &str, calls: usize, mut f_ref: F1, mut f_zcc: F2) {
+    for _ in 0..3 { f_ref(); f_zcc(); }
+    let mut r_ns = [0.0f64; 9];
+    let mut z_ns = [0.0f64; 9];
+    for t in 0..9 {
+        if t % 2 == 0 {
+            let t0 = Instant::now();
+            f_ref();
+            r_ns[t] = t0.elapsed().as_nanos() as f64 / calls as f64;
+            let t1 = Instant::now();
+            f_zcc();
+            z_ns[t] = t1.elapsed().as_nanos() as f64 / calls as f64;
+        } else {
+            let t1 = Instant::now();
+            f_zcc();
+            z_ns[t] = t1.elapsed().as_nanos() as f64 / calls as f64;
+            let t0 = Instant::now();
+            f_ref();
+            r_ns[t] = t0.elapsed().as_nanos() as f64 / calls as f64;
+        }
+    }
+    r_ns.sort_by(|a, b| a.total_cmp(b));
+    z_ns.sort_by(|a, b| a.total_cmp(b));
+    let rm = r_ns[4];
+    let zm = z_ns[4];
+    println!("SOCKET_BENCH|{name}|{rm:.3}|{zm:.3}|{:.3}", rm / zm);
+}
+
+fn main() {
+    const PARITY_BLOCKS: usize = 4096;
+    const BENCH_BLOCKS: usize = 512;
+    const ITERS: usize = 256;
+    const CALLS: usize = BENCH_BLOCKS * ITERS;
+    let mut rng = Rng(0x517C_C1B7_2722_0A95);
+    let u8_corners: [i32; 11] = [0, 1, 2, 7, 8, 24, 25, 127, 128, 254, 255];
+    let i8_corners: [i32; 9] = [-128, -127, -2, -1, 0, 1, 2, 126, 127];
+
+    let mut w = vec![[0i32; 8]; PARITY_BLOCKS];
+    let mut n = vec![[0i32; 8]; PARITY_BLOCKS];
+    let mut nw = vec![[0i32; 8]; PARITY_BLOCKS];
+    let mut err = vec![[0i32; 8]; PARITY_BLOCKS];
+    for b in 0..PARITY_BLOCKS {
+        for l in 0..8 {
+            if b < u8_corners.len() {
+                w[b][l] = u8_corners[(b + l) % u8_corners.len()];
+                n[b][l] = u8_corners[(b + l * 3 + 1) % u8_corners.len()];
+                nw[b][l] = u8_corners[(b + l * 5 + 2) % u8_corners.len()];
+            } else {
+                w[b][l] = rng.range_i32(0, 255);
+                n[b][l] = rng.range_i32(0, 255);
+                nw[b][l] = rng.range_i32(0, 255);
+            }
+            err[b][l] = if b < i8_corners.len() {
+                i8_corners[(b + l) % i8_corners.len()]
+            } else {
+                rng.range_i32(-128, 127)
+            };
+        }
+    }
+
+    let mut out_ref = vec![[0i32; 8]; PARITY_BLOCKS];
+    let mut out_zcc = vec![[0i32; 8]; PARITY_BLOCKS];
+
+    for &len in &[1usize, 3, 7, PARITY_BLOCKS] {
+        ref_paeth_batch(&w[..len], &n[..len], &nw[..len], &mut out_ref[..len]);
+        zcc_paeth_pred8_mod::zcc_paeth_pred8_batch(&w[..len], &n[..len], &nw[..len], &mut out_zcc[..len]);
+        assert_eq!(&out_ref[..len], &out_zcc[..len], "zcc_paeth_pred8 mismatch len={len}");
+
+        ref_grad_batch(&w[..len], &n[..len], &nw[..len], &mut out_ref[..len]);
+        zcc_grad_socket8_mod::zcc_grad_socket8_batch(&w[..len], &n[..len], &nw[..len], &mut out_zcc[..len]);
+        assert_eq!(&out_ref[..len], &out_zcc[..len], "zcc_grad_socket8 mismatch len={len}");
+
+        ref_sub_batch(&w[..len], &n[..len], &mut out_ref[..len]);
+        zcc_sub_mod256_8_mod::zcc_sub_mod256_8_batch(&w[..len], &n[..len], &mut out_zcc[..len]);
+        assert_eq!(&out_ref[..len], &out_zcc[..len], "zcc_sub_mod256_8 mismatch len={len}");
+
+        ref_add_batch(&w[..len], &n[..len], &mut out_ref[..len]);
+        zcc_add_mod256_8_mod::zcc_add_mod256_8_batch(&w[..len], &n[..len], &mut out_zcc[..len]);
+        assert_eq!(&out_ref[..len], &out_zcc[..len], "zcc_add_mod256_8 mismatch len={len}");
+
+        ref_zz_batch(&err[..len], &mut out_ref[..len]);
+        zcc_zigzag_u8_8_mod::zcc_zigzag_u8_8_batch(&err[..len], &mut out_zcc[..len]);
+        assert_eq!(&out_ref[..len], &out_zcc[..len], "zcc_zigzag_u8_8 mismatch len={len}");
+    }
+
+    // Counterfactual perturbation knockout: perturbing lane 0 must change output
+    let mut w_alt = vec![[100i32; 8]; 1];
+    let n_alt = vec![[100i32; 8]; 1];
+    let nw_alt = vec![[100i32; 8]; 1];
+    let mut k0 = vec![[0i32; 8]; 1];
+    let mut k1 = vec![[0i32; 8]; 1];
+    zcc_paeth_pred8_mod::zcc_paeth_pred8_batch(&w_alt, &n_alt, &nw_alt, &mut k0);
+    w_alt[0][0] = 180;
+    zcc_paeth_pred8_mod::zcc_paeth_pred8_batch(&w_alt, &n_alt, &nw_alt, &mut k1);
+    assert_ne!(k0[0][0], k1[0][0], "paeth perturbation knockout");
+
+    let (wb, nb, nwb, eb) = (&w[..BENCH_BLOCKS], &n[..BENCH_BLOCKS], &nw[..BENCH_BLOCKS], &err[..BENCH_BLOCKS]);
+    bench_pair("zcc_paeth_pred8", CALLS,
+        || { for _ in 0..ITERS { ref_paeth_batch(black_box(wb), black_box(nb), black_box(nwb), black_box(&mut out_ref[..BENCH_BLOCKS])); } },
+        || { for _ in 0..ITERS { zcc_paeth_pred8_mod::zcc_paeth_pred8_batch(black_box(wb), black_box(nb), black_box(nwb), black_box(&mut out_zcc[..BENCH_BLOCKS])); } },
+    );
+    bench_pair("zcc_grad_socket8", CALLS,
+        || { for _ in 0..ITERS { ref_grad_batch(black_box(wb), black_box(nb), black_box(nwb), black_box(&mut out_ref[..BENCH_BLOCKS])); } },
+        || { for _ in 0..ITERS { zcc_grad_socket8_mod::zcc_grad_socket8_batch(black_box(wb), black_box(nb), black_box(nwb), black_box(&mut out_zcc[..BENCH_BLOCKS])); } },
+    );
+    bench_pair("zcc_sub_mod256_8", CALLS,
+        || { for _ in 0..ITERS { ref_sub_batch(black_box(wb), black_box(nb), black_box(&mut out_ref[..BENCH_BLOCKS])); } },
+        || { for _ in 0..ITERS { zcc_sub_mod256_8_mod::zcc_sub_mod256_8_batch(black_box(wb), black_box(nb), black_box(&mut out_zcc[..BENCH_BLOCKS])); } },
+    );
+    bench_pair("zcc_add_mod256_8", CALLS,
+        || { for _ in 0..ITERS { ref_add_batch(black_box(wb), black_box(nb), black_box(&mut out_ref[..BENCH_BLOCKS])); } },
+        || { for _ in 0..ITERS { zcc_add_mod256_8_mod::zcc_add_mod256_8_batch(black_box(wb), black_box(nb), black_box(&mut out_zcc[..BENCH_BLOCKS])); } },
+    );
+    bench_pair("zcc_zigzag_u8_8", CALLS,
+        || { for _ in 0..ITERS { ref_zz_batch(black_box(eb), black_box(&mut out_ref[..BENCH_BLOCKS])); } },
+        || { for _ in 0..ITERS { zcc_zigzag_u8_8_mod::zcc_zigzag_u8_8_batch(black_box(eb), black_box(&mut out_zcc[..BENCH_BLOCKS])); } },
+    );
+}
+"#,
+    );
+    src
+}
+
+#[test]
+fn zero_rans_socket_five_kernels_elf64_wasm32_parity_and_bench() {
+    let sock_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../zero-rans/src/socket_kernels.rs");
+    let sock_src = fs::read_to_string(&sock_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", sock_path.display()));
+    let overrides: BTreeMap<String, BTreeMap<String, Domain>> = BTreeMap::new();
+    let mut extracted = BTreeMap::new();
+    for k in parse_rust_file_kernels(&sock_src, &overrides) {
+        extracted.insert(k.name.clone(), k);
+    }
+
+    let targets = [
+        "zcc_paeth_pred8",
+        "zcc_grad_socket8",
+        "zcc_sub_mod256_8",
+        "zcc_add_mod256_8",
+        "zcc_zigzag_u8_8",
+    ];
+    let dir = temp_dir("zero_rans_socket_kernels");
+    let mut obj_paths: Vec<PathBuf> = Vec::new();
+    let mut shims: BTreeMap<String, String> = BTreeMap::new();
+
+    for (idx, &name) in targets.iter().enumerate() {
+        let kernel = extracted
+            .get(name)
+            .unwrap_or_else(|| panic!("missing socket kernel '{name}'"));
+        let orig_cost = kernel.cost();
+        let opt = optimize_kernel(kernel).expect("optimize_kernel");
+        let opt_cost = opt.cost();
+        assert_eq!(opt_cost.divs_rems, 0, "{name} must have 0 remaining divs/rems");
+
+        let budget = kernel_reg_budget(kernel, RegBudget::default());
+        let obj = compile_kernel_direct(kernel, budget, TargetIsa::X86_64).expect("compile ET_REL");
+        verify_elf64_object(&obj.elf_bytes).expect("verify ET_REL");
+        assert!(obj.zero_spills, "{name} ET_REL must have 0 spills");
+
+        let obj_path = dir.join(format!("{name}.o"));
+        fs::write(&obj_path, &obj.elf_bytes).expect("write .o");
+        let (rel_insns, _, rel_ymm) = audit_objdump_x86(&obj_path, None);
+        assert!(rel_insns > 0 && rel_ymm > 0, "{name} ET_REL must emit packed AVX2 ymm insns");
+        obj_paths.push(obj_path);
+        shims.insert(name.to_string(), obj.rust_ffi_shim.clone());
+
+        const EXEC_BLOCKS: usize = 512;
+        let exec_inputs = build_exec_inputs(kernel, EXEC_BLOCKS, 0xD1B5_4A32_D192_ED03u64 + idx as u64);
+        let input_refs: Vec<&[i64]> = exec_inputs.iter().map(Vec::as_slice).collect();
+        let exec = compile_standalone_elf_exec(kernel, budget, TargetIsa::X86_64, &input_refs)
+            .expect("compile ET_EXEC");
+        let esum = verify_elf64_executable(&exec.elf_bytes).expect("verify ET_EXEC");
+        assert_eq!(exec.direct_share_pct, 100, "{name} ET_EXEC must be 100% direct");
+        assert_eq!(exec.shim_glue_insns, 0, "{name} ET_EXEC must have 0 shim glue");
+        assert!(exec.zero_spills, "{name} ET_EXEC must have 0 spills");
+
+        let exec_path = dir.join(format!("{name}_exec"));
+        fs::write(&exec_path, &exec.elf_bytes).expect("write ET_EXEC");
+        set_exec_mode(&exec_path);
+        let want_syms = [exec.kernel_sym.as_str(), exec.batch_sym.as_str(), exec.entry_sym.as_str()];
+        let (exec_insns, sym_cnt, exec_ymm) = audit_objdump_x86(&exec_path, Some(&want_syms));
+        assert_eq!(sym_cnt, 3, "{name} ET_EXEC must expose exactly 3 direct symbols");
+        assert!(exec_ymm > 0, "{name} ET_EXEC must emit packed AVX2 ymm insns");
+
+        let expected_stdout = eval_expected_stdout(kernel, &exec_inputs, EXEC_BLOCKS);
+        let expected_exit = i32::from(expected_stdout.iter().fold(0u8, |a, &b| a.wrapping_add(b)) & 0x7F);
+        let run_out = Command::new(&exec_path).output().expect("execute standalone ET_EXEC");
+        assert_eq!(run_out.stdout, expected_stdout, "{name} ET_EXEC stdout mismatch");
+        assert_eq!(run_out.status.code(), Some(expected_exit), "{name} ET_EXEC exit mismatch");
+
+        // Standalone 0-import WASM32 + SIMD128 verification & live Node v22 parity
+        let cw = compile_kernel_wasm(kernel, budget).expect("compile WASM32");
+        let wsum = verify_wasm_module(&cw.wasm_bytes).expect("verify WASM32");
+        assert!(!wsum.imports_memory, "{name} WASM32 must have 0 imports");
+        assert_eq!(wsum.div_rem_insns, 0, "{name} WASM32 must have 0 div/rem opcodes");
+        assert!(wsum.simd_insns > 0, "{name} WASM32 must emit SIMD128 instructions");
+        let node_ns = run_node_wasm_socket_case(
+            &dir,
+            name,
+            &cw,
+            kernel,
+            &exec_inputs,
+            &[1, 3, 7, EXEC_BLOCKS],
+            EXEC_BLOCKS,
+        );
+
+        println!(
+            "SOCKET_KERNEL|{name}|ops={}->{}|divs={}->{}|rel_insns={rel_insns}|rel_ymm={rel_ymm}|exec_insns={exec_insns}|exec_ymm={exec_ymm}|rel_B={}|exec_B={}|entry=0x{:x}",
+            orig_cost.total_nodes,
+            opt_cost.total_nodes,
+            orig_cost.divs_rems,
+            opt_cost.divs_rems,
+            obj.elf_bytes.len(),
+            exec.elf_bytes.len(),
+            esum.entry_vaddr
+        );
+        println!(
+            "SOCKET_WASM|{name}|mode={:?}|wasm_B={}|insns={}|simd={}|wasm_divs={}|node_ns={node_ns:.3}",
+            cw.vector_mode,
+            cw.wasm_bytes.len(),
+            wsum.total_insns,
+            wsum.simd_insns,
+            wsum.div_rem_insns,
+        );
+    }
+
+    let harness_rs = dir.join("socket_bench_harness.rs");
+    let harness_bin = dir.join("socket_bench_harness");
+    fs::write(&harness_rs, generate_socket_bench_harness(&shims)).expect("write socket harness");
+
+    let mut cmd = Command::new("rustc");
+    cmd.env_remove("RUSTFLAGS")
+        .args(["-C", "opt-level=3", "--edition", "2021", "-o"])
+        .arg(&harness_bin)
+        .arg(&harness_rs);
+    for obj in &obj_paths {
+        cmd.arg("-C").arg(format!("link-arg={}", obj.display()));
+    }
+    let build = cmd.output().expect("invoke rustc");
+    assert!(
+        build.status.success(),
+        "rustc socket bench harness failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(&harness_bin).output().expect("run socket bench harness");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "socket bench harness failed:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    println!("{stdout}");
+    let bench_lines: Vec<&str> = stdout.lines().filter(|l| l.starts_with("SOCKET_BENCH|")).collect();
+    assert_eq!(bench_lines.len(), targets.len(), "expected 5 SOCKET_BENCH lines");
 
     let _ = fs::remove_dir_all(&dir);
 }

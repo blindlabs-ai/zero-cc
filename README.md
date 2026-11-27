@@ -1,6 +1,6 @@
 # zero-cc
 
-Zero-dependency, zero-spill Rust specialized kernel compiler & sovereign **100.0% Direct `ELF64`** (`ET_EXEC` + `ET_REL`, `x86_64` AVX2 + `AArch64`) and **Direct `WASM32` (+`SIMD128`)** machine-code backend in **4,979 LOC** across `11` files in `src/` (`0` external crates, `0` LLVM, `28` `zero-check`-proven functions, `25/25` release tests including `100,032+` adversarial UB/ABI/`PROT_NONE`/WASM32 fuzz vectors).
+Zero-dependency, zero-spill Rust specialized kernel compiler & sovereign **100.0% Direct `ELF64`** (`ET_EXEC` + `ET_REL`, `x86_64` AVX2 + `AArch64`) and **Direct `WASM32` (+`SIMD128`)** machine-code backend in **4,979 LOC** across `11` files in `src/` (`0` external crates, `0` LLVM, `28` `zero-check`-proven functions, `26/26` release tests including `100,032+` adversarial UB/ABI/`PROT_NONE`/WASM32 fuzz vectors).
 
 ![zero-cc vs rustc -O3 on zero-rans](assets/zero_rans_speedup.svg)
 
@@ -39,7 +39,7 @@ Measured live on **AMD Ryzen 9 3900X** (`rustc 1.91.0 -C opt-level=3`, `512` blo
 | `dct8_1d_even` | `77 -> 31` | `0` / `0` | `100.0%` (`427` insns, `102` `ymm`) | `5.35` | `3.54` | **`1.51x`** | Vertical 4-block `i64x4` AVX2; domain proves all clamps dead |
 | `rans_refill_branchless` | `185 -> 67` | `0` / `0` | `100.0%` (`124` insns, `74` `ymm`) | `3.45` | `2.76` | **`1.25x`** | Horizontal 8-lane `u32x8` AVX2 (`0x80000000`-biased `vpcmpgtd` + `vpblendvb`) |
 
-Full-crate scan (`./target/release/zero-cc ../zero-rans/src --domain "raw: -262144..=262144, x: -32768..=32767, even: -1000000000..=1000000000, odd: -1000000000..=1000000000, next: 0..=4294967295"`): `14` files, `400` functions, `59` kernels extracted, **`59/59` compiled to `100.0%` direct `ET_EXEC` + `ET_REL` with `0` spills and `0` skipped in `120.40 ms`**, and **`59/59` compiled to standalone `0`-import `WASM32` (+`SIMD128`) in `85.27 ms`**.
+Full-crate scan (`./target/release/zero-cc ../zero-rans/src --domain "raw: -262144..=262144, x: -32768..=32767, even: -1000000000..=1000000000, odd: -1000000000..=1000000000, next: 0..=4294967295"`): `18` files, `587` functions, `84` kernels extracted, **`84/84` compiled to `100.0%` direct `ET_EXEC` + `ET_REL` with `0` spills and `0` skipped in `174.47 ms`**, and **`84/84` compiled to standalone `0`-import `WASM32` (+`SIMD128`) in `128.39 ms`**.
 
 ## Live Benchmarks: Direct `WASM32` + `SIMD128` (`zero-rans` in Node v22)
 
@@ -54,6 +54,20 @@ Verified live in **Node v22.17.0** (`WebAssembly.validate` + `WebAssembly.instan
 | `dct8_1d_odd` | `VerticalI64x2` | `1,182 B` | `515` / `68` | `0` | `6.34` |
 | `idct8_1d_odd` | `VerticalI64x2` | `1,460 B` | `631` / `82` | `0` | `9.77` |
 
+### Live `zero-rans` `socket_kernels.rs` 8-Lane `ELF64` & `WASM32+SIMD128` Parity
+
+All `5` pure-integer 8-lane kernels extracted directly from unmodified `../zero-rans/src/socket_kernels.rs` (via built-in `/// @domain` bounds) compile with `0` `div`/`idiv`, `0` stack spills, `100.0%` direct `ET_EXEC` (`512` blocks bit-exact against `Kernel::eval`), `4,096`-block + `1`/`3`/`7`-tail `ET_REL` parity + perturbation knockout, and standalone `0`-import `WASM32+SIMD128` live Node v22 parity (`tests/zero_rans_bench.rs`):
+
+| Kernel (`socket_kernels.rs`) | IR Ops (`orig -> opt`) | `ET_EXEC` Direct (`insns` / `ymm`) | `rustc -O3` / `zero-cc` (`ns/call`) | Speedup | WASM32 Mode & Size (`SIMD128`) | Node v22 (`ns/call`) |
+| :--- | :---: | :---: | :---: | :---: | :--- | :---: |
+| `zcc_grad_socket8` | `657 -> 400` | `100.0%` (`281` / `214`) | `7.39` / `3.92` | **`1.89x`** | `HorizontalI32x4`, `2,238 B` (`214`) | `31.69` |
+| `zcc_sub_mod256_8` | `49 -> 34` | `100.0%` (`66` / `22`) | `0.89` / `0.75` | **`1.19x`** | `HorizontalI32x4`, `368 B` (`22`) | `3.99` |
+| `zcc_add_mod256_8` | `49 -> 34` | `100.0%` (`66` / `22`) | `0.89` / `0.75` | **`1.18x`** | `HorizontalI32x4`, `368 B` (`22`) | `4.36` |
+| `zcc_paeth_pred8` | `369 -> 251` | `100.0%` (`2,617` / `1,060`) | `7.97` / `16.70` | `0.48x` | `VerticalI64x2`, `4,706 B` (`290`) | `29.11` |
+| `zcc_zigzag_u8_8` | `81 -> 42` | `100.0%` (`582` / `195`) | `0.99` / `4.35` | `0.23x` | `VerticalI64x2`, `1,134 B` (`65`) | `8.82` |
+
+Horizontal `i32x8` kernels (`zcc_grad_socket8`, `zcc_sub_mod256_8`, `zcc_add_mod256_8`) run `1.18x-1.89x` faster than `rustc -O3`, whereas `zcc_paeth_pred8` and `zcc_zigzag_u8_8` currently lower via the 4-block `VerticalI64x2`/`i64x4` transpose planner (`0` spills, `0` divs, `100%` bit-exact).
+
 ## Live Benchmarks: `i64x8` AVX2 Kernels (32,768 lanes, AMD Ryzen 9 3900X)
 
 All `3` compiled `i64x8` kernels are verified bit-exact against naive slice Rust across all 32,768 lanes before timing and compile with `rustc -D warnings` (0 warnings).
@@ -66,10 +80,10 @@ All `3` compiled `i64x8` kernels are verified bit-exact against naive slice Rust
 
 ## Formal Verification & 3-Layer Adversarial UB Fuzz Gate
 
-Every commit is verified across **`25/25`** release tests in `7` integration suites (`bitops_mul32_parity`, `direct_elf64_backend`, `equiv_and_bench`, `fuzz_ub_and_generalize`, `vmm_pipeline`, `wasm32_backend`, `zero_rans_bench`) plus static formal verification:
+Every commit is verified across **`26/26`** release tests in `7` integration suites (`bitops_mul32_parity`, `direct_elf64_backend`, `equiv_and_bench`, `fuzz_ub_and_generalize`, `vmm_pipeline`, `wasm32_backend`, `zero_rans_bench`) plus static formal verification:
 
 - **Formal Proofs (`zero-check`):** `28` functions formally proven across `src/{ir,isa,codegen,elf64,rust_fe}.rs` with `0` errors, `0` warnings, `0` failed, and `gauntlet=11/11` in both `--audit-external --prove-fns` and `--kernel-strict --ntf1 specs/zero_cc.ntf1` modes.
-- **Layer A -- Hostile Parser Fuzz (`tests/fuzz_ub_and_generalize.rs`):** `10,007` hostile inputs (unterminated multi-byte UTF-8 comments, `200`-deep nesting, `160`-deep `if`/`else` chains, overflow literals, `10,000` token soups) -> `0` panics, clean `Err` bounds.
+- **Layer A -- Hostile Parser Fuzz (`tests/fuzz_ub_and_generalize.rs`):** `10,007` hostile inputs (unterminated multi-byte UTF-8 comments, `200`-deep nesting, `160`-deep `if`/`else` chains, overflow literals, `10,000` token streams) -> `0` panics, clean `Err` bounds.
 - **Layer B -- `100,032` Boundary Vectors, `PROT_NONE`, ABI Canary, ASan/UBSan & WASM32:** `100,032` adversarial vectors directly on `mmap` RW->RX machine code; every input/output buffer placed flush against an unmapped `PROT_NONE` guard page for tail lengths `n = 0..=33`; System V AMD64 inline-asm canary verifying `rbx`/`rbp`/`r12..r15` and `rsp % 16 == 0`; emitted `.o` objects linked into a C harness compiled with `clang -O2 -no-pie -fsanitize=undefined,address`; and live Node WASM32 SIMD128 parity.
 - **Layer C -- `2,000` Random DAGs & `10` Counterfactual Knockouts:** `2,000` randomized 32/64-bit DAGs (`Rust == IR == native x86_64`), explicit `assert_ne!` knockouts including AArch64 `CBNZ` trap-word decoding and live Node WASM32 trap execution on `i64::MIN % -1` and `LoadLut` bounds, plus `4` unmodified classical systems domains (`morton4d`, `static_arith`, `cidr_ring`, `hash_checksum`) compiling with `0` spills and `0` ELF64 relocations across IR, native x86_64, and WASM32.
 
@@ -93,7 +107,7 @@ env -u RUSTFLAGS cargo build --release --offline
   --domain "raw: -262144..=262144, x: -32768..=32767, even: -1000000000..=1000000000, odd: -1000000000..=1000000000, next: 0..=4294967295" \
   --emit-wasm /tmp/zero_rans_wasm
 
-# Full test suite (25/25: direct ELF64 + Batch8/bitops + VMM pipeline + 100k+ 3-layer UB fuzz + WASM32 in Node v22 + zero-rans bench)
+# Full test suite (26/26: direct ELF64 + Batch8/bitops + VMM pipeline + 100k+ 3-layer UB fuzz + WASM32 in Node v22 + zero-rans & socket_kernels bench)
 env -u RUSTFLAGS cargo test --release --offline -- --nocapture
 
 # Clippy, Ripwire clone/lint audit, and zero-check proof gauntlet (28 proven fns, gauntlet=11/11)
