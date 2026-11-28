@@ -23,7 +23,9 @@ Module breakdown (`4,979` total LOC across `11` files, compacted `-51.2%` from `
 - `src/egraph.rs` (306 LOC): Deterministic Union-Find + `BTreeMap` hash-consed E-Graph with domain intersection, upward domain refinement, `noalias` store-forwarding and load-hoisting, dead bounds-check and dead saturation-clamp elimination, domain-proven dead-branch `Select` and boolean identity folding, distributive/butterfly factoring, shift-add/sub strength reduction, modular congruence zeroing, domain-exact Barrett reduction, and cycle-free DAG-cost extraction.
 - `src/elf64.rs` (239 LOC): Standalone `ET_EXEC` (`emit_elf64_executable` + `verify_elf64_executable`) and relocatable `ET_REL` (`emit_elf64_object` + `verify_elf64_object`) ELF64 serializer with strict W^X airlock and zero relocations.
 - `src/bin/zero-cc.rs` (203 LOC): Sovereign CLI (`zero-cc <file_or_dir> [--kernel <name[,name...]>] [--domain <spec>] [--emit-elf <out.o>] [--emit-exec <out_bin>] [--emit-wasm <out.wasm|dir>] [--wasm-import-memory] [--target x86_64|aarch64|wasm32] [--bench]`).
-- `src/ntf1.rs` (135 LOC) & `specs/zero_cc.ntf1`: Zero-SVO `NTF1` (Native Token-Morphism Format v1) parser, canonical emitter, and airlock fixed-point verifier.
+- `src/avx512.rs`: Direct `x86_64` AVX-512 EVEX (`zmm0..zmm31`, opmask `k1`, `{1to16}` embedded broadcast, compressed `disp8*N`) machine-code backend for 8/16-lane `f32` DAG kernels and Zen 4 SGEMM (`8x48`/`8x32`/`8x16`/`k1`-masked/K-vectorized tails, MAB-aware streaming, BLIS-style 48 KiB stack-packed `B`, all 4 register-fused epilogues + stack-staged `C == B` aliasing safety, zero `malloc`, zero relocations, zero spills).
+- `src/tensor.rs`: Structured tensor contraction / GEMM IR (`TensorKernel`, `TilePlan`), Rust contraction parser (`parse_rust_tensor_kernel`), zero-spill Zen 4 tile planner (`peak_gprs <= 14`, `peak_vecs <= 32`, `spills == 0`), exact FP32 reference evaluator, and `NTF1` contract exporter.
+- `src/ntf1.rs` & `specs/zero_cc.ntf1`: Zero-SVO `NTF1` (Native Token-Morphism Format v1) parser, canonical emitter, and airlock fixed-point verifier.
 - `src/lib.rs` (60 LOC): `#![forbid(unsafe_code)]` compile-time declarative macros (`define_errors!`, `define_ops!`) and unified public pipeline re-exports.
 
 ## Live Benchmarks: Real `zero-rans` Kernels (`rustc -O3` vs `zero-cc` Direct `ELF64`)
@@ -77,6 +79,23 @@ All `3` compiled `i64x8` kernels are verified bit-exact against naive slice Rust
 | `modular_hash_lut` | `101,687 ns -> 41,915 ns` (**`2.43x`**) | `93,737 ns -> 23,984 ns` (**`3.91x`**) | `81` insns, `56` AVX2 vec, `0` spills, `0` `idiv`, `0` calls | `101` insns, `0` vec, `5` panic calls |
 | `butterfly_8lane` | `17,836 ns -> 18,412 ns` (`0.97x` scalar) | `17,269 ns -> 7,058 ns` (**`2.45x`**) | `34` insns, `11` AVX2 vec, `0` spills, `0` `idiv`, `0` calls | `145` insns, `0` vec, `12` panic calls |
 | `affine_filter_8lane` | `58,943 ns -> 32,936 ns` (**`1.79x`**) | `58,860 ns -> 18,050 ns` (**`3.26x`**) | `305` insns, `266` AVX2 vec, `0` spills, `0` `idiv`, `0` calls | `58` insns, `0` vec, `3` panic calls |
+
+## Live Benchmarks: Direct `ELF64` AVX-512 `f32` SGEMM (AMD Ryzen 7 PRO 8840U, Zen 4)
+
+Measured live on a pinned Zen 4 core (`OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 taskset -c 9`, round-robin interleaved medians of `11` rounds), compiling unmodified Rust SGEMM contraction source directly via `zero-cc --emit-elf` in **`0.56-0.75 ms`** (`0` LLVM, `0` GCC, `0` relocations, `0` stack spills, `100%` parity vs OpenBLAS `rel <= 1.5e-6`):
+
+| Shape (`MxKxN`) | OpenBLAS (`us`) | `rustc -O3` (`us`) | GCC AVX-512 C (`us`) | `zero-cc` `ELF64` (`us`) | vs OpenBLAS | vs GCC C | vs `rustc -O3` |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `6144x64x64` | `651.8` | `12939.9` | `482.0` | `498.6` | **`1.31x`** | `0.97x` | **`25.95x`** |
+| `6144x64x192` | `1633.7` | -- | `1449.6` | `1391.5` | **`1.17x`** | **`1.04x`** | -- |
+| `6144x64x256` | `2076.5` | -- | `1968.5` | `1924.5` | **`1.08x`** | **`1.02x`** | -- |
+| `6144x64x65` | `654.2` | `12112.4` | `514.1` | `502.2` | **`1.30x`** | **`1.02x`** | **`24.12x`** |
+| `65x6144x64` | `714.7` | `29923.6` | `575.8` | `516.5` | **`1.38x`** | **`1.11x`** | **`57.94x`** |
+| `64x6144x64` | `516.5` | `22239.7` | `374.0` | `368.0` | **`1.40x`** | **`1.02x`** | **`60.43x`** |
+| `256x32x256` | `47.9` | `675.2` | `36.4` | `35.6` | **`1.34x`** | **`1.02x`** | **`18.96x`** |
+| `512x512x512` | `2020.7` | -- | `2044.5` | `1974.4` | **`1.02x`** | **`1.04x`** | -- |
+| `1024x1024x1024` | `17227.1` | -- | `19652.7` | `16582.4` | **`1.04x`** | **`1.19x`** | -- |
+| **Geomean (15 shapes)** | -- | -- | -- | -- | **`1.14x`** | **`1.03x`** | **`32.68x`** |
 
 ## Formal Verification & 3-Layer Adversarial UB Fuzz Gate
 

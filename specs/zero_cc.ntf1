@@ -2,6 +2,8 @@ NTF1 zero_cc
 # zero-cc >< zero-check recursive compiler-verifier contract
 RustSrc.Parse |> Kernel.IR |> Domain.CRT_Quad |> EGraph.Rewrite |> Select.Cmov |> SethiUllman.Sched |> RegAlloc.LinearScan |> Isa.X86_64_Aarch64 |> Elf64.Emit |> Elf64.ParseHeader |> RustO3.Emit
 +t zero_cc -> RustSrc.Parse |> Kernel.IR |> EGraph.Rewrite |> Select.Cmov |> RegAlloc.LinearScan |> Elf64.Emit |> RustO3.Emit
++t zero_cc.F32 -> RustSrc.Parse |> Kernel.IR |> EGraph.FmaContract |> SethiUllman.Sched |> Isa.Avx512Evex |> Elf64.Emit
++t zero_cc.Tensor -> RustSrc.Parse |> Tensor.IR |> Tile.ZeroSpillPlan |> Isa.Avx512Evex |> Elf64.Emit |> Elf64.ParseHeader
 +t zero_check -> Elf64.ParseHeader |> RustO3.Emit |> Lint.ZeroDep |> Verify.Airlock
 +t Domain.Meet -> Domain.CRT_LCM |> Domain.Tighten
 +t Domain.Mul -> Domain.CongruenceLift |> Domain.QuadResidue
@@ -10,6 +12,9 @@ RustSrc.Parse |> Kernel.IR |> Domain.CRT_Quad |> EGraph.Rewrite |> Select.Cmov |
 -t Fault.Div0 <- Guard.Barrett_u128
 -t Fault.OOB <- Guard.BoundsCheckElim
 -t Fault.RegSpill <- Guard.RegBudget_14_16
+-t Fault.Avx512Spill <- Guard.RegBudget_14_32
+-t Fault.EvexDisp8 <- Guard.EvexCompressedDisp
+-t Fault.TailOOB <- Guard.Avx512OpmaskK1
 -t Fault.LlvmPoisonDrift <- Guard.DirectElf64Backend
 -t Fault.SvoTax <- Guard.Ntf1Lexer
 0t zero_cc >< zero_check
@@ -17,3 +22,4 @@ RustSrc.Parse |> Kernel.IR |> Domain.CRT_Quad |> EGraph.Rewrite |> Select.Cmov |
 0t Elf64.Emit >< Elf64.ParseHeader
 0t EGraph.Rewrite >< EGraph.Rewrite
 0t Ntf1.Emit >< Ntf1.Emit
+0t Tensor.IR >< Isa.Avx512Evex

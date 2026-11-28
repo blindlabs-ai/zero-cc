@@ -8,8 +8,9 @@ type CMap = BTreeMap<String, i64>;
 type DMap = BTreeMap<String, Domain>;
 type DOvr = BTreeMap<String, DMap>;
 type HMap = BTreeMap<String, HelperFn>;
-#[derive(Clone, Debug, PartialEq, Eq)] enum Tok { Id(String), Int(i64, Option<Vt>), Doc(String), Sy(String), Other }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)] enum Vt { Bool, I64, I32, I16, U64, U32, U16, U8, Usize }
+#[derive(Clone, Debug, PartialEq, Eq)] enum Tok {
+  Id(String), Int(i64, Option<Vt>), Float(u32), Doc(String), Sy(String), Other }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)] enum Vt { Bool, I64, I32, I16, U64, U32, U16, U8, Usize, F32 }
 #[derive(Clone, Copy, PartialEq, Eq)] enum Ev { N(Nid, Vt), Xor(Nid, Nid, Vt), Mxr(Nid, Nid, Nid, Vt) }
 #[derive(Clone)] struct HelperFn { params: Vec<(String, Et)>, body: Vec<Tok> }
 #[derive(Clone, Debug)] pub struct ExtractedKernel { pub file: String, pub name: String, pub kernel: Kernel }
@@ -22,7 +23,8 @@ const SCALARS: &[(&str, Et, Vt, u8, bool, Vt)] = &[("i64", Et::I64, Vt::I64, 64,
   ("u64", Et::U64, Vt::U64, 64, false, Vt::U64), ("i32", Et::I32, Vt::I32, 32, true, Vt::U32),
   ("u32", Et::U32, Vt::U32, 32, false, Vt::U32), ("i16", Et::I16, Vt::I16, 16, true, Vt::U16),
   ("u16", Et::U16, Vt::U16, 16, false, Vt::U16), ("u8", Et::U8, Vt::U8, 8, false, Vt::U8),
-  ("usize", Et::I64, Vt::Usize, 64, false, Vt::Usize), ("bool", Et::U8, Vt::Bool, 1, false, Vt::Bool)];
+  ("usize", Et::I64, Vt::Usize, 64, false, Vt::Usize), ("bool", Et::U8, Vt::Bool, 1, false, Vt::Bool),
+  ("f32", Et::F32, Vt::F32, 32, true, Vt::F32)];
 const BINOPS: &[(&str, u8)] = &[("||", 1), ("&&", 2), ("==", 3), ("!=", 3), ("<", 3), ("<=", 3), (">", 3), (">=", 3),
   ("|", 4), ("^", 5), ("&", 6), ("<<", 7), (">>", 7), ("+", 8), ("-", 8), ("*", 9), ("/", 9), ("%", 9)];
 const COMP: &[&str] = &["+=", "-=", "*=", "&=", "|=", "^=", "<<=", ">>="];
@@ -81,13 +83,31 @@ fn lex_rust(src: &str, strict: bool) -> Res<Vec<Tok>> {
         .find(|(_, k)| b.get(i + 1).is_some_and(|x| x.eq_ignore_ascii_case(k))).map_or(10, |(&r, _)| r) } else { 10 };
       let st = i + usize::from(r != 10) * 2;
       let end = skip_w(b, st, |c| c == b'_' || (c as char).is_digit(r));
-      let nx = skip_w(b, end, |c| c.is_ascii_alphanumeric() || c == b'_');
-      let suf = text[end..nx].trim_start_matches('_');
-      let sty = if suf.is_empty() { Some(None) }
-        else { SCALARS.iter().find(|s| s.0 == suf && s.2 != Vt::Bool).map(|s| Some(s.2)) };
-      let val = u64::from_str_radix(&text[st..end].replace('_', ""), r).ok().map(|v| v as i64);
-      (Some(if let (Some(st), Some(v)) = (sty, val) { Tok::Int(v, st) }
-        else if strict { return Err(perr("bad int")) } else { Tok::Other }), nx)
+      let is_dot_f = r == 10 && b.get(end) == Some(&b'.') && b.get(end + 1).is_some_and(|&c| c.is_ascii_digit());
+      let is_exp_f = r == 10 && b.get(end).is_some_and(|&c| c == b'e' || c == b'E');
+      let is_f32_suf = r == 10 && text.get(end..).is_some_and(|t| t.trim_start_matches('_').starts_with("f32"));
+      if is_dot_f || is_exp_f || is_f32_suf {
+        let mut fe = end;
+        if is_dot_f { fe = skip_w(b, end + 1, |c| c == b'_' || c.is_ascii_digit()); }
+        if b.get(fe).is_some_and(|&c| c == b'e' || c == b'E') {
+          fe += 1;
+          if b.get(fe).is_some_and(|&c| c == b'+' || c == b'-') { fe += 1; }
+          fe = skip_w(b, fe, |c| c == b'_' || c.is_ascii_digit());
+        }
+        let nx = skip_w(b, fe, |c| c.is_ascii_alphanumeric() || c == b'_');
+        let suf = text[fe..nx].trim_start_matches('_');
+        let val = (suf.is_empty() || suf == "f32").then(|| text[i..fe].replace('_', "").parse::<f32>().ok()).flatten();
+        (Some(if let Some(fv) = val { Tok::Float(fv.to_bits()) }
+          else if strict { return Err(perr("bad float")) } else { Tok::Other }), nx)
+      } else {
+        let nx = skip_w(b, end, |c| c.is_ascii_alphanumeric() || c == b'_');
+        let suf = text[end..nx].trim_start_matches('_');
+        let sty = if suf.is_empty() { Some(None) }
+          else { SCALARS.iter().find(|s| s.0 == suf && s.2 != Vt::Bool && s.2 != Vt::F32).map(|s| Some(s.2)) };
+        let val = u64::from_str_radix(&text[st..end].replace('_', ""), r).ok().map(|v| v as i64);
+        (Some(if let (Some(st), Some(v)) = (sty, val) { Tok::Int(v, st) }
+          else if strict { return Err(perr("bad int")) } else { Tok::Other }), nx)
+      }
     } else {
       let step = MULTI_SYMS.iter().find(|s| b[i..].starts_with(s.as_bytes())).map_or(1, |s| s.len());
       (Some(Tok::Sy(text[i..i + step].into())), i + step) };
@@ -179,6 +199,7 @@ impl Lowerer {
     self.mty(v, ty) }
   fn ushr(&self, v: Nid, s: u8) -> Op<Nid> { if !self.dom(v).is_nonneg() { Op::Ushr(v, s) } else { Op::Shr(v, s) } }
   fn mty(&mut self, n: Nid, ty: Vt) -> Nid {
+    if ty == Vt::F32 { return n }
     let (d, (b, sgn, _)) = (self.dom(n), ty.inf());
     if b == 64 { return n }
     if !sgn {
@@ -433,6 +454,17 @@ impl Lowerer {
           if mb == u64::MAX || [self.dom(a), self.dom(b)].iter()
             .all(|d| !d.is_empty() && d.is_nonneg() && (d.hi as u64) <= mb) { return Ok(Ev::Mxr(a, b, c, ty)) } } } }
     let ((ln, ty), (rn, rty)) = (self.real(lhs), self.real(rhs));
+    if ty == Vt::F32 || rty == Vt::F32 {
+      if let Some(k) = cmp_k(op, false) { return Ok(Ev::N(self.p(Op::FCmp(k, ln, rn)), Vt::Bool)) }
+      let id = match op {
+        "+" => self.p(Op::FAdd(ln, rn)),
+        "-" => self.p(Op::FSub(ln, rn)),
+        "*" => self.p(Op::FMul(ln, rn)),
+        "/" => self.p(Op::FDiv(ln, rn)),
+        _ => return Err(perr(format!("bad f32 binop '{op}'"))),
+      };
+      return Ok(Ev::N(id, Vt::F32));
+    }
     if let Some(k) = cmp_k(op, ty.u64_cmp() || rty.u64_cmp()) { return Ok(Ev::N(self.p(Op::Cmp(k, ln, rn)), Vt::Bool)) }
     if op == "||" || op == "&&" {
       let (ba, bb) = (self.as_b(ln), self.as_b(rn));
@@ -452,8 +484,21 @@ impl Lowerer {
   fn cast(&mut self) -> Res<Ev> {
     let mut expr = self.prim()?;
     while self.eat_s(".") {
-      let (((n, ty), m), arg) = ((self.real(expr), self.id()?),
-        self.delim("(", ")", |s| if s.is_s(0, ")") { Ok(None) } else { Ok(Some(s.node(1)?.0)) })?);
+      let ((n, ty), m) = (self.real(expr), self.id()?);
+      if ty == Vt::F32 {
+        let args = self.rs("(").and_then(|s| s.list(|s| s.node(1).map(|x| x.0)))?;
+        let res = match (m.as_str(), args.as_slice()) {
+          ("sqrt", []) => self.p(Op::FSqrt(n)),
+          ("abs", []) => self.p(Op::FAbs(n)),
+          ("max", &[a]) => self.p(Op::FMax(n, a)),
+          ("min", &[a]) => self.p(Op::FMin(n, a)),
+          ("mul_add", &[b, c]) => self.p(Op::FFma(n, b, c)),
+          _ => return Err(perr(format!("bad f32 method '.{m}'"))),
+        };
+        expr = Ev::N(res, Vt::F32);
+        continue;
+      }
+      let arg = self.delim("(", ")", |s| if s.is_s(0, ")") { Ok(None) } else { Ok(Some(s.node(1)?.0)) })?;
       let (b, sgn, uty) = ty.inf();
       let zv = if matches!(m.as_str(), "count_ones" | "leading_zeros" | "swap_bytes" | "rotate_left" | "rotate_right") {
         self.zext(n, ty) } else { n };
@@ -514,11 +559,15 @@ impl Lowerer {
     res.and_then(|v| if v.is_empty() { Err(perr("empty helper")) } else { Ok(v) }) }
   fn prim(&mut self) -> Res<Ev> { self.with_d(|s| {
     let neg = s.eat_s("-");
+    if let Some(&Tok::Float(bits)) = s.peek() {
+      let b = if neg { (-f32::from_bits(bits)).to_bits() } else { bits };
+      return Ok(Ev::N(s.skip(1).p(Op::FConst(b)), Vt::F32)); }
     if let Some(&Tok::Int(v, sty)) = s.peek() {
       let v = if neg { v.checked_neg().ok_or_else(|| perr("int ovf"))? } else { v };
       let (ty, n) = (sty.unwrap_or(Vt::I64), s.skip(1).c(v));
       return Ok(Ev::N(if sty.is_some() { s.mty(n, ty) } else { n }, ty)); }
-    if neg { return s.pnode().map(|(e, ty)| Ev::N(s.po(Op::Const(0), |z| Op::Sub(z, e), Some(ty)), ty)) }
+    if neg { return s.pnode().map(|(e, ty)| if ty == Vt::F32 { Ev::N(s.p(Op::FNeg(e)), Vt::F32) }
+      else { Ev::N(s.po(Op::Const(0), |z| Op::Sub(z, e), Some(ty)), ty) }) }
     if s.eat_s("!") {
       let (e, ty) = s.pnode()?;
       return Ok(Ev::N(if ty == Vt::Bool { s.pc(|z| Op::Cmp(Ck::Eq, e, z), 0) }
@@ -587,9 +636,10 @@ fn parse_kernel_internal(toks: Vec<Tok>, ov: &DMap, helpers: &HMap, consts: &CMa
         if !low.eat_s(";") { return Ok((tn, LANES, true)) }
         low.bound().and_then(|n| if n <= 0 { Err(perr("bad len")) } else { Ok((tn, n as usize, false)) }) })?;
       let et = Et::from_rust_name(&tn).ok_or_else(|| perr("bad elem"))?;
-      let (acc, lanes) = if is_mut && (1..=LANES).contains(&len) { (Ba::MutNoAlias, len as u8) }
-        else if is_mut { return Err(perr("&mut lanes 1..=8")) }
-        else if len <= LANES { (Ba::ReadOnly, len as u8) } else { (Ba::LookupTable(len), LANES as u8) };
+      let ml = et.max_lanes();
+      let (acc, lanes) = if is_mut && (1..=ml).contains(&len) { (Ba::MutNoAlias, len as u8) }
+        else if is_mut { return Err(perr("&mut lanes 1..=max")) }
+        else if len <= ml { (Ba::ReadOnly, len as u8) } else { (Ba::LookupTable(len), ml as u8) };
       let id = low.k.add_typed_buf(pn.clone(), acc, et, lanes, tight(&pn, et, et.natural_domain()));
       low.bufs.insert(pn, id);
       if is_sl { low.sbufs.insert(id, None); }
@@ -602,12 +652,15 @@ fn parse_kernel_internal(toks: Vec<Tok>, ov: &DMap, helpers: &HMap, consts: &CMa
     if !allow_sc || !(1..=4).contains(&sparams.len()) { return Err(perr("need 1..=4 scalar params")) }
     let rt = low.ret_tys()?;
     if !(1..=4).contains(&rt.len()) || sparams.len() + rt.len() > 5 { return Err(perr("bad scalar lift")) }
+    let lift_lanes = if sparams.iter().any(|(_, e, _, _)| e.is_float()) || rt.iter().any(|(e, _)| e.is_float()) {
+      crate::ir::AVX512_F32_LANES as u8
+    } else { LANES as u8 };
     let in_b: Vec<_> = sparams.into_iter()
-      .map(|(p, e, v, d)| (p.clone(), low.k.add_typed_buf(p, Ba::ReadOnly, e, LANES as u8, d), v)).collect();
+      .map(|(p, e, v, d)| (p.clone(), low.k.add_typed_buf(p, Ba::ReadOnly, e, lift_lanes, d), v)).collect();
     let out_b: Vec<_> = rt.iter().enumerate().map(|(i, &(e, d))| low.k.add_typed_buf(
-      if rt.len() == 1 { "out".into() } else { format!("out{i}") }, Ba::MutNoAlias, e, LANES as u8, d)).collect();
+      if rt.len() == 1 { "out".into() } else { format!("out{i}") }, Ba::MutNoAlias, e, lift_lanes, d)).collect();
     let bpos = low.pos;
-    for lane in 0..LANES as u8 {
+    for lane in 0..lift_lanes {
       (low.vars, low.pos) = (BTreeMap::new(), bpos);
       for (p, bid, vty) in &in_b {
         let ld = low.p(Op::Load { mem: 0, buf: *bid, lane });

@@ -298,6 +298,7 @@ fn wasm32_all_six_elem_ty_widths_node_v22_bit_exact() {
             ElemTy::U32 => vec![0, 1, 63, 64, 127, 128, 65_535, 0x7FFF_FFFF, 0x8000_0000, u32::MAX as i64],
             ElemTy::U16 => vec![0, 1, 63, 64, 127, 128, 32_767, 32_768, 65_535],
             ElemTy::U8 => vec![0, 1, 63, 64, 127, 128, 254, 255],
+            ElemTy::F32 => vec![0, 0x3f80_0000, 0x4000_0000, 0xbf80_0000],
         };
         let mut inputs = Vec::new();
         for (bidx, decl) in kernel.bufs.iter().enumerate() {

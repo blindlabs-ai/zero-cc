@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 pub const LANES: usize = 8;
+pub const AVX512_F32_LANES: usize = 16;
 pub type NodeId = usize;
 pub type IrOp = Op<NodeId>;
 define_errors! { CompileError,
@@ -39,18 +40,20 @@ impl CmpKind {
         if i < Self::SYMS.len() { Self::SYMS[i] } else { "==" }}
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ElemTy { #[default] I64, U64, I32, I16, U32, U16, U8 }
+pub enum ElemTy { #[default] I64, U64, I32, I16, U32, U16, U8, F32 }
 impl ElemTy {
-    const ALL: [(Self, &'static str, u8, i64, i64); 7] = [
+    const ALL: [(Self, &'static str, u8, i64, i64); 8] = [
         (Self::I64, "i64", 3, i64::MIN, i64::MAX), (Self::U64, "u64", 3, i64::MIN, i64::MAX),
         (Self::I32, "i32", 2, i32::MIN as _, i32::MAX as _), (Self::I16, "i16", 1, i16::MIN as _, i16::MAX as _),
         (Self::U32, "u32", 2, 0, u32::MAX as _), (Self::U16, "u16", 1, 0, u16::MAX as _),
-        (Self::U8, "u8", 0, 0, u8::MAX as _)];
+        (Self::U8, "u8", 0, 0, u8::MAX as _), (Self::F32, "f32", 2, 0, u32::MAX as _)];
     const fn meta(self) -> (Self, &'static str, u8, i64, i64) {
         let i = self as usize;
         if i < Self::ALL.len() { Self::ALL[i] } else { Self::ALL[0] }}
     pub const fn scale_shift(self) -> u8 { self.meta().2 }
     pub const fn bytes(self) -> u8 { 1u8 << self.scale_shift() }
+    pub const fn is_float(self) -> bool { matches!(self, Self::F32) }
+    pub const fn max_lanes(self) -> usize { if self.is_float() { AVX512_F32_LANES } else { LANES } }
     pub const fn rust_name(self) -> &'static str { self.meta().1 }
     pub fn from_rust_name(name: &str) -> Option<Self> { Self::ALL.iter().find(|t| t.1 == name).map(|t| t.0) }
     pub const fn natural_domain(self) -> Domain { Domain { lo: self.meta().3, hi: self.meta().4, modulus: 1, rem: 0 } }
@@ -58,7 +61,7 @@ impl ElemTy {
         Self::I64 | Self::U64 => v,
         Self::I32 => (v as i32) as i64,
         Self::I16 => (v as i16) as i64,
-        Self::U32 => (v as u32) as i64,
+        Self::U32 | Self::F32 => (v as u32) as i64,
         Self::U16 => (v as u16) as i64,
         Self::U8 => (v as u8) as i64,
     }}
@@ -295,8 +298,23 @@ define_ops! { f,
     Cmp(CmpKind, Id, Id) | Self::Cmp(k, a, b) => Op::Cmp(k, f(a), f(b));
     Select { cond: Id, t_val: Id, f_val: Id }
         | Self::Select { cond, t_val, f_val } => Op::Select { cond: f(cond), t_val: f(t_val), f_val: f(f_val) };
+    FConst(u32) | Self::FConst(bits) => Op::FConst(bits);
+    FAdd(Id, Id) | Self::FAdd(a, b) => Op::FAdd(f(a), f(b));
+    FSub(Id, Id) | Self::FSub(a, b) => Op::FSub(f(a), f(b));
+    FMul(Id, Id) | Self::FMul(a, b) => Op::FMul(f(a), f(b));
+    FDiv(Id, Id) | Self::FDiv(a, b) => Op::FDiv(f(a), f(b));
+    FFma(Id, Id, Id) | Self::FFma(a, b, c) => Op::FFma(f(a), f(b), f(c));
+    FMax(Id, Id) | Self::FMax(a, b) => Op::FMax(f(a), f(b));
+    FMin(Id, Id) | Self::FMin(a, b) => Op::FMin(f(a), f(b));
+    FSqrt(Id) | Self::FSqrt(a) => Op::FSqrt(f(a));
+    FNeg(Id) | Self::FNeg(a) => Op::FNeg(f(a));
+    FAbs(Id) | Self::FAbs(a) => Op::FAbs(f(a));
+    FCmp(CmpKind, Id, Id) | Self::FCmp(k, a, b) => Op::FCmp(k, f(a), f(b));
 }
 impl<Id: Copy> Op<Id> {
+    pub const fn is_f32_op(self) -> bool { matches!(self,
+        Self::FConst(_) | Self::FAdd(..) | Self::FSub(..) | Self::FMul(..) | Self::FDiv(..) | Self::FFma(..)
+        | Self::FMax(..) | Self::FMin(..) | Self::FSqrt(_) | Self::FNeg(_) | Self::FAbs(_) | Self::FCmp(..)) }
     pub fn eval_domain(self, dom: impl Fn(Id) -> Domain, buf_dom: impl Fn(u8) -> Domain,
         is_init: impl Fn(Id) -> bool) -> Domain where Id: PartialEq { match self {
         Self::MemInit | Self::Store { .. } => Domain::top(),
@@ -334,9 +352,12 @@ impl<Id: Copy> Op<Id> {
             cd if !cd.contains(0) => dom(t_val),
             _ => dom(t_val).join(dom(f_val)),
         },
+        Self::FCmp(..) => Domain::range(0, 1),
+        Self::FConst(_) | Self::FAdd(..) | Self::FSub(..) | Self::FMul(..) | Self::FDiv(..) | Self::FFma(..)
+            | Self::FMax(..) | Self::FMin(..) | Self::FSqrt(_) | Self::FNeg(_) | Self::FAbs(_) => Domain::top(),
     }}
     pub fn hw_cost(self, dom: impl Fn(Id) -> Domain, is_init: impl Fn(Id) -> bool) -> (u64, u64) { match self {
-        Self::MemInit | Self::Const(_) => (0, 0),
+        Self::MemInit | Self::Const(_) | Self::FConst(_) => (0, 0),
         Self::Load { mem, .. } => if is_init(mem) { (4, 1) } else { (12, 2) },
         Self::Store { .. } | Self::BoundsCheck { .. } => (10, 2),
         Self::LoadLut { .. } => (5, 1),
@@ -346,6 +367,10 @@ impl<Id: Copy> Op<Id> {
         Self::ShlVar(_, _) | Self::ShrVarU(_, _) | Self::Popcnt(_) | Self::Tzcnt(_) => (2, 1),
         Self::Mul(a, b) => if dom(a).fits_u32() && dom(b).fits_u32() { (4, 1) } else { (10, 2) },
         Self::Div(_, _) | Self::Rem(_, _) => (36, 3),
+        Self::FNeg(_) | Self::FAbs(_) => (1, 1),
+        Self::FAdd(..) | Self::FSub(..) | Self::FMul(..) | Self::FMax(..) | Self::FMin(..) | Self::FCmp(..) => (3, 1),
+        Self::FFma(..) => (4, 1),
+        Self::FDiv(..) | Self::FSqrt(_) => (12, 1),
     }}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub struct OutputWrite { pub buf: u8, pub lane: u8, pub val: NodeId }
@@ -374,16 +399,20 @@ impl Kernel {
         id
     }
     pub fn add_output(&mut self, buf: u8, lane: u8, val: NodeId) { self.outputs.push(OutputWrite { buf, lane, val }); }
+    pub fn has_f32(&self) -> bool {
+        self.bufs.iter().any(|b| b.elem_ty == ElemTy::F32) || self.nodes.iter().any(|op| op.is_f32_op()) }
     fn check_buf_lane(&self, buf: u8, lane: u8, req_mut: bool) -> Result<(), CompileError> {
         let b = self.bufs.get(buf as usize).ok_or(CompileError::InvalidBuffer(buf))?;
         if req_mut && b.access != BufAccess::MutNoAlias { return Err(CompileError::WriteToReadOnlyBuf(buf)); }
         if !req_mut && matches!(b.access, BufAccess::LookupTable(_)) { return Err(CompileError::InvalidBuffer(buf)); }
-        if lane >= b.lanes || usize::from(b.lanes) > LANES { return Err(CompileError::InvalidLane(lane)); }
+        if lane >= b.lanes || usize::from(b.lanes) > b.elem_ty.max_lanes() {
+            return Err(CompileError::InvalidLane(lane)); }
         Ok(())
     }
     pub fn validate(&self) -> Result<(), CompileError> {
         for b in &self.bufs {
-            if !matches!(b.access, BufAccess::LookupTable(_)) && (b.lanes == 0 || usize::from(b.lanes) > LANES) {
+            if !matches!(b.access, BufAccess::LookupTable(_))
+                && (b.lanes == 0 || usize::from(b.lanes) > b.elem_ty.max_lanes()) {
                 return Err(CompileError::InvalidLane(b.lanes)); }}
         for (id, &op) in self.nodes.iter().enumerate() {
             let (kids, cnt) = op.children();
@@ -484,6 +513,29 @@ impl Kernel {
                 Op::Tzcnt(a) => i64::from((v(a) as u64).trailing_zeros()),
                 Op::Cmp(k, a, b) => i64::from(k.eval(v(a), v(b))),
                 Op::Select { cond, t_val, f_val } => if v(cond) != 0 { v(t_val) } else { v(f_val) },
+                Op::FConst(bits) => i64::from(bits),
+                Op::FAdd(a, b) => i64::from((f32::from_bits(v(a) as u32) + f32::from_bits(v(b) as u32)).to_bits()),
+                Op::FSub(a, b) => i64::from((f32::from_bits(v(a) as u32) - f32::from_bits(v(b) as u32)).to_bits()),
+                Op::FMul(a, b) => i64::from((f32::from_bits(v(a) as u32) * f32::from_bits(v(b) as u32)).to_bits()),
+                Op::FDiv(a, b) => i64::from((f32::from_bits(v(a) as u32) / f32::from_bits(v(b) as u32)).to_bits()),
+                Op::FFma(a, b, c) => i64::from(f32::from_bits(v(a) as u32)
+                    .mul_add(f32::from_bits(v(b) as u32), f32::from_bits(v(c) as u32)).to_bits()),
+                Op::FMax(a, b) => {
+                    let (fa, fb) = (f32::from_bits(v(a) as u32), f32::from_bits(v(b) as u32));
+                    i64::from((if fa > fb { fa } else { fb }).to_bits()) }
+                Op::FMin(a, b) => {
+                    let (fa, fb) = (f32::from_bits(v(a) as u32), f32::from_bits(v(b) as u32));
+                    i64::from((if fa < fb { fa } else { fb }).to_bits()) }
+                Op::FSqrt(a) => i64::from(f32::from_bits(v(a) as u32).sqrt().to_bits()),
+                Op::FNeg(a) => i64::from((-f32::from_bits(v(a) as u32)).to_bits()),
+                Op::FAbs(a) => i64::from(f32::from_bits(v(a) as u32).abs().to_bits()),
+                Op::FCmp(k, a, b) => {
+                    let (fa, fb) = (f32::from_bits(v(a) as u32), f32::from_bits(v(b) as u32));
+                    i64::from(match k {
+                        CmpKind::Eq => fa == fb, CmpKind::Ne => fa != fb,
+                        CmpKind::Lt | CmpKind::Ult => fa < fb, CmpKind::Le | CmpKind::Ule => fa <= fb,
+                        CmpKind::Gt | CmpKind::Ugt => fa > fb, CmpKind::Ge | CmpKind::Uge => fa >= fb,
+                    }) }
             });
             if matches!(op, Op::MemInit | Op::Store { .. }) { slot = mems.len() - 1; }
             vals.push(val);
@@ -496,9 +548,64 @@ impl Kernel {
                 *s = et.cast_i64(vals.get(o.val).copied().unwrap_or(0)); }}
         Ok(out)
     }
+    pub fn eval_f32(&self, inputs: &[&[f32]]) -> Result<Vec<Vec<f32>>, CompileError> {
+        self.validate()?;
+        if inputs.len() != self.bufs.len() { return Err(CompileError::InvalidBuffer(inputs.len() as u8)); }
+        let mut init_mem: Vec<Vec<u32>> = Vec::with_capacity(self.bufs.len());
+        for (decl, &inp) in self.bufs.iter().zip(inputs.iter()) {
+            let need = if let BufAccess::LookupTable(n) = decl.access { n } else { usize::from(decl.lanes) };
+            if inp.len() < need { return Err(CompileError::OutOfBounds { idx: inp.len() as i64, limit: need as i64 }); }
+            init_mem.push(inp[..need].iter().map(|&x| x.to_bits()).collect());
+        }
+        let (mut vals, mut mems, mut mslot) = (Vec::<u32>::new(), Vec::new(), Vec::new());
+        for &op in &self.nodes {
+            let (v, ms) = (|i| vals.get(i).copied().unwrap_or(0), |i| mslot.get(i).copied().unwrap_or(0));
+            let (mut slot, val) = (0usize, match op {
+                Op::MemInit => { mems.push(init_mem.clone());
+                    0 }
+                Op::Const(c) => c as u32,
+                Op::FConst(bits) => bits,
+                Op::Load { mem, buf, lane } => mems.get(ms(mem))
+                    .and_then(|m| m.get(buf as usize)).and_then(|a| a.get(lane as usize)).copied().unwrap_or(0),
+                Op::Store { mem, buf, lane, val } => {
+                    let mut n = mems.get(ms(mem)).cloned().unwrap_or_default();
+                    if let Some(s) = n.get_mut(buf as usize).and_then(|a| a.get_mut(lane as usize)) { *s = v(val); }
+                    mems.push(n);
+                    0 }
+                Op::FAdd(a, b) => (f32::from_bits(v(a)) + f32::from_bits(v(b))).to_bits(),
+                Op::FSub(a, b) => (f32::from_bits(v(a)) - f32::from_bits(v(b))).to_bits(),
+                Op::FMul(a, b) => (f32::from_bits(v(a)) * f32::from_bits(v(b))).to_bits(),
+                Op::FDiv(a, b) => (f32::from_bits(v(a)) / f32::from_bits(v(b))).to_bits(),
+                Op::FFma(a, b, c) => f32::from_bits(v(a)).mul_add(f32::from_bits(v(b)), f32::from_bits(v(c))).to_bits(),
+                Op::FMax(a, b) => { let (fa, fb) = (f32::from_bits(v(a)), f32::from_bits(v(b)));
+                    (if fa > fb { fa } else { fb }).to_bits() }
+                Op::FMin(a, b) => { let (fa, fb) = (f32::from_bits(v(a)), f32::from_bits(v(b)));
+                    (if fa < fb { fa } else { fb }).to_bits() }
+                Op::FSqrt(a) => f32::from_bits(v(a)).sqrt().to_bits(),
+                Op::FNeg(a) => (-f32::from_bits(v(a))).to_bits(),
+                Op::FAbs(a) => f32::from_bits(v(a)).abs().to_bits(),
+                Op::FCmp(k, a, b) => { let (fa, fb) = (f32::from_bits(v(a)), f32::from_bits(v(b)));
+                    u32::from(match k {
+                        CmpKind::Eq => fa == fb, CmpKind::Ne => fa != fb,
+                        CmpKind::Lt | CmpKind::Ult => fa < fb, CmpKind::Le | CmpKind::Ule => fa <= fb,
+                        CmpKind::Gt | CmpKind::Ugt => fa > fb, CmpKind::Ge | CmpKind::Uge => fa >= fb,
+                    }) }
+                Op::Select { cond, t_val, f_val } => if v(cond) != 0 { v(t_val) } else { v(f_val) },
+                _ => return Err(CompileError::BackendError("non-f32 op in eval_f32".into())),
+            });
+            if matches!(op, Op::MemInit | Op::Store { .. }) { slot = mems.len() - 1; }
+            vals.push(val);
+            mslot.push(slot);
+        }
+        let mut out = init_mem;
+        for o in &self.outputs {
+            if let Some(s) = out.get_mut(o.buf as usize).and_then(|a| a.get_mut(o.lane as usize)) {
+                *s = vals.get(o.val).copied().unwrap_or(0); }}
+        Ok(out.into_iter().map(|v| v.into_iter().map(f32::from_bits).collect()).collect())
+    }
 }
 fn narrow_channel_val(f: &mut Kernel, et: ElemTy, val: NodeId) -> NodeId { match et {
-    ElemTy::I64 | ElemTy::U64 => val,
+    ElemTy::I64 | ElemTy::U64 | ElemTy::F32 => val,
     ElemTy::U32 | ElemTy::U16 | ElemTy::U8 => { let m = f.push(Op::Const((1i64 << (et.bytes() * 8)) - 1));
         f.push(Op::BitAnd(val, m)) }
     ElemTy::I32 | ElemTy::I16 => { let (sh, s) = (64 - et.bytes() * 8, f.push(Op::Shl(val, 64 - et.bytes() * 8)));

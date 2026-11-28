@@ -1247,6 +1247,7 @@ fn narrow_elem_ty_all_six_widths_variable_lanes_and_u8_rex_pressure() {
             ElemTy::U32 => (0xB940_0000u32, 0xB900_0000u32, 0xB860_7800u32),
             ElemTy::U16 => (0x7940_0000u32, 0x7900_0000u32, 0x7860_7800u32),
             ElemTy::U8 => (0x3940_0000u32, 0x3900_0000u32, 0x3860_6800u32),
+            ElemTy::F32 => (0xB940_0000u32, 0xB900_0000u32, 0xB860_7800u32),
         };
 
         for lanes in [4u8, 8u8] {

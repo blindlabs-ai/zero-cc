@@ -4,8 +4,9 @@ use std::{process::{Command, ExitCode}, time::Instant};
 use zero_cc::rust_fe::{extract_and_compile_crate, extract_crate_kernels, kernel_reg_budget, parse_domain_spec,
     parse_rust_kernel_with_domains, ExtractedKernel};
 use zero_cc::{compile_kernel_direct, compile_kernel_wasm, compile_kernels_wasm_with_memory,
-    compile_standalone_elf_exec, verify_elf64_executable, verify_elf64_object, verify_wasm_module,
-    Domain, Kernel, KernelCost, RegBudget, TargetArch, TargetIsa, WasmSummary};
+    compile_standalone_elf_exec, compile_tensor_to_elf, parse_rust_tensor_kernel, verify_elf64_executable,
+    verify_elf64_object, verify_wasm_module, Domain, Kernel, KernelCost, RegBudget, TargetArch, TargetIsa,
+    WasmSummary};
 struct CliArgs {
     input: PathBuf, emit_elf: Option<PathBuf>, emit_exec: Option<PathBuf>, emit_wasm: Option<PathBuf>,
     wasm_import_memory: bool, target: TargetArch, kernel_filter: Option<String>,
@@ -153,6 +154,20 @@ fn run() -> Result<(), String> {
     }
     let isa = if cfg.target == TargetArch::Aarch64 { TargetIsa::Aarch64 } else { TargetIsa::X86_64 };
     if cfg.emit_elf.is_some() || cfg.emit_exec.is_some() || cfg.kernel_filter.is_some() {
+        if cfg.input.is_file() && cfg.emit_exec.is_none() && isa == TargetIsa::X86_64 {
+            if let Ok(src) = fs::read_to_string(&cfg.input) {
+                if let Ok(tk) = parse_rust_tensor_kernel(&src, budget) {
+                    let obj = to_err(compile_tensor_to_elf(&tk))?;
+                    to_err(verify_elf64_object(&obj.elf_bytes))?;
+                    if let Some(p) = &cfg.emit_elf { write_out(p, &obj.elf_bytes)?; }
+                    println!("zero-cc tensor={} file={} isa=X86_64_AVX512 tile={}x{} insns={} zero_spills={} \
+                        rel_bytes={} syms={} compile_us={}", tk.name, cfg.input.display(), tk.tile.mr,
+                        tk.tile.nr_wide, obj.direct_insns, obj.zero_spills, obj.elf_bytes.len(),
+                        obj.symbols.join(","), t0.elapsed().as_micros());
+                    return Ok(());
+                }
+            }
+        }
         let (ek, o, opt) = load_selected(&cfg)?;
         let kb = kernel_reg_budget(&ek.kernel, budget);
         let obj = to_err(compile_kernel_direct(&ek.kernel, kb, isa))?;

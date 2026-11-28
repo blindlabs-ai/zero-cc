@@ -12,7 +12,7 @@ fn sl<T>(v: &[Vec<T>], i: usize) -> &[T] { v.get(i).map_or(&[], Vec::as_slice) }
 fn set<T>(s: &mut [T], i: usize, v: T) { if let Some(x) = s.get_mut(i) { *x = v; }}
 fn inc(s: &mut [usize], i: usize) { if let Some(x) = s.get_mut(i) { *x = x.saturating_add(1); }}
 fn push_uniq(v: &mut Vec<usize>, x: usize) { if !v.contains(&x) { v.push(x); }}
-fn is_inline(op: Op<NodeId>) -> bool { matches!(op, Op::MemInit | Op::Const(_)) }
+fn is_inline(op: Op<NodeId>) -> bool { matches!(op, Op::MemInit | Op::Const(_) | Op::FConst(_)) }
 fn live_op(k: &Kernel, r: &[bool], i: usize) -> bool { at(r, i, false) && !is_inline(at(&k.nodes, i, Op::MemInit)) }
 fn calc_su(uniq: &[usize], su: &[usize]) -> usize {
     let mut w: Vec<usize> = uniq.iter().map(|&k| at(su, k, 0)).collect();
@@ -254,8 +254,13 @@ pub fn remat_readonly_loads(kernel: &Kernel, max_nodes: u8) -> Kernel {
 }
 fn ref_expr(kernel: &Kernel, id: NodeId) -> String { match at(&kernel.nodes, id, Op::MemInit) {
     Op::Const(c) => format!("{c}_i64"),
+    Op::FConst(b) => format!("{b}_u32 as i64"),
     Op::MemInit => "0_i64".into(),
     _ => format!("v{id}"),
+}}
+fn fref(kernel: &Kernel, id: NodeId) -> String { match at(&kernel.nodes, id, Op::MemInit) {
+    Op::FConst(b) => format!("f32::from_bits({b}_u32)"),
+    _ => format!("f32::from_bits({} as u32)", ref_expr(kernel, id)),
 }}
 fn emit_op_rhs(kernel: &Kernel, doms: &[Domain], id: NodeId) -> String {
     let r = |x: NodeId| ref_expr(kernel, x);
@@ -293,7 +298,23 @@ fn emit_op_rhs(kernel: &Kernel, doms: &[Domain], id: NodeId) -> String {
         Op::Tzcnt(a) => format!("(({} as u64).trailing_zeros()) as i64", r(a)),
         Op::Cmp(k, a, b) => if k.is_unsigned() { format!("(({} as u64) {} ({} as u64)) as i64", r(a), k.sym(), r(b)) }
             else { format!("({} {} {}) as i64", r(a), k.sym(), r(b)) },
-        Op::Select { cond: c, t_val: t, f_val: f } => format!("if {} != 0_i64 {{ {} }} else {{ {} }}", r(c), r(t), r(f))
+        Op::Select { cond: c, t_val: t, f_val: f } => format!("if {} != 0_i64 {{ {} }} else {{ {} }}",
+            r(c), r(t), r(f)),
+        Op::FConst(b) => format!("{b}_u32 as i64"),
+        Op::FAdd(a, b) => format!("({} + {}).to_bits() as i64", fref(kernel, a), fref(kernel, b)),
+        Op::FSub(a, b) => format!("({} - {}).to_bits() as i64", fref(kernel, a), fref(kernel, b)),
+        Op::FMul(a, b) => format!("({} * {}).to_bits() as i64", fref(kernel, a), fref(kernel, b)),
+        Op::FDiv(a, b) => format!("({} / {}).to_bits() as i64", fref(kernel, a), fref(kernel, b)),
+        Op::FFma(a, b, c) => format!("{}.mul_add({}, {}).to_bits() as i64",
+            fref(kernel, a), fref(kernel, b), fref(kernel, c)),
+        Op::FMax(a, b) => format!("{{ let (a, b) = ({}, {}); (if a > b {{ a }} else {{ b }}).to_bits() as i64 }}",
+            fref(kernel, a), fref(kernel, b)),
+        Op::FMin(a, b) => format!("{{ let (a, b) = ({}, {}); (if a < b {{ a }} else {{ b }}).to_bits() as i64 }}",
+            fref(kernel, a), fref(kernel, b)),
+        Op::FSqrt(a) => format!("{}.sqrt().to_bits() as i64", fref(kernel, a)),
+        Op::FNeg(a) => format!("(-{}).to_bits() as i64", fref(kernel, a)),
+        Op::FAbs(a) => format!("{}.abs().to_bits() as i64", fref(kernel, a)),
+        Op::FCmp(k, a, b) => format!("({} {} {}) as i64", fref(kernel, a), k.sym(), fref(kernel, b)),
     }
 }
 fn drain_outputs(s: &mut String, kernel: &Kernel, sched: &ScheduleReport, oc: &mut usize, step: Option<usize>) {

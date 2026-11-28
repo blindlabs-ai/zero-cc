@@ -22,7 +22,7 @@ type Res<T> = Result<T, CompileError>;
 type ModuleCode = (Vec<u8>, Vec<ElfSymbol>, Vec<ElfReloc>, usize);
 type Lanes<const N: usize> = [NodeId; N];
 fn berr(m: &str) -> CompileError { CompileError::BackendError(m.into()) }
-fn is_inl(op: Op<NodeId>) -> bool { matches!(op, Op::MemInit | Op::Const(_) | Op::Store { .. }) }
+fn is_inl(op: Op<NodeId>) -> bool { matches!(op, Op::MemInit | Op::Const(_) | Op::FConst(_) | Op::Store { .. }) }
 fn is_64(t: ElemTy) -> bool { matches!(t, ElemTy::I64 | ElemTy::U64) }
 fn breg(ra: &RegAlloc, b: u8) -> Res<u8> { ra.buf_reg.get(b as usize).copied().ok_or(CompileError::InvalidBuffer(b)) }
 fn bdecl(k: &Kernel, b: u8) -> Res<&BufDecl> { k.bufs.get(b as usize).ok_or(CompileError::InvalidBuffer(b)) }
@@ -625,7 +625,10 @@ fn emit_x86_body(e: &mut X86Emit, k: &Kernel, s: &ScheduleReport, ra: &RegAlloc,
         if cl { em.mr(11, th); }
         let (vf, sr) = (if f_val == cond { 0 } else { xv(em, k, ra, f_val, d)? }, if cl { 11 } else { th });
         em.mr(d, vf).seq(&[&[0x48, 0x85, 0xC0], &[x86_rex_w(d, sr), 0x0F, 0x45, x86_modrm(3, d, sr)]]); }
-      Op::MemInit | Op::Const(_) | Op::Store { .. } => {} }
+      Op::MemInit | Op::Const(_) | Op::FConst(_) | Op::Store { .. } => {}
+      Op::FAdd(..) | Op::FSub(..) | Op::FMul(..) | Op::FDiv(..) | Op::FFma(..) | Op::FMax(..) | Op::FMin(..)
+      | Op::FSqrt(_) | Op::FNeg(_) | Op::FAbs(_) | Op::FCmp(..) => {
+        return Err(berr("f32 op requires AVX-512 backend")) } }
     Ok(()) }) }
 fn bump_x86<'a>(e: &'a mut X86Emit, k: &Kernel, rs: &[u8], m: i32) -> &'a mut X86Emit {
   rs.iter().zip(&k.bufs).filter(|(_, b)| !matches!(b.access, BufAccess::LookupTable(_)) && b.block_bytes() != 0)
@@ -788,7 +791,10 @@ fn emit_arm_body(e: &mut ArmEmit, k: &Kernel, s: &ScheduleReport, ra: &RegAlloc,
       Op::Select { cond, t_val, f_val } => {
         av(em, k, ra, cond, 16).map(|c| em.put(arm64_rrr(0xEB00_0000, 31, 0, c, 31)).end())?;
         ap(em, t_val, f_val).map(|(t, f)| em.put(arm64_rrr(0x9A80_0000, f, 0x1000, t, d)).end())?; }
-      Op::MemInit | Op::Const(_) | Op::Store { .. } => {} }
+      Op::MemInit | Op::Const(_) | Op::FConst(_) | Op::Store { .. } => {}
+      Op::FAdd(..) | Op::FSub(..) | Op::FMul(..) | Op::FDiv(..) | Op::FFma(..) | Op::FMax(..) | Op::FMin(..)
+      | Op::FSqrt(_) | Op::FNeg(_) | Op::FAbs(_) | Op::FCmp(..) => {
+        return Err(berr("f32 op requires AVX-512 backend")) } }
     Ok(()) }) }
 fn arm_frame<'a>(e: &'a mut ArmEmit, sv: &[u8], epi: bool) -> &'a mut ArmEmit {
   if !sv.is_empty() {
@@ -907,6 +913,12 @@ fn emit_arm_start(so: usize, bo: u64, dv: u64, bs: &[u64], bl: usize, po: Option
 fn lower_kernel_code(k: &Kernel, b: RegBudget, isa: TargetIsa, opt: bool, cb: bool) -> LowerOut {
   k.validate()?;
   let base = if opt { optimize_kernel(k)? } else { k.clone() };
+  if base.has_f32() && isa == TargetIsa::X86_64 {
+    let fb = RegBudget { max_gprs: b.max_gprs, max_vecs: b.max_vecs.max(32) };
+    let sched = schedule_and_verify(&base, fb)?;
+    let (ra, m) = crate::avx512::emit_x86_avx512_f32_module(&base, &sched, fb)?;
+    return Ok((base, ra, m));
+  }
   let ts = |kn: &Kernel| schedule_and_verify(kn, b).and_then(|s| allocate_registers(kn, &s, isa, b).map(|r| (s, r)));
   let (low, (sched, ra)) = match ts(&base) {
     Ok(p) => (base.clone(), p),

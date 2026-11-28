@@ -166,8 +166,45 @@ impl EGraph {
             _ if self.is_bool(cond) && self.const_of(t_val) == Some(1) && self.const_of(f_val) == Some(0) => Some(cond),
             _ => None,
         } { out.push(Act::Alias(cid, dst)); },
-        Op::MemInit | Op::Const(_) | Op::Store { .. } | Op::LoadLut { .. } => {}
+        Op::FAdd(a, b) => {
+            for (m, c) in [(a, b), (b, a)] {
+                for &mn in self.nodes(m) {
+                    if let Op::FMul(x, y) = mn { out.push(Act::Node(cid, Op::FFma(x, y, c))); }
+                }
+            }
+            if let (Some(fa), Some(fb)) = (self.fconst_of(a), self.fconst_of(b)) {
+                out.push(Act::Node(cid, Op::FConst((fa + fb).to_bits()))); }
+        }
+        Op::FSub(a, b) => if let (Some(fa), Some(fb)) = (self.fconst_of(a), self.fconst_of(b)) {
+            out.push(Act::Node(cid, Op::FConst((fa - fb).to_bits()))); }
+        Op::FMul(a, b) => {
+            if let (Some(fa), Some(fb)) = (self.fconst_of(a), self.fconst_of(b)) {
+                out.push(Act::Node(cid, Op::FConst((fa * fb).to_bits())));
+            } else if self.fconst_of(b) == Some(1.0) { out.push(Act::Alias(cid, a)); }
+            else if self.fconst_of(a) == Some(1.0) { out.push(Act::Alias(cid, b)); }
+        }
+        Op::FDiv(a, b) => if let (Some(fa), Some(fb)) = (self.fconst_of(a), self.fconst_of(b)) {
+            out.push(Act::Node(cid, Op::FConst((fa / fb).to_bits())));
+        } else if self.fconst_of(b) == Some(1.0) { out.push(Act::Alias(cid, a)); }
+        Op::FFma(a, b, c) => if let (Some(fa), Some(fb), Some(fc)) =
+            (self.fconst_of(a), self.fconst_of(b), self.fconst_of(c)) {
+            out.push(Act::Node(cid, Op::FConst(fa.mul_add(fb, fc).to_bits()))); }
+        Op::FNeg(a) => {
+            if let Some(fa) = self.fconst_of(a) { out.push(Act::Node(cid, Op::FConst((-fa).to_bits()))); }
+            for &an in self.nodes(a) { if let Op::FNeg(x) = an { out.push(Act::Alias(cid, x)); } }
+        }
+        Op::FAbs(a) => if let Some(fa) = self.fconst_of(a) {
+            out.push(Act::Node(cid, Op::FConst(fa.abs().to_bits()))); }
+        Op::FSqrt(a) => if let Some(fa) = self.fconst_of(a) {
+            out.push(Act::Node(cid, Op::FConst(fa.sqrt().to_bits()))); }
+        Op::FMax(a, b) => if let (Some(fa), Some(fb)) = (self.fconst_of(a), self.fconst_of(b)) {
+            out.push(Act::Node(cid, Op::FConst((if fa > fb { fa } else { fb }).to_bits()))); }
+        Op::FMin(a, b) => if let (Some(fa), Some(fb)) = (self.fconst_of(a), self.fconst_of(b)) {
+            out.push(Act::Node(cid, Op::FConst((if fa < fb { fa } else { fb }).to_bits()))); }
+        Op::MemInit | Op::Const(_) | Op::FConst(_) | Op::FCmp(..) | Op::Store { .. } | Op::LoadLut { .. } => {}
     }}
+    fn fconst_of(&self, id: EClassId) -> Option<f32> {
+        self.nodes(id).iter().find_map(|&n| if let Op::FConst(b) = n { Some(f32::from_bits(b)) } else { None }) }
     fn match_div_rem(&self, cid: EClassId, x: EClassId, d_id: EClassId, is_rem: bool, out: &mut Vec<Act>) {
         let Some(d) = self.const_of(d_id) else { return };
         let dx = self.domain(x);
