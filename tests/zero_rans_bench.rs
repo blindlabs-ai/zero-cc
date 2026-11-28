@@ -1192,9 +1192,13 @@ fn zero_rans_socket_five_kernels_elf64_wasm32_parity_and_bench() {
     let mut shims: BTreeMap<String, String> = BTreeMap::new();
 
     for (idx, &name) in targets.iter().enumerate() {
-        let kernel = extracted
+        let mut owned = extracted
             .get(name)
+            .or_else(|| name.strip_prefix("zcc_").and_then(|s| extracted.get(s)))
+            .cloned()
             .unwrap_or_else(|| panic!("missing socket kernel '{name}'"));
+        owned.name = name.to_string();
+        let kernel = &owned;
         let orig_cost = kernel.cost();
         let opt = optimize_kernel(kernel).expect("optimize_kernel");
         let opt_cost = opt.cost();

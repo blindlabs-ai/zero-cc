@@ -1,7 +1,7 @@
 use std::{collections::{BTreeMap, BTreeSet}, fs, mem::{replace, take}, path::{Path, PathBuf}};
 use crate::ir::{barrett_params, BufAccess as Ba, CmpKind as Ck, CompileError, Domain, ElemTy as Et, Kernel, KernelCost};
 use crate::{codegen::RegBudget, compile_kernel, ir::{NodeId as Nid, Op, LANES}, isa::{compile_kernel_direct,
-  compile_standalone_elf_exec}, elf64::{verify_elf64_executable, verify_elf64_object, TargetIsa}, CompiledKernel};
+  compile_standalone_elf_exec, X86VectorMode}, elf64::{verify_elf64_executable, verify_elf64_object, TargetIsa}, CompiledKernel};
 type Res<T> = Result<T, CompileError>;
 type Vals = Vec<(Nid, Vt)>;
 type CMap = BTreeMap<String, i64>;
@@ -15,8 +15,9 @@ type HMap = BTreeMap<String, HelperFn>;
 #[derive(Clone)] struct HelperFn { params: Vec<(String, Et)>, body: Vec<Tok> }
 #[derive(Clone, Debug)] pub struct ExtractedKernel { pub file: String, pub name: String, pub kernel: Kernel }
 #[derive(Clone, Debug)] pub struct CompiledCrateKernel { pub file: String, pub name: String,
-  pub original_cost: KernelCost, pub optimized_cost: KernelCost, pub direct_insns: usize, pub direct_share_pct: u8,
-  pub exec_share_pct: u8, pub zero_spills: bool, pub obj_bytes: usize, pub exec_bytes: usize }
+  pub original_cost: KernelCost, pub optimized_cost: KernelCost, pub vector_mode: X86VectorMode, pub max_lanes: u8,
+  pub direct_insns: usize, pub direct_share_pct: u8, pub exec_share_pct: u8, pub zero_spills: bool,
+  pub obj_bytes: usize, pub exec_bytes: usize }
 #[derive(Clone, Debug)] pub struct CrateCompileReport { pub root: String, pub files_scanned: usize,
   pub functions_seen: usize, pub kernels_extracted: usize, pub compiled: Vec<CompiledCrateKernel>, pub skipped: usize }
 const SCALARS: &[(&str, Et, Vt, u8, bool, Vt)] = &[("i64", Et::I64, Vt::I64, 64, true, Vt::U64),
@@ -785,9 +786,11 @@ pub fn extract_and_compile_crate(path: &Path, isa: TargetIsa, budget: RegBudget,
     let (o, e) = (compile_kernel_direct(&ek.kernel, kb, isa).ok()?,
       compile_standalone_elf_exec(&ek.kernel, kb, isa, &[]).ok()?);
     verify_elf64_object(&o.elf_bytes).ok().and(verify_elf64_executable(&e.elf_bytes).ok())?;
+    let max_lanes = ek.kernel.bufs.iter().map(|b| b.lanes).max().unwrap_or(0);
     Some(CompiledCrateKernel { file: ek.file, name: ek.name, original_cost, optimized_cost,
-      direct_insns: o.direct_insns, direct_share_pct: o.direct_share_pct, exec_share_pct: e.direct_share_pct,
-      zero_spills: o.zero_spills && e.zero_spills, obj_bytes: o.elf_bytes.len(), exec_bytes: e.elf_bytes.len() })
+      vector_mode: o.vector_mode, max_lanes, direct_insns: o.direct_insns, direct_share_pct: o.direct_share_pct,
+      exec_share_pct: e.direct_share_pct, zero_spills: o.zero_spills && e.zero_spills, obj_bytes: o.elf_bytes.len(),
+      exec_bytes: e.elf_bytes.len() })
   }).collect();
   Ok(CrateCompileReport { root: path.display().to_string(), files_scanned, functions_seen, kernels_extracted,
     skipped: kernels_extracted - compiled.len(), compiled }) }

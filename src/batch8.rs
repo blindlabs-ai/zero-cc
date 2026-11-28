@@ -289,20 +289,46 @@ impl<'a> B8Builder<'a> {
                         self.bin(Bin::Or, hp, cy) };
                     Val::Split64(lo, hi) }}
             Op::Ushr(a, s) | Op::Shr(a, s) => {
-                if matches!(op, Op::Shr(..)) && !self.dom(a).is_nonneg() { return None; }
-                if s >= 32 && skip_mul.get(a).copied().unwrap_or(false) {
+                let signed = matches!(op, Op::Shr(..)) && !self.dom(a).is_nonneg();
+                if !signed && s >= 32 && skip_mul.get(a).copied().unwrap_or(false) {
                     let Op::Mul(mx, mc) = *self.k.nodes.get(a)? else { return None };
                     let (xi, cv) = pc32(self.k, mx, mc)?;
                     let m = if self.dom(xi).hi < (1i64 << 33) { MulHi::Pos01 } else { MulHi::General };
                     Val::Lo32(self.mul_hi(self.val(xi)?, cv, s - 32, m).2)
                 } else {
                     let va = self.val(a)?;
-                    if s == 0 { va } else if s >= 32 { Val::Lo32(self.sh_h(ShOp::Shr, va, true, s - 32)) }
-                    else if vz(va, true) { Val::Lo32(self.sh_h(ShOp::Shr, va, false, s)) } else {
+                    if s == 0 { va }
+                    else if let Val::Const(c) = va {
+                        Val::Const(if signed { ((c as i64) >> s) as u64 } else { c >> s })
+                    } else if !signed {
+                        if s >= 32 { Val::Lo32(self.sh_h(ShOp::Shr, va, true, s - 32)) }
+                        else if vz(va, true) { Val::Lo32(self.sh_h(ShOp::Shr, va, false, s)) }
+                        else {
+                            let (la, ha) = (self.h(va, false), self.h(va, true));
+                            let (lp, hp) = (self.sh(ShOp::Shr, la, s), self.sh(ShOp::Shl, ha, 32 - s));
+                            let lo = self.bin(Bin::Or, lp, hp);
+                            if self.fits_lo(id) { Val::Lo32(lo) }
+                            else { Val::Split64(lo, self.sh(ShOp::Shr, ha, s)) }
+                        }
+                    } else if vz(va, true) {
+                        if s >= 32 { Val::Const(0) }
+                        else { Val::Lo32(self.sh_h(ShOp::Shr, va, false, s)) }
+                    } else if s >= 32 {
+                        let ha = self.h(va, true);
+                        let lo = self.sh(ShOp::Sar, ha, s - 32);
+                        if self.fits_lo(id) { Val::Lo32(lo) }
+                        else { Val::Split64(lo, if s == 63 { lo } else { self.sh(ShOp::Sar, ha, 31) }) }
+                    } else if self.dom(a).fits_i32() {
+                        let lo = self.sh_h(ShOp::Sar, va, false, s);
+                        if self.fits_lo(id) { Val::Lo32(lo) }
+                        else { Val::Split64(lo, self.h(va, true)) }
+                    } else {
                         let (la, ha) = (self.h(va, false), self.h(va, true));
                         let (lp, hp) = (self.sh(ShOp::Shr, la, s), self.sh(ShOp::Shl, ha, 32 - s));
                         let lo = self.bin(Bin::Or, lp, hp);
-                        if self.fits_lo(id) { Val::Lo32(lo) } else { Val::Split64(lo, self.sh(ShOp::Shr, ha, s)) }}}}
+                        if self.fits_lo(id) { Val::Lo32(lo) }
+                        else { Val::Split64(lo, self.sh(ShOp::Sar, ha, s)) }
+                    }}}
             Op::ShlVar(a, b) | Op::ShrVarU(a, b) => {
                 let (sl, wlo) = (matches!(op, Op::ShlVar(..)), self.fits_lo(id));
                 if sl && !wlo { return None; }

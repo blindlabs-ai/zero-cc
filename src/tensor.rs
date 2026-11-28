@@ -1,4 +1,5 @@
 use crate::codegen::RegBudget;
+use crate::cpu_spec::CpuProfile;
 use crate::ir::CompileError;
 
 pub const UOPC_EPI_NONE: i32 = 0;
@@ -43,6 +44,29 @@ pub fn plan_gemm_tiles(budget: RegBudget) -> Result<TilePlan, CompileError> {
         return Err(CompileError::RegisterSpill {
             peak_gprs: plan.peak_gprs, max_gprs: budget.max_gprs,
             peak_vecs: plan.peak_vecs, max_vecs: max_v,
+        });
+    }
+    Ok(plan)
+}
+
+pub fn plan_gemm_tiles_for_profile(profile: &CpuProfile) -> Result<TilePlan, CompileError> {
+    let budget = profile.reg_budget();
+    let plan = if profile.supports_avx512() {
+        let kc = if profile.l1d_kib >= 48 { 384 } else { 256 };
+        TilePlan {
+            mr: 8, nr_wide: 48, nr_mid: 32, nr_narrow: 16, k_unroll: 4, kc,
+            peak_gprs: 11, peak_vecs: 29, spills: 0,
+        }
+    } else {
+        TilePlan {
+            mr: 4, nr_wide: 24, nr_mid: 16, nr_narrow: 8, k_unroll: 4, kc: 128,
+            peak_gprs: 11, peak_vecs: 15, spills: 0,
+        }
+    };
+    if plan.peak_gprs > budget.max_gprs || plan.peak_vecs > budget.max_vecs {
+        return Err(CompileError::RegisterSpill {
+            peak_gprs: plan.peak_gprs, max_gprs: budget.max_gprs,
+            peak_vecs: plan.peak_vecs, max_vecs: budget.max_vecs,
         });
     }
     Ok(plan)
